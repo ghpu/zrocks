@@ -131,8 +131,13 @@ pub const MemTable = struct {
         gpa.destroy(self);
     }
 
-    /// Encode an entry into the arena and insert it into the skiplist.
+    /// Encode an entry and insert it into the skiplist.
     /// For a deletion, `value` is typically empty (but any value is accepted).
+    ///
+    /// The entry is built into a `gpa`-backed scratch buffer and handed to
+    /// `SkipList.insert`, which copies it once into the arena (the skiplist
+    /// owns the arena copy).  Building straight into the arena would orphan a
+    /// duplicate block, so we use a freed scratch buffer instead.
     pub fn add(
         self: *MemTable,
         sequence: u64,
@@ -140,15 +145,17 @@ pub const MemTable = struct {
         key: []const u8,
         value: []const u8,
     ) !void {
+        const gpa = self.arena.backing;
         const internal_key_size = key.len + 8;
         const encoded_len = coding.varintLength(@intCast(internal_key_size)) + internal_key_size +
             coding.varintLength(@intCast(value.len)) + value.len;
 
-        const dst = try self.arena.alloc(encoded_len);
-        var list: std.ArrayListUnmanaged(u8) = .{ .items = dst[0..0], .capacity = dst.len };
+        const scratch = try gpa.alloc(u8, encoded_len);
+        defer gpa.free(scratch);
+        var list: std.ArrayListUnmanaged(u8) = .{ .items = scratch[0..0], .capacity = scratch.len };
 
         // varint32(internal_key_size) ++ user_key ++ fixed64(trailer)
-        coding.putVarint32(&list, self.arena.backing, @intCast(internal_key_size)) catch unreachable;
+        coding.putVarint32(&list, gpa, @intCast(internal_key_size)) catch unreachable;
         list.appendSliceAssumeCapacity(key);
         const trailer = internal_key.packSequenceAndType(sequence, t);
         var tbuf: [8]u8 = undefined;
@@ -156,15 +163,13 @@ pub const MemTable = struct {
         list.appendSliceAssumeCapacity(&tbuf);
 
         // varint32(value_size) ++ value
-        coding.putVarint32(&list, self.arena.backing, @intCast(value.len)) catch unreachable;
+        coding.putVarint32(&list, gpa, @intCast(value.len)) catch unreachable;
         list.appendSliceAssumeCapacity(value);
 
         std.debug.assert(list.items.len == encoded_len);
 
-        // The skiplist copies the key bytes into the arena again.  (LevelDB
-        // inserts the arena slice directly; an extra copy here is harmless and
-        // keeps the skiplist API untouched.)
-        try self.table.insert(dst);
+        // SkipList.insert copies the slice into the arena (the lasting copy).
+        try self.table.insert(list.items);
     }
 
     /// Look up the newest version of `lookup.userKey()` visible at the lookup's
