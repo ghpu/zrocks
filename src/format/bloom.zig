@@ -89,15 +89,13 @@ pub const BloomFilterPolicy = struct {
         try dst.append(gpa, @intCast(self.k));
 
         const array = dst.items[init_len..][0..bytes];
+        const nbits: u32 = @intCast(bits);
         for (keys) |key| {
-            // Use double-hashing to derive k probes from a single hash.
-            var h = bloomHash(key);
-            const delta = (h >> 17) | (h << 15); // rotate right 17 bits
+            var probe = Probe.init(key);
             var j: u32 = 0;
             while (j < self.k) : (j += 1) {
-                const bitpos = h % @as(u32, @intCast(bits));
+                const bitpos = probe.next(nbits);
                 array[bitpos / 8] |= @as(u8, 1) << @intCast(bitpos % 8);
-                h +%= delta;
             }
         }
     }
@@ -107,7 +105,7 @@ pub const BloomFilterPolicy = struct {
         const len = filter.len;
         if (len < 2) return false; // malformed; conservatively no match
 
-        const bits = (len - 1) * 8;
+        const nbits: u32 = @intCast((len - 1) * 8);
 
         // Recover the number of probes from the final byte.
         const k = filter[len - 1];
@@ -116,17 +114,34 @@ pub const BloomFilterPolicy = struct {
             return true;
         }
 
-        var h = bloomHash(key);
-        const delta = (h >> 17) | (h << 15); // rotate right 17 bits
+        var probe = Probe.init(key);
         var j: u32 = 0;
         while (j < k) : (j += 1) {
-            const bitpos = h % @as(u32, @intCast(bits));
+            const bitpos = probe.next(nbits);
             if ((filter[bitpos / 8] & (@as(u8, 1) << @intCast(bitpos % 8))) == 0) {
                 return false;
             }
-            h +%= delta;
         }
         return true;
+    }
+};
+
+/// Generates the sequence of bit positions probed for one key, using the
+/// LevelDB double-hashing scheme: a single bloom hash plus a fixed rotation
+/// gives `delta`, and each subsequent probe advances `h` by `delta`.
+const Probe = struct {
+    h: u32,
+    delta: u32,
+
+    fn init(key: []const u8) Probe {
+        const h = bloomHash(key);
+        return .{ .h = h, .delta = (h >> 17) | (h << 15) }; // rotate right 17 bits
+    }
+
+    fn next(self: *Probe, nbits: u32) u32 {
+        const bitpos = self.h % nbits;
+        self.h +%= self.delta;
+        return bitpos;
     }
 };
 

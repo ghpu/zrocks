@@ -158,16 +158,12 @@ pub const FilterBlockReader = struct {
         const limit = coding.decodeFixed32(self.data[off_pos + 4 ..][0..4]);
         if (start <= limit and limit <= self.offset_array) {
             const filter = self.data[start..limit];
-            if (filter.len == 0) {
-                // Empty filter range -> conservative match.
-                return true;
-            }
+            // An empty filter range carries no information -> conservative
+            // match; otherwise consult the bloom filter.
+            if (filter.len == 0) return true;
             return self.policy.keyMayMatch(key, filter);
-        } else if (start == limit) {
-            // Empty filter range.
-            return true;
         }
-        // Errors are treated as potential matches.
+        // Malformed offsets are treated conservatively as a potential match.
         return true;
     }
 };
