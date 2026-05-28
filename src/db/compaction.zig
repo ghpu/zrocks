@@ -810,7 +810,9 @@ const EmitCtx = struct {
 ///                 sequence would be > smallest_snapshot and excluded here too).
 /// Requiring `value_seq < tomb.seq <= smallest_snapshot` guarantees every live
 /// reader (at any snapshot >= smallest_snapshot) observes the tombstone over this
-/// value, so dropping it changes nothing observable.
+/// value, so dropping it changes nothing observable.  This is exactly the
+/// aggregator's `covered` query with the snapshot bound set to the smallest
+/// snapshot.
 fn rangeCoversForDrop(
     tombstones: *const delete_range.RangeTombstoneList,
     user_key: []const u8,
@@ -818,14 +820,7 @@ fn rangeCoversForDrop(
     smallest_snapshot: u64,
     user_cmp: comparator.Comparator,
 ) bool {
-    for (tombstones.tombstones.items) |t| {
-        if (t.seq > smallest_snapshot) continue; // a snapshot may still see the value
-        if (value_seq >= t.seq) continue; // value outranks (or ties) the tombstone
-        if (user_cmp.compare(user_key, t.begin) == .lt) continue;
-        if (user_cmp.compare(user_key, t.end) != .lt) continue; // user_key >= end
-        return true;
-    }
-    return false;
+    return tombstones.covered(user_key, value_seq, smallest_snapshot, user_cmp);
 }
 
 /// Encode `user_key ++ fixed64(packSequenceAndType(seq, t))` (caller frees).

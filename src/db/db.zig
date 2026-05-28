@@ -498,43 +498,14 @@ pub const DB = struct {
     }
 
     /// The largest range-tombstone sequence (visible at `snapshot`) that covers
-    /// `key`, or 0 if none.  Scans the live MemTable + imm + every SST's range-del
-    /// block.  This is the read-side aggregator query specialized to point gets.
+    /// `key`, or 0 if none.  Builds the snapshot-scoped aggregator (live MemTable
+    /// + imm + every SST's range-del block) and folds its covering tombstones
+    /// into one effective deletion sequence.
     /// TODO(perf): prune by file key-range overlap; cache per-Version aggregation.
     fn maxCoveringTombstoneSeq(self: *DB, key: []const u8, snapshot: u64) !u64 {
-        const user_cmp = self.options.comparator;
-        var best: u64 = 0;
-
-        const consider = struct {
-            fn f(best_p: *u64, t_begin: []const u8, t_end: []const u8, t_seq: u64, k: []const u8, snap: u64, cmp: comparator.Comparator) void {
-                if (t_seq > snap) return;
-                if (t_seq <= best_p.*) return;
-                if (cmp.compare(k, t_begin) == .lt) return;
-                if (cmp.compare(k, t_end) != .lt) return; // k >= end
-                best_p.* = t_seq;
-            }
-        }.f;
-
-        for (self.mem.range_tombstones.tombstones.items) |t| {
-            consider(&best, t.begin, t.end, t.seq, key, snapshot, user_cmp);
-        }
-        if (self.imm) |imm| {
-            for (imm.range_tombstones.tombstones.items) |t| {
-                consider(&best, t.begin, t.end, t.seq, key, snapshot, user_cmp);
-            }
-        }
-        const v = self.versions.currentVersion();
-        for (&v.files) |level| {
-            for (level.items) |f| {
-                const table = try self.table_cache.findTable(f.number, f.file_size);
-                var rtl = try table.rangeTombstones(self.gpa);
-                defer rtl.deinit();
-                for (rtl.tombstones.items) |t| {
-                    consider(&best, t.begin, t.end, t.seq, key, snapshot, user_cmp);
-                }
-            }
-        }
-        return best;
+        var agg = try self.buildRangeAggregator(self.gpa, snapshot);
+        defer agg.deinit();
+        return agg.maxCoveringSeq(key, snapshot, self.options.comparator);
     }
 
     /// Merge-aware point lookup (M7.1).  Builds an internal MergingIterator over

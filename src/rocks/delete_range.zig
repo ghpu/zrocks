@@ -103,6 +103,28 @@ pub const RangeTombstoneList = struct {
         return false;
     }
 
+    /// The largest tombstone sequence (visible at `snapshot`) that covers
+    /// `user_key`, or 0 if none.  A surfaced value with sequence `< ` this is
+    /// shadowed; one with sequence `>=` it outranks the tombstone.  Used by the
+    /// point-get read path (M7.5) to fold all covering tombstones into one
+    /// effective deletion sequence.
+    pub fn maxCoveringSeq(
+        self: *const RangeTombstoneList,
+        user_key: []const u8,
+        snapshot: u64,
+        user_cmp: comparator.Comparator,
+    ) u64 {
+        var best: u64 = 0;
+        for (self.tombstones.items) |t| {
+            if (t.seq > snapshot) continue;
+            if (t.seq <= best) continue;
+            if (user_cmp.compare(user_key, t.begin) == .lt) continue;
+            if (user_cmp.compare(user_key, t.end) != .lt) continue; // key >= end
+            best = t.seq;
+        }
+        return best;
+    }
+
     /// Serialize into `out` (our clean range-del meta-block format):
     ///   varint(count) ++ [ lenpfx(begin) lenpfx(end) varint(seq) ]*
     pub fn encode(self: *const RangeTombstoneList, out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator) !void {
