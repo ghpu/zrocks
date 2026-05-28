@@ -497,6 +497,57 @@ pub const DB = struct {
         return null;
     }
 
+    /// The sequence of the NEWEST entry for `key` across the live MemTable, the
+    /// immutable MemTable (if flushing), and the current Version's SSTs — of ANY
+    /// kind (put, delete, or merge operand).  Returns 0 if the key has never
+    /// appeared.  (M7.6 transaction conflict detection: an optimistic txn began at
+    /// snapshot S; if `latestSequenceForKey(k) > S` then some commit touched `k`
+    /// after the txn's snapshot and a write-write conflict exists.)
+    ///
+    /// Reuses the M7.5 `getWithSeq` machinery, probing layers newest-first.  Each
+    /// layer's `getWithSeq` reports the single newest entry visible at the query
+    /// sequence and writes its sequence into `seq_out` even for a `.merge` operand
+    /// (where the function itself returns null), so a non-zero `seq_out` means the
+    /// layer holds the key — the first such layer (newest) wins.
+    pub fn latestSequenceForKey(self: *DB, key: []const u8) u64 {
+        // Query at the latest sequence so the newest entry is visible.
+        const seq = self.last_sequence;
+
+        var lookup = memtable_mod.LookupKey.init(self.gpa, key, seq) catch return 0;
+        defer lookup.deinit(self.gpa);
+
+        // 1. Live MemTable (newest writes).
+        {
+            var vseq: u64 = 0;
+            const r = self.mem.getWithSeq(lookup, &vseq);
+            if (r != null or vseq != 0) return vseq;
+        }
+
+        // 2. The immutable MemTable being flushed (if any).
+        if (self.imm) |imm| {
+            var vseq: u64 = 0;
+            const r = imm.getWithSeq(lookup, &vseq);
+            if (r != null or vseq != 0) return vseq;
+        }
+
+        // 3. The current Version's SSTs.
+        const version = self.versions.currentVersion();
+        var vseq: u64 = 0;
+        const r = version.getWithSeq(self.gpa, &self.table_cache, self.options.comparator, key, seq, &vseq) catch return 0;
+        if (r) |res| {
+            // A Version `.found` returns a freshly gpa-allocated value the caller
+            // owns; we only need the sequence, so free it.
+            switch (res) {
+                .found => |v| self.gpa.free(@constCast(v)),
+                .deleted => {},
+            }
+            return vseq;
+        }
+        if (vseq != 0) return vseq;
+
+        return 0;
+    }
+
     /// The largest range-tombstone sequence (visible at `snapshot`) that covers
     /// `key`, or 0 if none.  Builds the snapshot-scoped aggregator (live MemTable
     /// + imm + every SST's range-del block) and folds its covering tombstones
