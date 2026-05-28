@@ -13,9 +13,17 @@
 //! then sequence descending), so the FIRST occurrence of each user key is the
 //! newest version.
 //!
+//! Merge operands (M7.1): a `.merge` entry COMBINES with older entries rather
+//! than superseding them, so the per-version drop rule must not touch it.  When
+//! the newest surviving entry for a user key is a `.merge` and an operator is
+//! configured, `collapseMergeRun` accumulates the operand run and collapses it
+//! (with the underlying base/deletion) into a single value — keeping
+//! above-snapshot operands verbatim and never losing an operand.
+//!
 //! What is implemented vs left as TODO:
 //!   * Size-based output split — implemented (correctness-sufficient).
 //!   * Tombstone drop at the base level — implemented (isBaseLevelForKey).
+//!   * Merge operand collapse — implemented (collapseMergeRun, M7.1).
 //!   * Grandparent-overlap split — TODO (refinement; size split suffices).
 //!   * Boundary-input expansion ("AddBoundaryInputs") — TODO (refinement).
 //!   * Obsolete .sst deletion from disk — TODO (files are dropped from the
@@ -36,6 +44,7 @@ const table_builder_mod = @import("../format/table_builder.zig");
 const bloom = @import("../format/bloom.zig");
 const filename = @import("../version/filename.zig");
 const coding = @import("../util/coding.zig");
+const merge_operator_mod = @import("../rocks/merge_operator.zig");
 
 const FileMetaData = version_edit.FileMetaData;
 const VersionSet = version_set.VersionSet;
@@ -467,17 +476,16 @@ fn encodeInternalKey(gpa: std.mem.Allocator, user_key: []const u8, seq: u64, t: 
 ///       - `.value` base reached → `fullMerge(operands, base)` → one `.value`.
 ///       - `.deletion` reached   → `fullMerge(operands, no base)` → one `.value`
 ///         (a Delete STOPS the merge; operands merge with no base).
-///       - run ends with no base in this compaction's inputs:
-///           * bottom of the tree (isBaseLevelForKey) → `fullMerge(no base)` →
-///             one `.value` (nothing deeper can supply a base).
-///           * otherwise → emit `partialMerge(operands)` as ONE `.merge` operand
-///             if the operator supports it (shrinks the run), else emit the
-///             operands VERBATIM so a deeper compaction can finish the merge.
+///       - run ends with no base in this compaction's inputs → a base (a Put)
+///         may still live in a deeper level we did not read, so we must NOT
+///         resolve to a final value (that could discard a base).  Shrink the run
+///         to ONE operand via `partialMerge` if supported, else keep the operands
+///         VERBATIM so a deeper compaction (which reads the base) finishes it.
 fn collapseMergeRun(
     gpa: std.mem.Allocator,
     mit: iterator.Iterator,
     user_cmp: comparator.Comparator,
-    merge_op: merge_operator_mod_compaction.MergeOperator,
+    merge_op: merge_operator_mod.MergeOperator,
     smallest_snapshot: u64,
     user_key_in: []const u8,
     emit_ctx: *EmitCtx,
@@ -649,7 +657,6 @@ fn emitOperandsVerbatim(
     }
 }
 
-const merge_operator_mod_compaction = @import("../rocks/merge_operator.zig");
 
 // ===========================================================================
 // Tests
@@ -936,7 +943,6 @@ test "M6.2: randomized 2000-op gate vs reference map (get + scan + reopen)" {
 
 // --- THE MERGE GATE (M7.1) -------------------------------------------------
 
-const merge_operator_mod = @import("../rocks/merge_operator.zig");
 const Uint64AddOperator = merge_operator_mod.Uint64AddOperator;
 
 /// Reference model for u64-counter merge semantics: put=set, merge=add,

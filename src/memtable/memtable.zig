@@ -201,7 +201,11 @@ pub const MemTable = struct {
                 return .{ .found = value };
             },
             .deletion, .single_deletion, .range_deletion => return .deleted,
-            .merge => return null, // merge operands not handled at this layer (M-later)
+            // Merge operands are NOT resolved by this point-lookup (it returns
+            // the single newest entry).  Returning null routes callers with a
+            // merge operator to DB.mergeGet, which scans the operand run and
+            // applies fullMerge (M7.1); callers without one treat it as absent.
+            .merge => return null,
         }
     }
 
