@@ -1,0 +1,260 @@
+//! Env — capability-based filesystem abstraction over `std.Io` (Zig 0.16).
+//!
+//! This module isolates ALL of Zig 0.16's `std.Io` filesystem surface behind a
+//! small runtime-vtable interface, following the same capability pattern used
+//! by `util/comparator.zig`.  Nothing in zrocks should touch `std.fs.*` or
+//! `std.Io.Dir.cwd()` directly; everything that performs I/O receives an `Env`
+//! value explicitly and goes through it.
+//!
+//! Two implementations satisfy the SAME interface:
+//!   * `RealEnv`  — OS-backed, wraps an `std.Io` + a root `std.Io.Dir`.
+//!   * `MemEnv`   — in-memory test double (path -> owned bytes).
+//!
+//! The DB, WAL, SST, and MANIFEST layers will accept an `Env` and can therefore
+//! run against either implementation.
+
+const std = @import("std");
+
+// ---------------------------------------------------------------------------
+// Error vocabulary
+// ---------------------------------------------------------------------------
+// Small, purposeful set.  Underlying `std.Io` errors are mapped into these so
+// callers never have to reason about the (large, platform-specific) raw std
+// error unions.
+pub const Error = error{
+    NotFound,
+    AlreadyExists,
+    IoError,
+    PermissionDenied,
+    NotSupported,
+} || std.mem.Allocator.Error;
+
+// ---------------------------------------------------------------------------
+// File handles — each its own runtime-vtable fat pointer.
+// ---------------------------------------------------------------------------
+
+/// A file opened for writing/appending.  Implementations may buffer; `flush`
+/// pushes buffered bytes to the backing store, `sync` additionally forces them
+/// durable (fsync on the real impl).  `close` releases the heap-allocated impl
+/// state.
+pub const WritableFile = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        append: *const fn (ptr: *anyopaque, data: []const u8) Error!void,
+        flush: *const fn (ptr: *anyopaque) Error!void,
+        sync: *const fn (ptr: *anyopaque) Error!void,
+        close: *const fn (ptr: *anyopaque) Error!void,
+    };
+
+    pub fn append(self: WritableFile, data: []const u8) Error!void {
+        return self.vtable.append(self.ptr, data);
+    }
+    pub fn flush(self: WritableFile) Error!void {
+        return self.vtable.flush(self.ptr);
+    }
+    pub fn sync(self: WritableFile) Error!void {
+        return self.vtable.sync(self.ptr);
+    }
+    pub fn close(self: WritableFile) Error!void {
+        return self.vtable.close(self.ptr);
+    }
+};
+
+/// A file opened for sequential reading (WAL / MANIFEST replay).
+pub const SequentialFile = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        /// Reads up to `buf.len` bytes, advancing an internal cursor.  Returns
+        /// the number of bytes read; 0 means end-of-file.
+        read: *const fn (ptr: *anyopaque, buf: []u8) Error!usize,
+        /// Advances the internal cursor by `n` bytes (clamped at EOF).
+        skip: *const fn (ptr: *anyopaque, n: u64) Error!void,
+        close: *const fn (ptr: *anyopaque) Error!void,
+    };
+
+    pub fn read(self: SequentialFile, buf: []u8) Error!usize {
+        return self.vtable.read(self.ptr, buf);
+    }
+    pub fn skip(self: SequentialFile, n: u64) Error!void {
+        return self.vtable.skip(self.ptr, n);
+    }
+    pub fn close(self: SequentialFile) Error!void {
+        return self.vtable.close(self.ptr);
+    }
+};
+
+/// A file opened for positional (random-access) reading (SST).
+pub const RandomAccessFile = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        /// Positional read at `offset`.  Returns the number of bytes read into
+        /// `buf` (may be short at EOF).
+        readAt: *const fn (ptr: *anyopaque, offset: u64, buf: []u8) Error!usize,
+        close: *const fn (ptr: *anyopaque) Error!void,
+    };
+
+    pub fn readAt(self: RandomAccessFile, offset: u64, buf: []u8) Error!usize {
+        return self.vtable.readAt(self.ptr, offset, buf);
+    }
+    pub fn close(self: RandomAccessFile) Error!void {
+        return self.vtable.close(self.ptr);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Env — the capability object.
+// ---------------------------------------------------------------------------
+
+pub const Env = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        newWritableFile: *const fn (ptr: *anyopaque, gpa: std.mem.Allocator, path: []const u8) Error!WritableFile,
+        newSequentialFile: *const fn (ptr: *anyopaque, gpa: std.mem.Allocator, path: []const u8) Error!SequentialFile,
+        newRandomAccessFile: *const fn (ptr: *anyopaque, gpa: std.mem.Allocator, path: []const u8) Error!RandomAccessFile,
+        deleteFile: *const fn (ptr: *anyopaque, path: []const u8) Error!void,
+        renameFile: *const fn (ptr: *anyopaque, from: []const u8, to: []const u8) Error!void,
+        fileExists: *const fn (ptr: *anyopaque, path: []const u8) bool,
+        getFileSize: *const fn (ptr: *anyopaque, path: []const u8) Error!u64,
+        makeDir: *const fn (ptr: *anyopaque, path: []const u8) Error!void,
+        // Advisory file locking.  See note in RealEnv/MemEnv: stubbed for now
+        // (TODO M5/M6 — DB-level single-process lock).  No-op success.
+        lockFile: *const fn (ptr: *anyopaque, path: []const u8) Error!void,
+        unlockFile: *const fn (ptr: *anyopaque, path: []const u8) Error!void,
+    };
+
+    /// Create/truncate `path` for writing/appending.
+    pub fn newWritableFile(self: Env, gpa: std.mem.Allocator, path: []const u8) Error!WritableFile {
+        return self.vtable.newWritableFile(self.ptr, gpa, path);
+    }
+    /// Open `path` for sequential reading.
+    pub fn newSequentialFile(self: Env, gpa: std.mem.Allocator, path: []const u8) Error!SequentialFile {
+        return self.vtable.newSequentialFile(self.ptr, gpa, path);
+    }
+    /// Open `path` for positional reading.
+    pub fn newRandomAccessFile(self: Env, gpa: std.mem.Allocator, path: []const u8) Error!RandomAccessFile {
+        return self.vtable.newRandomAccessFile(self.ptr, gpa, path);
+    }
+    pub fn deleteFile(self: Env, path: []const u8) Error!void {
+        return self.vtable.deleteFile(self.ptr, path);
+    }
+    /// Rename `from` to `to`.  Atomic where the platform allows (used for the
+    /// CURRENT file pointer swap).
+    pub fn renameFile(self: Env, from: []const u8, to: []const u8) Error!void {
+        return self.vtable.renameFile(self.ptr, from, to);
+    }
+    pub fn fileExists(self: Env, path: []const u8) bool {
+        return self.vtable.fileExists(self.ptr, path);
+    }
+    pub fn getFileSize(self: Env, path: []const u8) Error!u64 {
+        return self.vtable.getFileSize(self.ptr, path);
+    }
+    /// Create a directory; success if it already exists.
+    pub fn makeDir(self: Env, path: []const u8) Error!void {
+        return self.vtable.makeDir(self.ptr, path);
+    }
+    pub fn lockFile(self: Env, path: []const u8) Error!void {
+        return self.vtable.lockFile(self.ptr, path);
+    }
+    pub fn unlockFile(self: Env, path: []const u8) Error!void {
+        return self.vtable.unlockFile(self.ptr, path);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Implementations
+// ---------------------------------------------------------------------------
+
+pub const RealEnv = @import("real_env.zig").RealEnv;
+pub const MemEnv = @import("mem_env.zig").MemEnv;
+
+// ---------------------------------------------------------------------------
+// Tests — the SAME contract runs against both implementations.
+// ---------------------------------------------------------------------------
+
+/// Generic conformance test exercised by both `MemEnv` and `RealEnv`.
+fn runEnvContract(env: Env, gpa: std.mem.Allocator) !void {
+    const expect = std.testing.expect;
+
+    // ---- write ----------------------------------------------------------
+    {
+        var wf = try env.newWritableFile(gpa, "foo.txt");
+        errdefer wf.close() catch {};
+        try wf.append("hello ");
+        try wf.append("world");
+        try wf.sync();
+        try wf.close();
+    }
+
+    // ---- metadata -------------------------------------------------------
+    try expect(env.fileExists("foo.txt"));
+    try std.testing.expectEqual(@as(u64, 11), try env.getFileSize("foo.txt"));
+
+    // ---- sequential read ------------------------------------------------
+    {
+        var sf = try env.newSequentialFile(gpa, "foo.txt");
+        errdefer sf.close() catch {};
+        var assembled: [32]u8 = undefined;
+        var total: usize = 0;
+        while (true) {
+            const n = try sf.read(assembled[total..]);
+            if (n == 0) break; // EOF
+            total += n;
+        }
+        try std.testing.expectEqualStrings("hello world", assembled[0..total]);
+        // Reading again at EOF returns 0.
+        var tmp: [4]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 0), try sf.read(&tmp));
+        try sf.close();
+    }
+
+    // ---- random-access read --------------------------------------------
+    {
+        var raf = try env.newRandomAccessFile(gpa, "foo.txt");
+        errdefer raf.close() catch {};
+        var buf: [5]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 5), try raf.readAt(6, &buf));
+        try std.testing.expectEqualStrings("world", &buf);
+        try std.testing.expectEqual(@as(usize, 5), try raf.readAt(0, &buf));
+        try std.testing.expectEqualStrings("hello", &buf);
+        try raf.close();
+    }
+
+    // ---- rename ---------------------------------------------------------
+    try env.renameFile("foo.txt", "bar.txt");
+    try expect(!env.fileExists("foo.txt"));
+    try expect(env.fileExists("bar.txt"));
+
+    // ---- delete ---------------------------------------------------------
+    try env.deleteFile("bar.txt");
+    try expect(!env.fileExists("bar.txt"));
+
+    // ---- missing-file error paths --------------------------------------
+    try std.testing.expectError(error.NotFound, env.getFileSize("bar.txt"));
+    try std.testing.expectError(error.NotFound, env.newSequentialFile(gpa, "bar.txt"));
+}
+
+test "MemEnv contract" {
+    const gpa = std.testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    try runEnvContract(me.env(), gpa);
+}
+
+test "RealEnv contract" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var re = RealEnv.init(io, tmp.dir);
+    try runEnvContract(re.env(), gpa);
+}
