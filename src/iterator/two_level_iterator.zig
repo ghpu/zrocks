@@ -64,41 +64,130 @@ pub const TwoLevelIterator = struct {
         .status = statusImpl,
     };
 
+    fn cast(ctx: *anyopaque) *TwoLevelIterator {
+        return @ptrCast(@alignCast(ctx));
+    }
+
+    /// Build (or rebuild) the second-level iterator from the current index
+    /// entry's value.  Leaves it UNPOSITIONED.  Drops any previous reference.
+    /// Records an error and clears `data_iter` on failure.
+    fn openSecondLevel(self: *TwoLevelIterator) void {
+        self.data_iter = null;
+        if (!self.index_iter.valid()) return;
+        const value = self.index_iter.value();
+        self.data_iter = self.make(self.ctx, value) catch |err| {
+            self.err = err;
+            return;
+        };
+    }
+
+    /// When forward and the current data iterator is exhausted (or none is
+    /// open), advance the index iterator and open the next data block, repeating
+    /// across empty blocks until a live entry is found or the index runs out.
+    fn skipEmptyForward(self: *TwoLevelIterator) void {
+        while (self.err == null) {
+            if (self.data_iter) |di| {
+                if (di.valid()) return;
+            }
+            if (!self.index_iter.valid()) {
+                self.data_iter = null;
+                return;
+            }
+            self.index_iter.next();
+            if (!self.index_iter.valid()) {
+                self.data_iter = null;
+                return;
+            }
+            self.openSecondLevel();
+            if (self.data_iter) |di| di.seekToFirst();
+        }
+    }
+
+    /// Reverse analogue of `skipEmptyForward`: when the current data iterator is
+    /// exhausted going backward, step the index iterator back and open the
+    /// previous data block, positioned at its last entry.
+    fn skipEmptyBackward(self: *TwoLevelIterator) void {
+        while (self.err == null) {
+            if (self.data_iter) |di| {
+                if (di.valid()) return;
+            }
+            if (!self.index_iter.valid()) {
+                self.data_iter = null;
+                return;
+            }
+            self.index_iter.prev();
+            if (!self.index_iter.valid()) {
+                self.data_iter = null;
+                return;
+            }
+            self.openSecondLevel();
+            if (self.data_iter) |di| di.seekToLast();
+        }
+    }
+
     fn seekToFirstImpl(ctx: *anyopaque) void {
-        _ = ctx;
-        @panic("RED: not implemented");
+        const self = cast(ctx);
+        self.err = null;
+        self.index_iter.seekToFirst();
+        self.openSecondLevel();
+        if (self.data_iter) |di| di.seekToFirst();
+        self.skipEmptyForward();
     }
+
     fn seekToLastImpl(ctx: *anyopaque) void {
-        _ = ctx;
-        @panic("RED: not implemented");
+        const self = cast(ctx);
+        self.err = null;
+        self.index_iter.seekToLast();
+        self.openSecondLevel();
+        if (self.data_iter) |di| di.seekToLast();
+        self.skipEmptyBackward();
     }
+
     fn seekImpl(ctx: *anyopaque, target: []const u8) void {
-        _ = ctx;
-        _ = target;
-        @panic("RED: not implemented");
+        const self = cast(ctx);
+        self.err = null;
+        self.index_iter.seek(target);
+        self.openSecondLevel();
+        if (self.data_iter) |di| di.seek(target);
+        self.skipEmptyForward();
     }
+
     fn nextImpl(ctx: *anyopaque) void {
-        _ = ctx;
-        @panic("RED: not implemented");
+        const self = cast(ctx);
+        std.debug.assert(self.data_iter != null and self.data_iter.?.valid());
+        self.data_iter.?.next();
+        self.skipEmptyForward();
     }
+
     fn prevImpl(ctx: *anyopaque) void {
-        _ = ctx;
-        @panic("RED: not implemented");
+        const self = cast(ctx);
+        std.debug.assert(self.data_iter != null and self.data_iter.?.valid());
+        self.data_iter.?.prev();
+        self.skipEmptyBackward();
     }
+
     fn validImpl(ctx: *anyopaque) bool {
-        _ = ctx;
+        const self = cast(ctx);
+        if (self.err != null) return false;
+        if (self.data_iter) |di| return di.valid();
         return false;
     }
+
     fn keyImpl(ctx: *anyopaque) []const u8 {
-        _ = ctx;
-        @panic("RED: not implemented");
+        const self = cast(ctx);
+        return self.data_iter.?.key();
     }
+
     fn valueImpl(ctx: *anyopaque) []const u8 {
-        _ = ctx;
-        @panic("RED: not implemented");
+        const self = cast(ctx);
+        return self.data_iter.?.value();
     }
+
     fn statusImpl(ctx: *anyopaque) ?anyerror {
-        _ = ctx;
+        const self = cast(ctx);
+        if (self.err) |e_| return e_;
+        if (self.index_iter.status()) |s| return s;
+        if (self.data_iter) |di| return di.status();
         return null;
     }
 };

@@ -144,39 +144,70 @@ pub const VectorIterator = struct {
         .status = statusImpl,
     };
 
+    fn cast(ctx: *anyopaque) *VectorIterator {
+        return @ptrCast(@alignCast(ctx));
+    }
+
     fn seekToFirstImpl(ctx: *anyopaque) void {
-        _ = ctx;
-        @panic("RED: not implemented");
+        const self = cast(ctx);
+        self.pos = 0;
     }
+
     fn seekToLastImpl(ctx: *anyopaque) void {
-        _ = ctx;
-        @panic("RED: not implemented");
+        const self = cast(ctx);
+        // entries.len == 0 -> pos = (0 -% 1) which is huge => invalid; guard it.
+        self.pos = if (self.entries.len == 0) 0 else self.entries.len - 1;
     }
+
     fn seekImpl(ctx: *anyopaque, target: []const u8) void {
-        _ = ctx;
-        _ = target;
-        @panic("RED: not implemented");
+        const self = cast(ctx);
+        // Binary search for the first entry whose key is >= target.
+        var lo: usize = 0;
+        var hi: usize = self.entries.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            switch (self.cmp.compare(self.entries[mid].key, target)) {
+                .lt => lo = mid + 1,
+                .eq, .gt => hi = mid,
+            }
+        }
+        self.pos = lo;
     }
+
     fn nextImpl(ctx: *anyopaque) void {
-        _ = ctx;
-        @panic("RED: not implemented");
+        const self = cast(ctx);
+        std.debug.assert(self.pos < self.entries.len);
+        self.pos += 1;
     }
+
     fn prevImpl(ctx: *anyopaque) void {
-        _ = ctx;
-        @panic("RED: not implemented");
+        const self = cast(ctx);
+        std.debug.assert(self.pos < self.entries.len);
+        if (self.pos == 0) {
+            // Step before the first entry -> invalid sentinel.
+            self.pos = self.entries.len;
+        } else {
+            self.pos -= 1;
+        }
     }
+
     fn validImpl(ctx: *anyopaque) bool {
-        _ = ctx;
-        return false;
+        const self = cast(ctx);
+        return self.pos < self.entries.len;
     }
+
     fn keyImpl(ctx: *anyopaque) []const u8 {
-        _ = ctx;
-        @panic("RED: not implemented");
+        const self = cast(ctx);
+        std.debug.assert(self.pos < self.entries.len);
+        return self.entries[self.pos].key;
     }
+
     fn valueImpl(ctx: *anyopaque) []const u8 {
-        _ = ctx;
-        @panic("RED: not implemented");
+        const self = cast(ctx);
+        std.debug.assert(self.pos < self.entries.len);
+        return self.entries[self.pos].value;
     }
+
     fn statusImpl(ctx: *anyopaque) ?anyerror {
         _ = ctx;
         return null;

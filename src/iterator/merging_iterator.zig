@@ -39,19 +39,71 @@ pub const MergingIterator = struct {
         cmp: comparator.Comparator,
         children: []const Iterator,
     ) !MergingIterator {
-        _ = gpa;
-        _ = cmp;
-        _ = children;
-        @panic("RED: not implemented");
+        const owned = try gpa.alloc(Iterator, children.len);
+        @memcpy(owned, children);
+        return .{
+            .gpa = gpa,
+            .cmp = cmp,
+            .children = owned,
+            .current = null,
+            .direction = .forward,
+        };
     }
 
     pub fn deinit(self: *MergingIterator) void {
-        _ = self;
-        @panic("RED: not implemented");
+        self.gpa.free(self.children);
+        self.* = undefined;
     }
 
     pub fn iterator(self: *MergingIterator) Iterator {
         return .{ .ctx = self, .vtable = &vtable };
+    }
+
+    // --- internal positioning helpers --------------------------------------
+
+    fn cast(ctx: *anyopaque) *MergingIterator {
+        return @ptrCast(@alignCast(ctx));
+    }
+
+    /// Pick the child with the smallest key as `current` (forward order).
+    fn findSmallest(self: *MergingIterator) void {
+        var smallest: ?usize = null;
+        for (self.children, 0..) |child, i| {
+            if (!child.valid()) continue;
+            if (smallest) |s| {
+                if (self.cmp.compare(child.key(), self.children[s].key()) == .lt) {
+                    smallest = i;
+                }
+            } else {
+                smallest = i;
+            }
+        }
+        self.current = smallest;
+    }
+
+    /// Pick the child with the largest key as `current` (reverse order).
+    /// On ties the LATER child wins, mirroring the forward stable order so a
+    /// reverse scan is the exact inverse of a forward scan.
+    fn findLargest(self: *MergingIterator) void {
+        if (self.children.len == 0) {
+            self.current = null;
+            return;
+        }
+        var largest: ?usize = null;
+        var i: usize = self.children.len;
+        while (i > 0) {
+            i -= 1;
+            const child = self.children[i];
+            if (!child.valid()) continue;
+            if (largest) |l| {
+                if (self.cmp.compare(child.key(), self.children[l].key()) == .gt) {
+                    largest = i;
+                }
+            } else {
+                largest = i;
+            }
+        }
+        self.current = largest;
     }
 
     const vtable = Iterator.VTable{
@@ -67,40 +119,102 @@ pub const MergingIterator = struct {
     };
 
     fn seekToFirstImpl(ctx: *anyopaque) void {
-        _ = ctx;
-        @panic("RED: not implemented");
+        const self = cast(ctx);
+        for (self.children) |child| child.seekToFirst();
+        self.direction = .forward;
+        self.findSmallest();
     }
+
     fn seekToLastImpl(ctx: *anyopaque) void {
-        _ = ctx;
-        @panic("RED: not implemented");
+        const self = cast(ctx);
+        for (self.children) |child| child.seekToLast();
+        self.direction = .reverse;
+        self.findLargest();
     }
+
     fn seekImpl(ctx: *anyopaque, target: []const u8) void {
-        _ = ctx;
-        _ = target;
-        @panic("RED: not implemented");
+        const self = cast(ctx);
+        for (self.children) |child| child.seek(target);
+        self.direction = .forward;
+        self.findSmallest();
     }
+
     fn nextImpl(ctx: *anyopaque) void {
-        _ = ctx;
-        @panic("RED: not implemented");
+        const self = cast(ctx);
+        std.debug.assert(self.current != null);
+        const cur = self.current.?;
+
+        // If we were going in reverse, the non-current children are positioned
+        // at-or-before the current key.  To go forward we must move each of
+        // them just past the current key (LevelDB's direction-switch fixup).
+        if (self.direction != .forward) {
+            const cur_key = self.children[cur].key();
+            for (self.children, 0..) |child, i| {
+                if (i == cur) continue;
+                child.seek(cur_key);
+                // `seek` lands on the first entry >= cur_key; if that equals
+                // cur_key, step past it so the current child's entry is the
+                // unique smallest.
+                if (child.valid() and self.cmp.compare(child.key(), cur_key) == .eq) {
+                    child.next();
+                }
+            }
+            self.direction = .forward;
+        }
+
+        self.children[cur].next();
+        self.findSmallest();
     }
+
     fn prevImpl(ctx: *anyopaque) void {
-        _ = ctx;
-        @panic("RED: not implemented");
+        const self = cast(ctx);
+        std.debug.assert(self.current != null);
+        const cur = self.current.?;
+
+        // If we were going forward, the non-current children are positioned
+        // at-or-after the current key.  To go reverse we must move each of
+        // them just before the current key.
+        if (self.direction != .reverse) {
+            const cur_key = self.children[cur].key();
+            for (self.children, 0..) |child, i| {
+                if (i == cur) continue;
+                child.seek(cur_key);
+                if (child.valid()) {
+                    // child is at first entry >= cur_key; step back to land at
+                    // the last entry < cur_key.
+                    child.prev();
+                } else {
+                    // No entry >= cur_key; the largest entry is the last one.
+                    child.seekToLast();
+                }
+            }
+            self.direction = .reverse;
+        }
+
+        self.children[cur].prev();
+        self.findLargest();
     }
+
     fn validImpl(ctx: *anyopaque) bool {
-        _ = ctx;
-        return false;
+        const self = cast(ctx);
+        return self.current != null;
     }
+
     fn keyImpl(ctx: *anyopaque) []const u8 {
-        _ = ctx;
-        @panic("RED: not implemented");
+        const self = cast(ctx);
+        return self.children[self.current.?].key();
     }
+
     fn valueImpl(ctx: *anyopaque) []const u8 {
-        _ = ctx;
-        @panic("RED: not implemented");
+        const self = cast(ctx);
+        return self.children[self.current.?].value();
     }
+
     fn statusImpl(ctx: *anyopaque) ?anyerror {
-        _ = ctx;
+        const self = cast(ctx);
+        for (self.children) |child| {
+            if (child.status()) |s| return s;
+        }
         return null;
     }
 };
