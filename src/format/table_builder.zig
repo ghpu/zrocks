@@ -76,7 +76,9 @@ pub const TableBuilder = struct {
         file: env.WritableFile,
         policy: bloom.BloomFilterPolicy,
     ) !TableBuilder {
-        // STUB (RED): real wiring lands in the GREEN step.
+        var filter = FilterBlockBuilder.init(gpa, policy);
+        // LevelDB starts the first filter range at offset 0.
+        try filter.startBlock(gpa, 0);
         return .{
             .gpa = gpa,
             .options = options,
@@ -84,7 +86,7 @@ pub const TableBuilder = struct {
             .policy = policy,
             .data_block = BlockBuilder.init(gpa, options.block_restart_interval),
             .index_block = BlockBuilder.init(gpa, kMetaIndexRestartInterval),
-            .filter = FilterBlockBuilder.init(gpa, policy),
+            .filter = filter,
             .last_key = .empty,
             .offset = 0,
             .num_entries = 0,
@@ -114,19 +116,133 @@ pub const TableBuilder = struct {
 
     /// Add (key, value). Keys MUST arrive in non-decreasing sorted order.
     pub fn add(self: *TableBuilder, key: []const u8, value: []const u8) !void {
-        // STUB (RED).
-        _ = self;
-        _ = key;
-        _ = value;
-        return error.Unimplemented;
+        std.debug.assert(!self.finished);
+        // Sorted-order invariant (non-decreasing) against the previous key.
+        std.debug.assert(self.num_entries == 0 or
+            self.options.comparator.compare(self.last_key.items, key) != .gt);
+
+        // If a data block was just flushed, emit its deferred index entry now
+        // that we know the first key of the next block.
+        if (self.pending_index_entry) {
+            std.debug.assert(self.data_block.isEmpty());
+            // separator in [last_key, key); shortens last_key in place.
+            self.options.comparator.findShortestSeparator(&self.last_key, key);
+            self.handle_encoding.clearRetainingCapacity();
+            try self.pending_handle.encodeTo(&self.handle_encoding, self.gpa);
+            try self.index_block.add(self.last_key.items, self.handle_encoding.items);
+            self.pending_index_entry = false;
+        }
+
+        // Record the key in the filter.
+        try self.filter.addKey(self.gpa, key);
+
+        // Remember last_key = key.
+        self.last_key.clearRetainingCapacity();
+        try self.last_key.appendSlice(self.gpa, key);
+
+        self.num_entries += 1;
+        try self.data_block.add(key, value);
+
+        if (self.data_block.currentSizeEstimate() >= self.options.block_size) {
+            try self.flush();
+        }
+    }
+
+    /// Flush the current data block to the file and arm a deferred index entry.
+    fn flush(self: *TableBuilder) !void {
+        std.debug.assert(!self.finished);
+        if (self.data_block.isEmpty()) return;
+        std.debug.assert(!self.pending_index_entry);
+
+        self.pending_handle = try self.writeBlock(&self.data_block);
+        self.pending_index_entry = true;
+        try self.file.flush();
+
+        // Begin the next filter range at the new file offset.
+        try self.filter.startBlock(self.gpa, self.offset);
+    }
+
+    /// Finish a BlockBuilder, write it (with trailer) to the file, reset the
+    /// builder, and return its BlockHandle.
+    fn writeBlock(self: *TableBuilder, builder: *BlockBuilder) !BlockHandle {
+        const contents = builder.finish();
+        const handle = try self.writeRawBlock(contents, kNoCompression);
+        builder.reset();
+        return handle;
+    }
+
+    /// Append block contents + 5-byte trailer to the file at the running
+    /// offset, returning a handle whose size is the contents length (the
+    /// trailer is NOT part of the handle size). Advances offset.
+    fn writeRawBlock(self: *TableBuilder, contents: []const u8, compression_type: u8) !BlockHandle {
+        const handle = BlockHandle{ .offset = self.offset, .size = contents.len };
+
+        try self.file.append(contents);
+
+        // trailer[0] = compression type
+        // trailer[1..5] = fixed32_LE(mask(extend(crc(contents), &[type])))
+        var trailer: [5]u8 = undefined;
+        trailer[0] = compression_type;
+        const crc = crc32c.extend(crc32c.value(contents), &[_]u8{compression_type});
+        coding.encodeFixed32(trailer[1..5], crc32c.mask(crc));
+        try self.file.append(&trailer);
+
+        self.offset += contents.len + trailer.len;
+        return handle;
     }
 
     /// Flush the remaining data, write the filter/metaindex/index blocks and
     /// the footer, then flush the file. Does NOT close the file (caller owns).
     pub fn finish(self: *TableBuilder) !void {
-        // STUB (RED).
-        _ = self;
-        return error.Unimplemented;
+        std.debug.assert(!self.finished);
+        try self.flush();
+        self.finished = true;
+
+        // 1. Filter block.
+        const filter_contents = try self.filter.finish(self.gpa);
+        const filter_handle = try self.writeRawBlock(filter_contents, kNoCompression);
+
+        // 2. Metaindex block: single entry "filter."++name -> filter handle.
+        var metaindex_block = BlockBuilder.init(self.gpa, kMetaIndexRestartInterval);
+        defer metaindex_block.deinit();
+        {
+            var key_buf: std.ArrayListUnmanaged(u8) = .empty;
+            defer key_buf.deinit(self.gpa);
+            try key_buf.appendSlice(self.gpa, "filter.");
+            try key_buf.appendSlice(self.gpa, self.policy.name());
+
+            self.handle_encoding.clearRetainingCapacity();
+            try filter_handle.encodeTo(&self.handle_encoding, self.gpa);
+            try metaindex_block.add(key_buf.items, self.handle_encoding.items);
+        }
+        const metaindex_handle = try self.writeBlock(&metaindex_block);
+
+        // 3. Final pending index entry (use a short successor of the last key).
+        if (self.pending_index_entry) {
+            self.options.comparator.findShortSuccessor(&self.last_key);
+            self.handle_encoding.clearRetainingCapacity();
+            try self.pending_handle.encodeTo(&self.handle_encoding, self.gpa);
+            try self.index_block.add(self.last_key.items, self.handle_encoding.items);
+            self.pending_index_entry = false;
+        }
+
+        // 4. Index block.
+        const index_handle = try self.writeBlock(&self.index_block);
+
+        // 5. Footer (no trailer).
+        const footer = Footer{
+            .metaindex_handle = metaindex_handle,
+            .index_handle = index_handle,
+            .format_version = 5,
+            .checksum_type = .crc32c,
+        };
+        var footer_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer footer_buf.deinit(self.gpa);
+        try footer.encodeTo(&footer_buf, self.gpa);
+        try self.file.append(footer_buf.items);
+        self.offset += footer_buf.items.len;
+
+        try self.file.flush();
     }
 };
 
