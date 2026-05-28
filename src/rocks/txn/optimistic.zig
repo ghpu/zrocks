@@ -61,7 +61,15 @@ pub const OptimisticTransaction = struct {
     pub fn commit(self: *OptimisticTransaction, wopts: WriteOptions) !void {
         std.debug.assert(!self.base.committed);
 
-        // TODO(m7.6 green): conflict validation against latestSequenceForKey.
+        // Conflict validation: walk the written-key set (the RYOW index keys).
+        var it = self.base.ryow.iterator();
+        while (it.next()) |e| {
+            const key = e.key_ptr.*;
+            if (self.base.db.latestSequenceForKey(key) > self.base.snapshot_seq) {
+                return error.Busy; // write-write conflict; abort (caller may retry)
+            }
+        }
+
         if (!self.base.isEmpty()) {
             try self.base.db.write(wopts, &self.base.batch);
         }

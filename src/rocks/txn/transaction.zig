@@ -139,11 +139,13 @@ pub const Transaction = struct {
     /// Otherwise the DB is read at the txn's BEGIN snapshot, giving snapshot
     /// isolation.  Returns a freshly gpa-allocated value the CALLER OWNS, or null.
     pub fn get(self: *Transaction, gpa: std.mem.Allocator, key: []const u8) !?[]u8 {
-        // TODO(m7.6 green): consult the RYOW index + read at the begin snapshot.
-        _ = self;
-        _ = gpa;
-        _ = key;
-        return null;
+        if (self.ryow.get(key)) |op| {
+            return switch (op) {
+                .put, .merge => |v| try gpa.dupe(u8, v),
+                .delete => null,
+            };
+        }
+        return self.db.get(.{ .snapshot = self.snapshot_seq }, key);
     }
 
     /// Discard all buffered writes (resets the commit batch + clears the RYOW

@@ -52,9 +52,7 @@ pub const PessimisticTransaction = struct {
     /// Acquire the exclusive lock on `key` for this txn; `error.Busy` if another
     /// open txn holds it.  Re-locking a key this txn already owns is a no-op.
     fn lockKey(self: *PessimisticTransaction, key: []const u8) !void {
-        // TODO(m7.6 green): acquire the key lock, error.Busy on contention.
-        _ = self;
-        _ = key;
+        if (!(try self.locks.tryLock(key, self.id))) return error.Busy;
     }
 
     pub fn put(self: *PessimisticTransaction, key: []const u8, value: []const u8) !void {
