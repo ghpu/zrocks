@@ -22,6 +22,7 @@ const comparator = @import("../util/comparator.zig");
 const internal_key = @import("../format/internal_key.zig");
 const coding = @import("../util/coding.zig");
 const prefix = @import("../rocks/prefix.zig");
+const merge_operator_mod = @import("../rocks/merge_operator.zig");
 
 /// User-facing iterator over a single internal iterator at a fixed snapshot.
 pub const DBIterator = struct {
@@ -61,6 +62,16 @@ pub const DBIterator = struct {
     /// The active prefix bound; empty/unset means "no bound".
     prefix_bound: std.ArrayListUnmanaged(u8) = .empty,
     prefix_bound_set: bool = false,
+
+    /// Optional merge operator (M7.1).  When set, a run of `.merge` operands at
+    /// the head of a user key's versions is combined — together with an optional
+    /// underlying `.value` base — into a single surfaced value via `fullMerge`.
+    merge_operator: ?merge_operator_mod.MergeOperator = null,
+    /// True when the just-surfaced entry came from a merge run, which already
+    /// advanced `inner` PAST the whole run (to the next user key's first entry).
+    /// `next` then skips its usual initial `inner.next()` so it does not jump
+    /// over that entry.
+    inner_past_run: bool = false,
 
     pub fn init(
         gpa: std.mem.Allocator,
@@ -110,6 +121,7 @@ pub const DBIterator = struct {
         // A whole-DB scan has no prefix bound.
         self.prefix_bound_set = false;
         self.prefix_bound.clearRetainingCapacity();
+        self.inner_past_run = false;
         self.inner.seekToFirst();
         self.findNextUserEntry(false) catch |e| self.fail(e);
     }
@@ -121,6 +133,7 @@ pub const DBIterator = struct {
         // An out-of-domain target leaves the scan unbounded (RocksDB behaviour).
         self.prefix_bound_set = false;
         self.prefix_bound.clearRetainingCapacity();
+        self.inner_past_run = false;
         if (self.prefix_same_as_start) {
             if (self.prefix_extractor) |pe| {
                 if (pe.inDomain(user_target)) {
@@ -130,13 +143,17 @@ pub const DBIterator = struct {
             }
         }
 
-        // Build an internal lookup key: user_target ++ trailer(snapshot, seek).
+        // Build an internal lookup key: user_target ++ max-type seek trailer.
         // Because internal keys sort by trailer DESCENDING, seeking to this
-        // lands at/after the newest version of user_target with seq <= snapshot.
+        // lands at/before the newest version of user_target with seq <= snapshot.
+        // A raw 0xFF type byte (above every real ValueType, incl. `.merge` = 0x2)
+        // guarantees we do not skip a `.merge` entry that sits at the snapshot
+        // sequence (its type byte exceeds `.value`).  The trailer is only ever
+        // compared, never parsed, so 0xFF is safe.
         var lookup: std.ArrayListUnmanaged(u8) = .empty;
         defer lookup.deinit(self.gpa);
         lookup.appendSlice(self.gpa, user_target) catch |e| return self.fail(e);
-        const trailer = internal_key.packSequenceAndType(self.snapshot, internal_key.kValueTypeForSeek);
+        const trailer = (self.snapshot << 8) | 0xFF;
         var tbuf: [8]u8 = undefined;
         coding.encodeFixed64(&tbuf, trailer);
         lookup.appendSlice(self.gpa, &tbuf) catch |e| return self.fail(e);
@@ -150,8 +167,14 @@ pub const DBIterator = struct {
         std.debug.assert(self.is_valid);
         // The saved_key already holds the just-returned user key; everything
         // with that user key must be skipped.  Advance once past the current
-        // inner entry, then resume the skip-loop with skipping = true.
-        self.inner.next();
+        // inner entry, then resume the skip-loop with skipping = true.  When the
+        // last surface came from a merge run, `inner` is already positioned at
+        // the next user key's first entry — do NOT advance again or we'd skip it.
+        if (self.inner_past_run) {
+            self.inner_past_run = false;
+        } else {
+            self.inner.next();
+        }
         self.findNextUserEntry(true) catch |e| self.fail(e);
     }
 
@@ -195,7 +218,34 @@ pub const DBIterator = struct {
                         }
                     },
                     .merge => {
-                        // Merge operands are not handled at this layer.
+                        const is_new_key = !skipping or
+                            self.user_cmp.compare(ikey.user_key, self.saved_key.items) == .gt;
+                        if (!is_new_key) {
+                            // An operand belonging to a user key we already
+                            // surfaced/hid — skip it.
+                        } else if (self.outsidePrefixBound(ikey.user_key)) {
+                            self.saved_key.clearRetainingCapacity();
+                            self.saved_value.clearRetainingCapacity();
+                            self.is_valid = false;
+                            return;
+                        } else if (self.merge_operator) |_| {
+                            // The newest visible entry for this user key is a
+                            // merge operand: gather its run (+ optional base) and
+                            // surface the combined value.  `mergeUserEntry`
+                            // advances `inner` past the whole run, so return
+                            // directly afterward.
+                            if (try self.mergeUserEntry(ikey.user_key)) return;
+                            // mergeUserEntry left us positioned past the run and
+                            // could not surface a value (operator failure with no
+                            // base): mark the key handled and continue scanning.
+                            skipping = true;
+                            continue;
+                        } else {
+                            // No merge operator: a stray operand is a usage
+                            // error.  Treat it like a key to skip (hide it).
+                            try self.saveKey(ikey.user_key);
+                            skipping = true;
+                        }
                     },
                 }
             }
@@ -205,6 +255,85 @@ pub const DBIterator = struct {
         self.saved_key.clearRetainingCapacity();
         self.saved_value.clearRetainingCapacity();
         self.is_valid = false;
+    }
+
+    /// Gather the run of `.merge` operands (and an optional underlying `.value`
+    /// base or `.deletion`) for `user_key`, beginning at the current `inner`
+    /// position (which must be the newest visible operand).  Combines them via
+    /// the merge operator and surfaces the result.  Advances `inner` to the
+    /// first entry PAST this user key's version run.
+    ///
+    /// Returns true when a value was surfaced (is_valid set, inner advanced);
+    /// false when the operator failed with no base (caller skips the key).
+    fn mergeUserEntry(self: *DBIterator, user_key: []const u8) !bool {
+        const merge_op = self.merge_operator.?;
+
+        // Stable copy of the user key (inner advances during the walk).
+        try self.saveKey(user_key);
+
+        var operands: std.ArrayListUnmanaged([]u8) = .empty; // newest-first
+        defer {
+            for (operands.items) |op| self.gpa.free(op);
+            operands.deinit(self.gpa);
+        }
+        var base: ?[]u8 = null;
+        defer if (base) |b| self.gpa.free(b);
+        var have_base = false;
+
+        while (self.inner.valid()) {
+            const ikey = try internal_key.parseInternalKey(self.inner.key());
+            if (self.user_cmp.compare(ikey.user_key, self.saved_key.items) != .eq) break;
+            if (ikey.sequence <= self.snapshot) {
+                switch (ikey.type) {
+                    .merge => try operands.append(self.gpa, try self.gpa.dupe(u8, self.inner.value())),
+                    .value => {
+                        base = try self.gpa.dupe(u8, self.inner.value());
+                        have_base = true;
+                        self.inner.next(); // consume the base too
+                        break;
+                    },
+                    .deletion, .single_deletion, .range_deletion => {
+                        self.inner.next(); // consume the tombstone (stops merge, no base)
+                        break;
+                    },
+                }
+            }
+            self.inner.next();
+        }
+
+        if (operands.items.len == 0) {
+            // No visible operands (all above the snapshot): fall back to the
+            // base/tombstone semantics.
+            if (have_base) {
+                try self.saveValue(base.?);
+                self.is_valid = true;
+                self.inner_past_run = true;
+                return true;
+            }
+            return false; // nothing to surface; caller continues scanning
+        }
+
+        std.mem.reverse([]u8, operands.items); // OLDEST-first for the operator
+        const view = try self.gpa.alloc([]const u8, operands.items.len);
+        defer self.gpa.free(view);
+        for (operands.items, 0..) |op, i| view[i] = op;
+
+        const existing: ?[]const u8 = if (have_base) base.? else null;
+        const merged = (try merge_op.fullMerge(self.saved_key.items, existing, view, self.gpa)) orelse {
+            // Operator failure: fall back to the base if any, else skip.
+            if (have_base) {
+                try self.saveValue(base.?);
+                self.is_valid = true;
+                self.inner_past_run = true;
+                return true;
+            }
+            return false;
+        };
+        defer self.gpa.free(merged);
+        try self.saveValue(merged);
+        self.is_valid = true;
+        self.inner_past_run = true;
+        return true;
     }
 
     /// True when a prefix bound is active and `user_key`'s prefix differs from
