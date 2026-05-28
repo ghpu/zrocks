@@ -99,7 +99,7 @@ fn bytewiseFindShortSuccessor(_: *const anyopaque, key: *std.ArrayList(u8)) void
 }
 
 // ---------------------------------------------------------------------------
-// Reverse bytewise comparator — stubs
+// Reverse bytewise comparator — singleton
 // ---------------------------------------------------------------------------
 
 const reverse_bytewise_vtable = Comparator.VTable{
