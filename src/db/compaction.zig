@@ -239,11 +239,19 @@ pub fn doCompaction(
         if (cur_largest) |l| gpa.free(l);
     }
 
-    // last_user_key holds the user key of the most recent OUTPUT/seen entry, in
-    // a stable buffer (iterator slices are transient).
+    // last_user_key holds the user key of the most recent seen entry, in a
+    // stable buffer (iterator slices are transient).  `last_sequence_for_key`
+    // is the sequence of the PREVIOUS entry for that same user key, mirroring
+    // LevelDB's `DBImpl::DoCompactionWork`: it is reset to "max" on each new
+    // user key so the FIRST (newest) version is never dropped, and an entry is
+    // dropped only once a strictly-newer version at-or-below the snapshot has
+    // already been emitted for the key.  Checking the PREVIOUS entry's sequence
+    // (not the current one's) is what keeps a value pinned by a snapshot whose
+    // sequence equals that value's sequence (the M6.3 correctness property).
     var last_user_key: std.ArrayListUnmanaged(u8) = .empty;
     defer last_user_key.deinit(gpa);
     var has_last_user_key = false;
+    var last_sequence_for_key: u64 = internal_key.kMaxSequenceNumber;
 
     mit.seekToFirst();
     while (mit.valid()) : (mit.next()) {
@@ -271,24 +279,30 @@ pub fn doCompaction(
                 user_cmp.compare(user_key, last_user_key.items) != .eq;
 
             if (first_for_key) {
-                // Remember this user key in a stable buffer.
+                // New user key: remember it, and reset the per-key sequence so
+                // this (newest) version is always kept.
                 last_user_key.clearRetainingCapacity();
                 try last_user_key.appendSlice(gpa, user_key);
                 has_last_user_key = true;
+                last_sequence_for_key = internal_key.kMaxSequenceNumber;
             }
 
-            if (!first_for_key and parsed.sequence <= smallest_snapshot) {
-                // An older version of a user key already emitted, hidden by the
-                // newer one and below the snapshot → drop.
+            if (last_sequence_for_key <= smallest_snapshot) {
+                // A strictly-newer version for this key was already emitted and
+                // sits at-or-below the oldest snapshot, so no live read can see
+                // this older entry → drop.
                 drop = true;
             } else if (parsed.type == .deletion and
                 parsed.sequence <= smallest_snapshot and
                 isBaseLevelForKey(versions, compaction.level, user_key, user_cmp))
             {
-                // A tombstone no longer needed (nothing deeper would resurface) →
-                // drop.
+                // A tombstone no longer needed (nothing deeper would resurface
+                // and no snapshot needs it) → drop.
                 drop = true;
             }
+
+            // Record this entry's sequence as the "previous" for the next one.
+            last_sequence_for_key = parsed.sequence;
         }
 
         if (drop) continue;

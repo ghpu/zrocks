@@ -263,10 +263,15 @@ pub const DB = struct {
     }
 
     /// Run leveled compactions until no level wants one (or a guard trips).
-    /// Synchronous + single-threaded for M6.2; uses the DB's latest sequence as
-    /// `smallest_snapshot` (no live-snapshot pinning yet — M6.3 wires the real
-    /// oldest snapshot).  TODO(perf): background compaction thread.
+    /// Synchronous + single-threaded.  The compaction's `smallest_snapshot` is
+    /// the oldest LIVE snapshot's sequence (or the latest sequence if none is
+    /// live), so versions/tombstones still visible to a snapshot are never
+    /// dropped (M6.3 snapshot pinning).  TODO(perf): background compaction
+    /// thread.
     fn maybeScheduleCompaction(self: *DB) !void {
+        // Pin compaction to the oldest live snapshot so it cannot discard a
+        // version (or a tombstone) that a snapshot read could still need.
+        const smallest_snapshot = self.snapshots.oldest() orelse self.last_sequence;
         // Guard against a pathological loop: each compaction must make progress
         // (it reduces a level's score by moving files down), so bound the number
         // of iterations generously by the current file count.
@@ -294,7 +299,7 @@ pub const DB = struct {
                 self.options.comparator,
                 self.versions,
                 &c,
-                self.last_sequence,
+                smallest_snapshot,
             );
         }
     }
