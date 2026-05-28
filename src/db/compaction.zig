@@ -20,10 +20,20 @@
 //! (with the underlying base/deletion) into a single value — keeping
 //! above-snapshot operands verbatim and never losing an operand.
 //!
+//! Compaction filter (M7.4): when `options.compaction_filter` is set, the newest
+//! plain `.value` survivor of each user key that is NOT visible to a live
+//! snapshot is handed to the filter, which may keep, drop (`.remove`), or rewrite
+//! (`.change`) it.  A `.change` replacement is gpa-allocated by the filter and
+//! freed here after writing.  Snapshot-protected versions, merge operands,
+//! deletions, and older (hidden) versions are never filtered.
+//!
 //! What is implemented vs left as TODO:
 //!   * Size-based output split — implemented (correctness-sufficient).
 //!   * Tombstone drop at the base level — implemented (isBaseLevelForKey).
 //!   * Merge operand collapse — implemented (collapseMergeRun, M7.1).
+//!   * Compaction filter on plain `.value` survivors — implemented (M7.4).
+//!   * Compaction filter on merge-derived values / FilterMergeOperand — TODO.
+//!   * Per-compaction CompactionFilterFactory — TODO (single filter for now).
 //!   * Grandparent-overlap split — TODO (refinement; size split suffices).
 //!   * Boundary-input expansion ("AddBoundaryInputs") — TODO (refinement).
 //!   * Obsolete .sst deletion from disk — TODO (files are dropped from the
@@ -185,6 +195,13 @@ pub fn doCompaction(
     versions: *VersionSet,
     compaction: *Compaction,
     smallest_snapshot: u64,
+    /// True iff a LIVE snapshot pins `smallest_snapshot` (vs. it merely being the
+    /// latest sequence because no snapshot is held).  The compaction filter (M7.4)
+    /// must never modify an entry a live snapshot can still read, so when this is
+    /// true the newest `.value` of a key is filtered only if its sequence is
+    /// strictly ABOVE `smallest_snapshot` (a post-snapshot version the oldest
+    /// snapshot does not see); when false, the newest version is always eligible.
+    has_live_snapshot: bool,
 ) !void {
     // --- 1. Build child iterators over every input file --------------------
     var children: std.ArrayListUnmanaged(iterator.Iterator) = .empty;
@@ -315,6 +332,10 @@ pub fn doCompaction(
         // rule below would corrupt them.  When the newest surviving entry for a
         // user key is a `.merge` and an operator is configured, collapse the
         // operand run here (it advances `mit` past everything it consumes).
+        // TODO(M7.4): the M7.4 compaction filter is intentionally NOT applied to
+        // a value produced by collapseMergeRun (a merge-derived `.value`); only
+        // plain `.value` survivors below are filtered.  Filtering a merge result
+        // (and a FilterMergeOperand hook for operands) is a future refinement.
         if (parsed.type == .merge and
             options.merge_operator != null and
             last_sequence_for_key == internal_key.kMaxSequenceNumber) // first-for-key (newest)
@@ -349,10 +370,46 @@ pub fn doCompaction(
             drop = true;
         }
 
+        // --- M7.4: compaction filter on the newest, snapshot-eligible .value --
+        // Only consider a plain `.value` that survives the drop rules and is the
+        // NEWEST version of its user key (no strictly-newer version seen yet, i.e.
+        // last_sequence_for_key is still the per-key reset sentinel).  Merge
+        // operands never reach here (collapseMergeRun consumes them above), and
+        // deletions / older versions are excluded by the type and freshness
+        // checks.  The entry must additionally be SNAPSHOT-ELIGIBLE: when a live
+        // snapshot pins `smallest_snapshot`, the oldest snapshot reads the newest
+        // version with sequence <= smallest_snapshot, so that version must survive
+        // verbatim — only a strictly-newer (post-snapshot) version may be
+        // filtered.  Without a live snapshot the newest version is always
+        // eligible.  The filter may keep, drop, or rewrite the value.
+        const snapshot_eligible = !has_live_snapshot or parsed.sequence > smallest_snapshot;
+        var filtered_value = value;
+        var owned_change: ?[]const u8 = null;
+        if (!drop and
+            parsed.type == .value and
+            last_sequence_for_key == internal_key.kMaxSequenceNumber and // newest for this key
+            snapshot_eligible)
+        {
+            if (options.compaction_filter) |cf| {
+                switch (try cf.filter(compaction.level, user_key, value, gpa)) {
+                    .keep => {},
+                    .remove => drop = true,
+                    .change => |repl| {
+                        // The compaction owns the replacement: emit it below, then
+                        // free it (the ownership contract).
+                        owned_change = repl;
+                        filtered_value = repl;
+                    },
+                }
+            }
+        }
+        // Free any change buffer once we are done emitting it (or if dropped).
+        defer if (owned_change) |c| gpa.free(c);
+
         // Record this entry's sequence as the "previous" for the next one.
         last_sequence_for_key = parsed.sequence;
 
-        if (!drop) try emit_ctx.emit(ikey, value);
+        if (!drop) try emit_ctx.emit(ikey, filtered_value);
         mit.next();
     }
 
@@ -1121,5 +1178,144 @@ test "M7.1: randomized merge gate vs counter reference (flush + compaction + reo
         const db = try DB.open(gpa, e, "mergefuzz", opts);
         defer db.close();
         try verifyCounterRef(gpa, db, &ref, key_space);
+    }
+}
+
+// --- THE COMPACTION-FILTER GATE (M7.4) -------------------------------------
+
+const compaction_filter_mod = @import("../rocks/compaction_filter.zig");
+
+test "M7.4: compaction filter removes keys whose value has the configured prefix" {
+    const gpa = testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    var f = compaction_filter_mod.RemoveByValuePrefixFilter{ .prefix = "DEL" };
+    const db = try DB.open(gpa, e, "cf-remove", .{
+        .compaction_filter = f.filter(),
+        .write_buffer_size = 1, // tiny buffer -> flush per put
+        .level0_file_num_compaction_trigger = 2, // fire a compaction quickly
+    });
+    defer db.close();
+
+    // A mix of "DEL..."-valued keys (to be removed) and normal keys (kept).
+    try db.put(.{}, "a", "DELme");
+    try db.put(.{}, "b", "keep-b");
+    try db.put(.{}, "c", "DELme-too");
+    try db.put(.{}, "d", "keep-d");
+    try db.put(.{}, "e", "keep-e"); // extra writes force flushes + compaction
+
+    // Data has been pushed to L1 by compaction.
+    try testing.expect(levelFiles(db, 1) >= 1);
+
+    // The "DEL"-valued keys are gone; the normal keys remain with their values.
+    try testing.expect((try db.get(.{}, "a")) == null);
+    try testing.expect((try db.get(.{}, "c")) == null);
+    for ([_]struct { k: []const u8, v: []const u8 }{
+        .{ .k = "b", .v = "keep-b" },
+        .{ .k = "d", .v = "keep-d" },
+        .{ .k = "e", .v = "keep-e" },
+    }) |kv| {
+        const got = try db.get(.{}, kv.k) orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings(kv.v, got);
+    }
+}
+
+test "M7.4: compaction filter rewrites surviving values (change decision)" {
+    const gpa = testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    var f = compaction_filter_mod.AppendSuffixFilter{ .suffix = "!" };
+    const db = try DB.open(gpa, e, "cf-change", .{
+        .compaction_filter = f.filter(),
+        .write_buffer_size = 1,
+        .level0_file_num_compaction_trigger = 2,
+    });
+    defer db.close();
+
+    // The keys under test (a..d), then a run of trailing keys whose only job is
+    // to force flushes + compactions so EVERY key under test is swept down to L1
+    // (the last-written keys would otherwise linger in L0 and never be filtered).
+    try db.put(.{}, "a", "av");
+    try db.put(.{}, "b", "bv");
+    try db.put(.{}, "c", "cv");
+    try db.put(.{}, "d", "dv");
+    for ([_][]const u8{ "p", "q", "r", "s", "t", "u" }) |k| {
+        try db.put(.{}, k, "x");
+    }
+
+    try testing.expect(levelFiles(db, 1) >= 1);
+
+    // Every surviving value under test has the suffix appended exactly once by
+    // the filter (L1 never overflows here, so a key is filtered a single time).
+    for ([_]struct { k: []const u8, v: []const u8 }{
+        .{ .k = "a", .v = "av!" },
+        .{ .k = "b", .v = "bv!" },
+        .{ .k = "c", .v = "cv!" },
+        .{ .k = "d", .v = "dv!" },
+    }) |kv| {
+        const got = try db.get(.{}, kv.k) orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings(kv.v, got);
+    }
+}
+
+test "M7.4: compaction filter must not touch snapshot-protected entries" {
+    const gpa = testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    var f = compaction_filter_mod.RemoveByValuePrefixFilter{ .prefix = "DEL" };
+    // Small level budgets + output files so data is driven all the way down
+    // through L1 -> L2 -> ... (an L1->L2 compaction re-reads every overlapping
+    // L1 file, so the file holding "k" is eventually swept after release).
+    const db = try DB.open(gpa, e, "cf-snap", .{
+        .compaction_filter = f.filter(),
+        .write_buffer_size = 64,
+        .level0_file_num_compaction_trigger = 2,
+        .max_bytes_for_level_base = 256,
+        .target_file_size_base = 256,
+    });
+    defer db.close();
+
+    // Write the value the filter would remove, then PIN it with a snapshot so a
+    // compaction must not drop it.
+    try db.put(.{}, "k", "DELme");
+    const snap = try db.getSnapshot();
+
+    // More writes to force flushes + a compaction while the snapshot is held.
+    try db.put(.{}, "a", "av");
+    try db.put(.{}, "b", "bv");
+    try db.put(.{}, "c", "cv");
+
+    // The snapshot read still sees the original value (filter left it alone
+    // because "k" is protected by the snapshot — its sequence > smallest_snapshot).
+    {
+        const got = try db.get(.{ .snapshot = snap.sequence }, "k") orelse
+            return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings("DELme", got);
+    }
+
+    // Release the snapshot, then force more compactions.  We write a run of
+    // keys spanning across and PAST "k" so the L1 file that holds "k" is pulled
+    // into a level-0 -> level-1 compaction (overlap requires the input range to
+    // cover "k").  With the snapshot gone "k" is now eligible and is removed.
+    db.releaseSnapshot(snap);
+    var kbuf: [8]u8 = undefined;
+    var i: usize = 0;
+    while (i < 60) : (i += 1) {
+        const key = try std.fmt.bufPrint(&kbuf, "x{d:0>4}", .{i});
+        try db.put(.{}, key, "keepmevalue-padding-to-grow-levels");
+    }
+
+    if (try db.get(.{}, "k")) |leftover| {
+        defer gpa.free(leftover);
+        return error.TestExpectedRemoved;
     }
 }
