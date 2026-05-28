@@ -1,7 +1,25 @@
 //! compaction.zig — leveled (LevelDB-style) compaction (M6.2).
 //!
-//! RED phase: declarations with stubs + the full test suite (targeted +
-//! randomized gate).  GREEN phase fills in the bodies.
+//! Merges SST files from one level into the next while preserving exact LSM
+//! read semantics.  `pickCompaction` chooses what to compact (by score),
+//! `doCompaction` performs the merge — feeding every input file's IKC-ordered
+//! iterator through a `MergingIterator`, dropping shadowed/obsolete entries
+//! (older duplicates below the snapshot, and tombstones that no deeper level
+//! needs), and writing the surviving entries into fresh `level+1` SSTs split by
+//! `target_file_size_base`.  A single `VersionEdit` removes the input files and
+//! adds the outputs, so the new Version reflects the merge atomically.
+//!
+//! Following LevelDB: the merged stream is in IKC order (user key ascending,
+//! then sequence descending), so the FIRST occurrence of each user key is the
+//! newest version.
+//!
+//! What is implemented vs left as TODO:
+//!   * Size-based output split — implemented (correctness-sufficient).
+//!   * Tombstone drop at the base level — implemented (isBaseLevelForKey).
+//!   * Grandparent-overlap split — TODO (refinement; size split suffices).
+//!   * Boundary-input expansion ("AddBoundaryInputs") — TODO (refinement).
+//!   * Obsolete .sst deletion from disk — TODO (files are dropped from the
+//!     Version but left on disk; a future SST file manager reclaims them).
 
 const std = @import("std");
 
@@ -11,9 +29,18 @@ const comparator = @import("../util/comparator.zig");
 const internal_key = @import("../format/internal_key.zig");
 const version_set = @import("../version/version_set.zig");
 const version_edit = @import("../version/version_edit.zig");
+const table_cache_mod = @import("../version/table_cache.zig");
+const merging_iterator = @import("../iterator/merging_iterator.zig");
+const iterator = @import("../iterator/iterator.zig");
+const table_builder_mod = @import("../format/table_builder.zig");
+const bloom = @import("../format/bloom.zig");
+const filename = @import("../version/filename.zig");
 
 const FileMetaData = version_edit.FileMetaData;
 const VersionSet = version_set.VersionSet;
+
+/// Bloom bits/key for compaction-output SSTs (must match the reader policy).
+const kFilterBitsPerKey: usize = 10;
 
 pub const Compaction = struct {
     /// The level being compacted; output files land at `level + 1`.
@@ -23,36 +50,125 @@ pub const Compaction = struct {
     inputs: [2]std.ArrayListUnmanaged(FileMetaData),
 
     pub fn deinit(self: *Compaction, gpa: std.mem.Allocator) void {
-        _ = self;
-        _ = gpa;
-        @panic("compaction.Compaction.deinit not implemented");
+        for (&self.inputs) |*list| {
+            for (list.items) |f| {
+                gpa.free(f.smallest);
+                gpa.free(f.largest);
+            }
+            list.deinit(gpa);
+        }
+        self.* = undefined;
     }
 };
 
+/// Pick the next compaction to run, or null if no level wants compacting.
+///
+/// Scores every level (L0 by file count, deeper by bytes); the winner's input
+/// files are chosen from that level — for L0 the first file then EXPAND to all
+/// overlapping L0 files; for deeper levels the first file (round-robin
+/// compact-pointers are a TODO).  The combined user-key range then selects the
+/// overlapping files at `level+1` as inputs[1].
 pub fn pickCompaction(
     gpa: std.mem.Allocator,
     versions: *VersionSet,
     user_cmp: comparator.Comparator,
 ) !?Compaction {
-    _ = gpa;
-    _ = versions;
-    _ = user_cmp;
-    @panic("compaction.pickCompaction not implemented");
+    const level = versions.pickCompactionLevel() orelse return null;
+    const v = versions.currentVersion();
+    if (v.numFiles(level) == 0) return null;
+
+    var c = Compaction{
+        .level = level,
+        .inputs = .{ .empty, .empty },
+    };
+    errdefer c.deinit(gpa);
+
+    // --- inputs[0]: file(s) from `level` -----------------------------------
+    if (level == 0) {
+        // Pick the first L0 file, then expand to every L0 file overlapping the
+        // accumulated range (L0 files overlap arbitrarily).
+        const first = v.files[0].items[0];
+        var expanded = try v.overlappingInputs(gpa, 0, first.smallest, first.largest, user_cmp);
+        // `expanded` already deep-owns its bytes; move it into inputs[0].
+        c.inputs[0] = expanded;
+        expanded = .empty;
+    } else {
+        // Pick the first file at this level (TODO: round-robin compact pointer).
+        const first = v.files[level].items[0];
+        try c.inputs[0].append(gpa, .{
+            .number = first.number,
+            .file_size = first.file_size,
+            .smallest = try gpa.dupe(u8, first.smallest),
+            .largest = try gpa.dupe(u8, first.largest),
+        });
+    }
+
+    // --- combined user-key range of inputs[0] (internal keys) --------------
+    const range = keyRange(c.inputs[0].items, user_cmp);
+
+    // --- inputs[1]: overlapping files at level+1 ---------------------------
+    var lvl1 = try v.overlappingInputs(gpa, level + 1, range.smallest, range.largest, user_cmp);
+    c.inputs[1] = lvl1;
+    lvl1 = .empty;
+
+    return c;
 }
 
+const KeyRange = struct { smallest: []const u8, largest: []const u8 };
+
+/// The min/max INTERNAL keys (by InternalKeyComparator user-key ordering) of a
+/// non-empty file list.  Returned slices alias the list's own bytes.
+fn keyRange(files: []const FileMetaData, user_cmp: comparator.Comparator) KeyRange {
+    std.debug.assert(files.len > 0);
+    var smallest = files[0].smallest;
+    var largest = files[0].largest;
+    for (files[1..]) |f| {
+        if (user_cmp.compare(internal_key.extractUserKey(f.smallest), internal_key.extractUserKey(smallest)) == .lt) {
+            smallest = f.smallest;
+        }
+        if (user_cmp.compare(internal_key.extractUserKey(f.largest), internal_key.extractUserKey(largest)) == .gt) {
+            largest = f.largest;
+        }
+    }
+    return .{ .smallest = smallest, .largest = largest };
+}
+
+/// True iff NO file at any level DEEPER than `level+1` overlaps `user_key` — so
+/// a tombstone for it can be safely dropped (nothing below would resurface an
+/// older value).  Conservative: any overlap returns false (keep the tombstone).
 pub fn isBaseLevelForKey(
     versions: *VersionSet,
     level: usize,
     user_key: []const u8,
     user_cmp: comparator.Comparator,
 ) bool {
-    _ = versions;
-    _ = level;
-    _ = user_key;
-    _ = user_cmp;
-    @panic("compaction.isBaseLevelForKey not implemented");
+    const v = versions.currentVersion();
+    var lvl: usize = level + 2;
+    while (lvl < version_set.kNumLevels) : (lvl += 1) {
+        for (v.files[lvl].items) |f| {
+            const start = internal_key.extractUserKey(f.smallest);
+            const limit = internal_key.extractUserKey(f.largest);
+            if (user_cmp.compare(user_key, start) != .lt and
+                user_cmp.compare(user_key, limit) != .gt)
+            {
+                return false; // a deeper file holds this user key — keep tombstone.
+            }
+        }
+    }
+    return true;
 }
 
+/// One in-progress / finished output SST during a compaction.
+const Output = struct {
+    number: u64,
+    smallest: []u8, // owned
+    largest: []u8, // owned
+    file_size: u64,
+};
+
+/// Run the compaction: merge inputs[0] ++ inputs[1], drop shadowed/obsolete
+/// entries, write the survivors into fresh `level+1` SSTs, and logAndApply a
+/// VersionEdit that removes the inputs and adds the outputs.
 pub fn doCompaction(
     gpa: std.mem.Allocator,
     e: env.Env,
@@ -64,16 +180,197 @@ pub fn doCompaction(
     compaction: *Compaction,
     smallest_snapshot: u64,
 ) !void {
-    _ = gpa;
-    _ = e;
-    _ = dbname;
-    _ = options;
-    _ = ikc;
-    _ = user_cmp;
-    _ = versions;
-    _ = compaction;
-    _ = smallest_snapshot;
-    @panic("compaction.doCompaction not implemented");
+    // --- 1. Build child iterators over every input file --------------------
+    var children: std.ArrayListUnmanaged(iterator.Iterator) = .empty;
+    // On any error before the merger takes ownership, tear the children down.
+    var merger_owns_children = false;
+    errdefer if (!merger_owns_children) {
+        for (children.items) |it| it.deinit();
+        children.deinit(gpa);
+    };
+
+    // We need a TableCache to open the input files.  Build a private one for
+    // this compaction so we don't depend on the DB's cache lifetime.  It must
+    // be pinned (its ikcmp address is taken into opened tables), so heap it.
+    const tc = try gpa.create(table_cache_mod.TableCache);
+    tc.* = table_cache_mod.TableCache.init(gpa, e, dbname, options, null);
+    defer {
+        tc.deinit();
+        gpa.destroy(tc);
+    }
+
+    for (&compaction.inputs) |*list| {
+        for (list.items) |f| {
+            const it = try tc.newIterator(gpa, f.number, f.file_size);
+            errdefer it.deinit();
+            try children.append(gpa, it);
+        }
+    }
+
+    // --- 2. Merge them in InternalKeyComparator order ----------------------
+    var merger = try merging_iterator.MergingIterator.init(gpa, ikc, children.items);
+    merger_owns_children = true; // merger copied + now owns the children
+    children.deinit(gpa); // free our temporary list (copies live in the merger)
+    defer merger.deinit(); // tears down every child iterator
+    const mit = merger.iterator();
+
+    // --- 3. Accumulate finished outputs (their metadata) -------------------
+    var outputs: std.ArrayListUnmanaged(Output) = .empty;
+    defer {
+        for (outputs.items) |o| {
+            gpa.free(o.smallest);
+            gpa.free(o.largest);
+        }
+        outputs.deinit(gpa);
+    }
+
+    // The currently-open output builder + its file/metadata (null between
+    // outputs).  build_opts uses the IKC (SSTs store internal keys).
+    var build_opts = options;
+    build_opts.comparator = ikc;
+    const policy = bloom.BloomFilterPolicy.init(kFilterBitsPerKey);
+
+    var builder: ?table_builder_mod.TableBuilder = null;
+    var cur_file: ?env.WritableFile = null;
+    var cur_number: u64 = 0;
+    var cur_smallest: ?[]u8 = null;
+    var cur_largest: ?[]u8 = null;
+    // Tear down a half-open output on error (the success path closes it cleanly).
+    errdefer {
+        if (builder) |*b| b.deinit();
+        if (cur_file) |f| f.close() catch {};
+        if (cur_smallest) |s| gpa.free(s);
+        if (cur_largest) |l| gpa.free(l);
+    }
+
+    // last_user_key holds the user key of the most recent OUTPUT/seen entry, in
+    // a stable buffer (iterator slices are transient).
+    var last_user_key: std.ArrayListUnmanaged(u8) = .empty;
+    defer last_user_key.deinit(gpa);
+    var has_last_user_key = false;
+
+    mit.seekToFirst();
+    while (mit.valid()) : (mit.next()) {
+        if (mit.status()) |err| return err;
+
+        const ikey = mit.key();
+        const value = mit.value();
+
+        // On a parse failure, keep the entry verbatim (defensive — should not
+        // happen for well-formed SSTs).
+        var drop = false;
+        var parsed_ok = true;
+        const parsed = internal_key.parseInternalKey(ikey) catch blk: {
+            parsed_ok = false;
+            break :blk internal_key.ParsedInternalKey{
+                .user_key = ikey,
+                .sequence = 0,
+                .type = .value,
+            };
+        };
+
+        if (parsed_ok) {
+            const user_key = parsed.user_key;
+            const first_for_key = !has_last_user_key or
+                user_cmp.compare(user_key, last_user_key.items) != .eq;
+
+            if (first_for_key) {
+                // Remember this user key in a stable buffer.
+                last_user_key.clearRetainingCapacity();
+                try last_user_key.appendSlice(gpa, user_key);
+                has_last_user_key = true;
+            }
+
+            if (!first_for_key and parsed.sequence <= smallest_snapshot) {
+                // An older version of a user key already emitted, hidden by the
+                // newer one and below the snapshot → drop.
+                drop = true;
+            } else if (parsed.type == .deletion and
+                parsed.sequence <= smallest_snapshot and
+                isBaseLevelForKey(versions, compaction.level, user_key, user_cmp))
+            {
+                // A tombstone no longer needed (nothing deeper would resurface) →
+                // drop.
+                drop = true;
+            }
+        }
+
+        if (drop) continue;
+
+        // --- emit the surviving entry into the current output builder ------
+        if (builder == null) {
+            cur_number = versions.newFileNumber();
+            const path = try filename.tableFileName(gpa, dbname, cur_number);
+            defer gpa.free(path);
+            cur_file = try e.newWritableFile(gpa, path);
+            builder = try table_builder_mod.TableBuilder.init(gpa, build_opts, cur_file.?, policy);
+            cur_smallest = null;
+            cur_largest = null;
+        }
+
+        try builder.?.add(ikey, value);
+        if (cur_smallest == null) cur_smallest = try gpa.dupe(u8, ikey);
+        if (cur_largest) |l| gpa.free(l);
+        cur_largest = try gpa.dupe(u8, ikey);
+
+        // Roll over to a fresh output once the current one reaches target size.
+        if (builder.?.fileSize() >= options.target_file_size_base) {
+            try finishOutput(gpa, &builder, &cur_file, cur_number, &cur_smallest, &cur_largest, &outputs);
+        }
+    }
+
+    // Close any final open output.
+    if (builder != null) {
+        try finishOutput(gpa, &builder, &cur_file, cur_number, &cur_smallest, &cur_largest, &outputs);
+    }
+
+    // --- 4. Apply the edit: remove inputs, add outputs at level+1 ----------
+    var edit = version_edit.VersionEdit.init();
+    defer edit.deinit(gpa);
+
+    for (compaction.inputs[0].items) |f| {
+        try edit.removeFile(gpa, @intCast(compaction.level), f.number);
+    }
+    for (compaction.inputs[1].items) |f| {
+        try edit.removeFile(gpa, @intCast(compaction.level + 1), f.number);
+    }
+    for (outputs.items) |o| {
+        try edit.addFile(gpa, @intCast(compaction.level + 1), o.number, o.file_size, o.smallest, o.largest);
+    }
+
+    try versions.logAndApply(&edit);
+    // TODO: delete obsolete input .sst files via an SST file manager.  They are
+    // dropped from the Version here but left on disk so concurrent readers (none
+    // yet) cannot fault.
+}
+
+/// Finish the current output builder: emit the table, capture its metadata into
+/// `outputs`, close the file, and reset the in-progress slots.
+fn finishOutput(
+    gpa: std.mem.Allocator,
+    builder: *?table_builder_mod.TableBuilder,
+    cur_file: *?env.WritableFile,
+    cur_number: u64,
+    cur_smallest: *?[]u8,
+    cur_largest: *?[]u8,
+    outputs: *std.ArrayListUnmanaged(Output),
+) !void {
+    try builder.*.?.finish();
+    const file_size = builder.*.?.fileSize();
+    builder.*.?.deinit();
+    builder.* = null;
+    try cur_file.*.?.close();
+    cur_file.* = null;
+
+    // Hand the owned smallest/largest to the outputs list.
+    try outputs.append(gpa, .{
+        .number = cur_number,
+        .smallest = cur_smallest.*.?,
+        .largest = cur_largest.*.?,
+        .file_size = file_size,
+    });
+    cur_smallest.* = null;
+    cur_largest.* = null;
 }
 
 // ===========================================================================
@@ -83,15 +380,6 @@ pub fn doCompaction(
 const testing = std.testing;
 const db_mod = @import("db.zig");
 const DB = db_mod.DB;
-const filename = @import("../version/filename.zig");
-
-/// Count files across all levels of the DB's current version.
-fn totalSSTFiles(db: *DB) usize {
-    var n: usize = 0;
-    const v = db.versions.currentVersion();
-    for (&v.files) |level| n += level.items.len;
-    return n;
-}
 
 /// Number of files at a given level.
 fn levelFiles(db: *DB, level: usize) usize {
