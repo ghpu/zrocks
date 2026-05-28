@@ -22,7 +22,6 @@ const bloom = @import("bloom.zig");
 const footer_mod = @import("footer.zig");
 const crc32c = @import("../util/crc32c.zig");
 const coding = @import("../util/coding.zig");
-const comparator = @import("../util/comparator.zig");
 const env = @import("../env/env.zig");
 const options_mod = @import("../options.zig");
 
@@ -36,6 +35,9 @@ pub const kNoCompression: u8 = 0;
 
 /// Restart interval used for the index and metaindex blocks (LevelDB uses 1).
 const kMetaIndexRestartInterval: usize = 1;
+
+/// Prefix of the metaindex key naming the table's filter block.
+const kFilterMetaKeyPrefix: []const u8 = "filter.";
 
 pub const TableBuilder = struct {
     gpa: std.mem.Allocator,
@@ -127,10 +129,7 @@ pub const TableBuilder = struct {
             std.debug.assert(self.data_block.isEmpty());
             // separator in [last_key, key); shortens last_key in place.
             self.options.comparator.findShortestSeparator(&self.last_key, key);
-            self.handle_encoding.clearRetainingCapacity();
-            try self.pending_handle.encodeTo(&self.handle_encoding, self.gpa);
-            try self.index_block.add(self.last_key.items, self.handle_encoding.items);
-            self.pending_index_entry = false;
+            try self.appendIndexEntry();
         }
 
         // Record the key in the filter.
@@ -146,6 +145,18 @@ pub const TableBuilder = struct {
         if (self.data_block.currentSizeEstimate() >= self.options.block_size) {
             try self.flush();
         }
+    }
+
+    /// Emit the deferred index entry for the just-flushed data block:
+    /// key = `last_key` (already narrowed to a short separator/successor by the
+    /// caller), value = the pending data block's encoded BlockHandle. Clears
+    /// `pending_index_entry`.
+    fn appendIndexEntry(self: *TableBuilder) !void {
+        std.debug.assert(self.pending_index_entry);
+        self.handle_encoding.clearRetainingCapacity();
+        try self.pending_handle.encodeTo(&self.handle_encoding, self.gpa);
+        try self.index_block.add(self.last_key.items, self.handle_encoding.items);
+        self.pending_index_entry = false;
     }
 
     /// Flush the current data block to the file and arm a deferred index entry.
@@ -208,7 +219,7 @@ pub const TableBuilder = struct {
         {
             var key_buf: std.ArrayListUnmanaged(u8) = .empty;
             defer key_buf.deinit(self.gpa);
-            try key_buf.appendSlice(self.gpa, "filter.");
+            try key_buf.appendSlice(self.gpa, kFilterMetaKeyPrefix);
             try key_buf.appendSlice(self.gpa, self.policy.name());
 
             self.handle_encoding.clearRetainingCapacity();
@@ -220,10 +231,7 @@ pub const TableBuilder = struct {
         // 3. Final pending index entry (use a short successor of the last key).
         if (self.pending_index_entry) {
             self.options.comparator.findShortSuccessor(&self.last_key);
-            self.handle_encoding.clearRetainingCapacity();
-            try self.pending_handle.encodeTo(&self.handle_encoding, self.gpa);
-            try self.index_block.add(self.last_key.items, self.handle_encoding.items);
-            self.pending_index_entry = false;
+            try self.appendIndexEntry();
         }
 
         // 4. Index block.
