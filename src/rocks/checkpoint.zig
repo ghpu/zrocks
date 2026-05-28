@@ -107,10 +107,14 @@ pub fn createCheckpoint(
 // Private helpers
 // ---------------------------------------------------------------------------
 
+/// I/O chunk size used by `copyFile`.  32 KiB is large enough to amortise
+/// per-call overhead on MemEnv while staying small enough to live on the stack.
+const kCopyBufSize = 32 * 1024;
+
 /// Copy every byte of `src_path` into `dest_path` using the provided `Env`.
-/// Opens `src_path` as a SequentialFile, reads in 32 KiB chunks, and appends
-/// each chunk to a newly created WritableFile at `dest_path`.  Both handles
-/// are flushed and closed on success; `src_path` is closed on any error.
+/// Opens `src_path` as a SequentialFile, reads in `kCopyBufSize` chunks, and
+/// appends each chunk to a newly created WritableFile at `dest_path`.  The
+/// destination is flushed and closed on success; the source is always closed.
 fn copyFile(
     gpa: std.mem.Allocator,
     e: env_mod.Env,
@@ -123,7 +127,7 @@ fn copyFile(
     var dst_file = try e.newWritableFile(gpa, dest_path);
     errdefer dst_file.close() catch {};
 
-    var buf: [32 * 1024]u8 = undefined;
+    var buf: [kCopyBufSize]u8 = undefined;
     while (true) {
         const n = try src_file.read(&buf);
         if (n == 0) break; // EOF
