@@ -3,13 +3,13 @@ project: zrocks
 zig_binary: /home/ghpu/zig/zig
 stdlib: /home/ghpu/zig/lib/std
 target_rocksdb: "9.x line; block-based table format_version 5; legacy WAL/MANIFEST log (see docs/adr/000-target-format.md)"
-active_phase: P0
-active_milestone: M0.5
-last_completed: M0.0, M0.1, M0.2, M0.3, M0.4, M0.6 (Phase 0 foundation minus Options)
-branch: milestone/m0.5-options
-worktree: /home/ghpu/projets/zig/zrocks-wt/m0.5-options
+active_phase: P1
+active_milestone: M1.0
+last_completed: M0.0–M0.6 (Phase 0 foundation COMPLETE)
+branch: milestone/m1.0-env
+worktree: /home/ghpu/projets/zig/zrocks-wt/m1.0-env
 test_command: "/home/ghpu/zig/zig build test"
-test_count: 88
+test_count: 98
 updated: 2026-05-28
 ---
 
@@ -26,11 +26,11 @@ RocksDB reference: https://github.com/facebook/rocksdb/wiki
 - [x] M0.2 Coding (varint + fixed)    (merged 9eaa0b0)
 - [x] M0.3 Comparator                 (merged 60bdb88)
 - [x] M0.4 Arena                      (merged 1abcd38)
-- [~] M0.5 Options  <-- ACTIVE
+- [x] M0.5 Options                    (merged f074f04)
 - [x] M0.6 CRC32C                     (merged 352d647)
 
 ### Phase 1 — Environment
-- [ ] M1.0 Env over std.Io (+ MemEnv)
+- [~] M1.0 Env over std.Io (+ MemEnv)  <-- ACTIVE
 
 ### Phase 2 — Write durability core
 - [ ] M2.0 InternalKey
@@ -72,19 +72,20 @@ RocksDB reference: https://github.com/facebook/rocksdb/wiki
 - [ ] M7.6 Transactions (optimistic + pessimistic)
 - [ ] M7.7 Checkpoints
 
-## Active milestone: M0.5 — Options
-- TDD state: not started
-- Files in flight: src/options.zig
-- Depends on: M0.3 Comparator (Options.comparator holds a `comparator.Comparator`).
+## Active milestone: M1.0 — Env (filesystem over std.Io) + MemEnv
+- TDD state: in progress (Opus subagent in worktree milestone/m1.0-env)
+- Files in flight: src/env/env.zig (+ possibly src/env/mem_env.zig)
+- Architectural: isolates ALL 0.16 std.Io filesystem churn behind one capability interface
+  (Env + WritableFile/SequentialFile/RandomAccessFile vtable handles); real OS env + MemEnv
+  test double share one contract test.
 - Acceptance checklist:
-  - [ ] Options / ReadOptions / WriteOptions with sane no-compression defaults
-  - [ ] default comparator = comparator.bytewise
-  - [ ] instantiable as plain value types; zig build test green, zero leaks
+  - [ ] MemEnv passes the env contract (write/sync/read seq+random/rename/delete/size/notfound)
+  - [ ] RealEnv passes the same contract against a temp dir, via std.Io.Threaded io
+  - [ ] all FS through std.Io (no std.fs.*); zero leaks
 
 ## Next steps (ordered)
-1. Dispatch M0.5 (Options) subagent into worktree milestone/m0.5-options.
-2. Merge → wire src/options.zig into root.zig → `zig build test` green → update this file → remove worktree.
-3. Phase 0 complete after M0.5. Then Phase 1: M1.0 Env over std.Io (+ MemEnv) — the first I/O milestone (Opus); isolates all the 0.16 Io threading.
+1. Integrate M1.0 when the subagent finishes: merge → wire src/env into root.zig → `zig build test` → update this file → remove worktree. Capture the exact std.Io/Dir/File signatures it used into the gotchas list below for reuse.
+2. Phase 2 — Write durability core. Likely-parallel batch: M2.0 InternalKey (S) and M2.1 WriteBatch (S, depends on M2.0) on coding; M2.2 WAL (O, depends on Env+crc32c); M2.3 Skiplist (O, depends on Arena+Comparator); M2.4 MemTable (O, depends on Skiplist+InternalKey). Order: M2.0→M2.1 serial; M2.2/M2.3 can parallel after Env; M2.4 after M2.3+M2.0.
 
 ## Decision log (ADR pointers)
 - ADR-000: RocksDB format target pinned (format_version 5 SST, legacy WAL/MANIFEST, CRC32C mask). docs/adr/000-target-format.md
