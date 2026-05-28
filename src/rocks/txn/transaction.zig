@@ -108,18 +108,22 @@ pub const Transaction = struct {
     /// it in the RYOW index (latest op wins).
     pub fn put(self: *Transaction, key: []const u8, value: []const u8) !void {
         std.debug.assert(!self.committed);
+        // Append to the batch first (the fallible step that does NOT transfer
+        // ownership), then dupe + record in the RYOW index — `recordRyow` takes
+        // ownership of `owned` only on success, so the errdefer covers just the
+        // window before that and never double-frees.
+        try self.batch.put(self.gpa, key, value);
         const owned = try self.gpa.dupe(u8, value);
         errdefer self.gpa.free(owned);
         try self.recordRyow(key, .{ .put = owned });
-        try self.batch.put(self.gpa, key, value);
     }
 
     /// Buffer a delete of `key`: append to the commit batch AND record a delete in
     /// the RYOW index (so `get` returns null for it within the txn).
     pub fn delete(self: *Transaction, key: []const u8) !void {
         std.debug.assert(!self.committed);
-        try self.recordRyow(key, .delete);
         try self.batch.delete(self.gpa, key);
+        try self.recordRyow(key, .delete);
     }
 
     /// Buffer a merge operand for `key`.  The RYOW index records the operand as a
@@ -128,10 +132,10 @@ pub const Transaction = struct {
     /// the DB — the txn does not run the merge operator itself).
     pub fn merge(self: *Transaction, key: []const u8, value: []const u8) !void {
         std.debug.assert(!self.committed);
+        try self.batch.merge(self.gpa, key, value);
         const owned = try self.gpa.dupe(u8, value);
         errdefer self.gpa.free(owned);
         try self.recordRyow(key, .{ .merge = owned });
-        try self.batch.merge(self.gpa, key, value);
     }
 
     /// READ-YOUR-OWN-WRITES point lookup.  If `key` was written in this txn, the
