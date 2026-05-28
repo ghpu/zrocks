@@ -38,6 +38,7 @@ const env = @import("../env/env.zig");
 const options_mod = @import("../options.zig");
 const internal_key = @import("internal_key.zig");
 const prefix = @import("../rocks/prefix.zig");
+const delete_range = @import("../rocks/delete_range.zig");
 
 const BlockHandle = footer_mod.BlockHandle;
 const Footer = footer_mod.Footer;
@@ -74,6 +75,10 @@ pub const Table = struct {
     /// Per-table id mixed into cache keys so blocks at the same offset in
     /// different tables do not collide in a shared cache.
     cache_id: u64,
+
+    /// Handle of the metaindex block (kept so `rangeTombstones` can re-scan it
+    /// on demand for the range-del entry, M7.5).
+    metaindex_handle: BlockHandle,
 
     /// Open a table from a random-access file of `file_size` bytes. Reads and
     /// validates the footer, the index block, and (if present) the filter
@@ -118,6 +123,7 @@ pub const Table = struct {
             .filter_reader = null,
             .block_cache = block_cache,
             .cache_id = cache_id,
+            .metaindex_handle = footer.metaindex_handle,
         };
 
         // ---- Metaindex block -> filter block ----------------------------
@@ -151,10 +157,14 @@ pub const Table = struct {
         try key_buf.appendSlice(self.gpa, "filter.");
         try key_buf.appendSlice(self.gpa, self.policy.name());
 
-        var it = meta_block.iterator(self.comparator);
+        // The metaindex is built with the BYTEWISE comparator over plain meta
+        // keys (NOT internal keys), so it must be searched bytewise — using the
+        // table's main comparator (an IKC for DB SSTs, which strips a trailer)
+        // would mis-order/mis-match the meta keys.
+        var it = meta_block.iterator(comparator.bytewise);
         defer it.deinit();
         it.seek(key_buf.items);
-        if (!it.valid() or self.comparator.compare(it.key(), key_buf.items) != .eq) {
+        if (!it.valid() or comparator.bytewise.compare(it.key(), key_buf.items) != .eq) {
             // No filter for this policy: reader works without bloom.
             return;
         }
@@ -164,6 +174,31 @@ pub const Table = struct {
         const filter_contents = try self.readBlock(filter_handle);
         self.filter_contents = filter_contents;
         self.filter_reader = FilterBlockReader.init(self.policy, filter_contents);
+    }
+
+    /// Read this table's range tombstones (M7.5) by scanning the metaindex for
+    /// the `"rocksdb.range_del"` entry and parsing its block.  Returns a freshly
+    /// initialized `RangeTombstoneList` the CALLER OWNS (must `deinit`); an empty
+    /// list when the table carries no range-del block.
+    pub fn rangeTombstones(self: *Table, gpa: std.mem.Allocator) !delete_range.RangeTombstoneList {
+        const meta_contents = try self.readBlock(self.metaindex_handle);
+        defer self.gpa.free(meta_contents);
+        const meta_block = try Block.init(self.gpa, meta_contents);
+
+        // Metaindex keys are plain bytewise meta keys; search bytewise.
+        var it = meta_block.iterator(comparator.bytewise);
+        defer it.deinit();
+        it.seek("rocksdb.range_del");
+        if (!it.valid() or comparator.bytewise.compare(it.key(), "rocksdb.range_del") != .eq) {
+            // No range-del block: an empty tombstone list.
+            return delete_range.RangeTombstoneList.init(gpa);
+        }
+
+        var hv: []const u8 = it.value();
+        const handle = try BlockHandle.decodeFrom(&hv);
+        const rd_contents = try self.readBlock(handle);
+        defer self.gpa.free(rd_contents);
+        return delete_range.RangeTombstoneList.decode(gpa, rd_contents);
     }
 
     /// Point lookup. Returns a freshly allocated copy of the value (caller owns
@@ -834,6 +869,93 @@ test "table reader: prefix bloom — no false negatives, prunes absent prefixes,
             return error.TestExpectedNull;
         }
     }
+}
+
+// ===========================================================================
+// M7.5 — range-del meta block: builder writes it, reader parses it back.
+// ===========================================================================
+
+test "M7.5: range tombstones round-trip through the SST range-del meta block" {
+    const gpa = testing.allocator;
+
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    var ikc = internal_key.InternalKeyComparator{ .user = comparator.bytewise };
+    const opts = options_mod.Options{ .comparator = ikc.comparatorInterface() };
+    const policy = bloom.BloomFilterPolicy.init(10);
+
+    // Build a table with a couple of point keys AND two range tombstones.
+    {
+        var wf = try e.newWritableFile(gpa, "rd.sst");
+        errdefer wf.close() catch {};
+        var tb = try TableBuilder.init(gpa, opts, wf, policy);
+        defer tb.deinit();
+
+        const a = try encodeIkey(gpa, "a", 1);
+        defer gpa.free(a);
+        const m = try encodeIkey(gpa, "m", 2);
+        defer gpa.free(m);
+        try tb.add(a, "av");
+        try tb.add(m, "mv");
+
+        try tb.addRangeTombstone("b", "d", 10);
+        try tb.addRangeTombstone("f", "h", 20);
+
+        try tb.finish();
+        try wf.close();
+    }
+
+    const file_size = try e.getFileSize("rd.sst");
+    var raf = try e.newRandomAccessFile(gpa, "rd.sst");
+    defer raf.close() catch {};
+
+    var table = try Table.open(gpa, raf, file_size, opts, policy, null, 0);
+    defer table.deinit();
+
+    var rtl = try table.rangeTombstones(gpa);
+    defer rtl.deinit();
+    try testing.expectEqual(@as(usize, 2), rtl.count());
+    try testing.expectEqualStrings("b", rtl.tombstones.items[0].begin);
+    try testing.expectEqualStrings("d", rtl.tombstones.items[0].end);
+    try testing.expectEqual(@as(u64, 10), rtl.tombstones.items[0].seq);
+    try testing.expectEqualStrings("f", rtl.tombstones.items[1].begin);
+    try testing.expectEqualStrings("h", rtl.tombstones.items[1].end);
+    try testing.expectEqual(@as(u64, 20), rtl.tombstones.items[1].seq);
+
+    // The point keys still read back normally.
+    {
+        const ik = try encodeIkey(gpa, "a", 1);
+        defer gpa.free(ik);
+        const got = try table.get(gpa, ik) orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings("av", got);
+    }
+}
+
+test "M7.5: a table with no range tombstones returns an empty list" {
+    const gpa = testing.allocator;
+
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    const opts = options_mod.Options{};
+    const policy = bloom.BloomFilterPolicy.init(10);
+
+    const pairs = [_]KV{ .{ .k = "alpha", .v = "1" }, .{ .k = "beta", .v = "2" } };
+    try buildTable(gpa, e, "nordsst.sst", opts, policy, &pairs);
+
+    const file_size = try e.getFileSize("nordsst.sst");
+    var raf = try e.newRandomAccessFile(gpa, "nordsst.sst");
+    defer raf.close() catch {};
+    var table = try Table.open(gpa, raf, file_size, opts, policy, null, 0);
+    defer table.deinit();
+
+    var rtl = try table.rangeTombstones(gpa);
+    defer rtl.deinit();
+    try testing.expect(rtl.isEmpty());
 }
 
 test "table reader: optional block cache yields identical results and hits on reread" {

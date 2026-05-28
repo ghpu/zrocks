@@ -45,6 +45,15 @@ pub const MemTableInserter = struct {
         try self.mem.add(self.sequence, .merge, key, value);
         self.sequence += 1;
     }
+
+    /// Handle a DeleteRange record (M7.5): record a range tombstone over
+    /// `[begin, end)` in the memtable's tombstone list at the current sequence,
+    /// then bump the sequence.  Encoded as `.range_deletion` (key=begin,
+    /// value=end), which `MemTable.add` routes into `range_tombstones`.
+    pub fn deleteRange(self: *MemTableInserter, begin: []const u8, end: []const u8) !void {
+        try self.mem.add(self.sequence, .range_deletion, begin, end);
+        self.sequence += 1;
+    }
 };
 
 /// Insert every record of `batch` into `mem`, assigning sequence numbers
@@ -94,5 +103,40 @@ test "insertBatch assigns per-record sequences and applies puts/deletes" {
         defer lk.deinit(gpa);
         const r = mem.get(lk) orelse return error.TestExpectedFound;
         try std.testing.expectEqualStrings("1", r.found);
+    }
+}
+
+test "M7.5 insertBatch records a range tombstone in the memtable's list" {
+    const gpa = std.testing.allocator;
+    const mem = try MemTable.init(gpa, comparator.bytewise);
+    defer mem.deinit();
+
+    var wb = try WriteBatch.init(gpa);
+    defer wb.deinit(gpa);
+    try wb.put(gpa, "a", "1"); // seq 10
+    try wb.deleteRange(gpa, "b", "d"); // seq 11
+    try wb.put(gpa, "e", "5"); // seq 12
+
+    try insertBatch(mem, &wb, 10);
+
+    // The tombstone landed in the memtable's range-tombstone list at seq 11.
+    try std.testing.expectEqual(@as(usize, 1), mem.range_tombstones.count());
+    const t = mem.range_tombstones.tombstones.items[0];
+    try std.testing.expectEqualStrings("b", t.begin);
+    try std.testing.expectEqualStrings("d", t.end);
+    try std.testing.expectEqual(@as(u64, 11), t.seq);
+
+    // Point puts still applied with their own sequences.
+    {
+        var lk = try LookupKey.init(gpa, "a", 100);
+        defer lk.deinit(gpa);
+        const r = mem.get(lk) orelse return error.TestExpectedFound;
+        try std.testing.expectEqualStrings("1", r.found);
+    }
+    {
+        var lk = try LookupKey.init(gpa, "e", 100);
+        defer lk.deinit(gpa);
+        const r = mem.get(lk) orelse return error.TestExpectedFound;
+        try std.testing.expectEqualStrings("5", r.found);
     }
 }

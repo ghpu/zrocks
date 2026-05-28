@@ -62,6 +62,17 @@ pub const WriteBatch = struct {
         self.setCount(self.count() + 1);
     }
 
+    /// Append a DeleteRange record (M7.5) and increment the count.  It deletes
+    /// every key in `[begin, end)` (half-open, `end` exclusive) as of this
+    /// record's sequence.  Wire format: type byte 0x0F (range_deletion) followed
+    /// by length-prefixed `begin` then length-prefixed `end`.
+    pub fn deleteRange(self: *WriteBatch, gpa: std.mem.Allocator, begin: []const u8, end: []const u8) !void {
+        try self.rep.append(gpa, @intFromEnum(ValueType.range_deletion));
+        try coding.putLengthPrefixedSlice(&self.rep, gpa, begin);
+        try coding.putLengthPrefixedSlice(&self.rep, gpa, end);
+        self.setCount(self.count() + 1);
+    }
+
     /// Read the record count from the header (fixed32 LE at offset 8).
     pub fn count(self: *const WriteBatch) u32 {
         const bytes: *const [4]u8 = self.rep.items[kCountOffset..][0..4];
@@ -149,6 +160,17 @@ pub const WriteBatch = struct {
                 const key = coding.getLengthPrefixedSlice(&input) catch return error.Corruption;
                 const value = coding.getLengthPrefixedSlice(&input) catch return error.Corruption;
                 try handler.merge(key, value);
+                parsed_count += 1;
+            } else if (type_byte == @intFromEnum(ValueType.range_deletion)) {
+                // DeleteRange record (M7.5): begin + end (both user keys).
+                const begin = coding.getLengthPrefixedSlice(&input) catch return error.Corruption;
+                const end = coding.getLengthPrefixedSlice(&input) catch return error.Corruption;
+                // Only handlers that implement `deleteRange` accept range records;
+                // a range record reaching a handler without the method is a usage
+                // error (e.g. an old put/delete-only handler) and is rejected.
+                const Handler = @typeInfo(@TypeOf(handler)).pointer.child;
+                if (!@hasDecl(Handler, "deleteRange")) return error.Corruption;
+                try handler.deleteRange(begin, end);
                 parsed_count += 1;
             } else {
                 return error.Corruption;
@@ -437,4 +459,60 @@ test "byteSize reflects rep length" {
     try wb.put(gpa, "k", "v");
     // header(12) + type(1) + varint(1)+'k'(1) + varint(1)+'v'(1) = 17
     try std.testing.expectEqual(@as(usize, 17), wb.byteSize());
+}
+
+// ---------------------------------------------------------------------------
+// M7.5 — DeleteRange (range tombstones)
+// ---------------------------------------------------------------------------
+
+test "M7.5 golden bytes: deleteRange(b, d) produces type 0x0F wire encoding" {
+    const gpa = std.testing.allocator;
+    var wb = try WriteBatch.init(gpa);
+    defer wb.deinit(gpa);
+
+    try wb.deleteRange(gpa, "b", "d");
+
+    // seq=0 (8B), count=1 (4B), 0x0F, varint32(1)+"b", varint32(1)+"d".
+    const expected = [_]u8{
+        0, 0, 0, 0, 0, 0, 0, 0, // seq=0 fixed64 LE
+        1, 0, 0, 0, // count=1 fixed32 LE
+        0x0F, // ValueType.range_deletion
+        0x01, 'b',
+        0x01, 'd',
+    };
+    try std.testing.expectEqualSlices(u8, &expected, wb.contents());
+}
+
+test "M7.5 iterate: deleteRange handler called with begin + end" {
+    const gpa = std.testing.allocator;
+    var wb = try WriteBatch.init(gpa);
+    defer wb.deinit(gpa);
+
+    try wb.put(gpa, "p", "pv");
+    try wb.deleteRange(gpa, "b", "d");
+
+    const Handler = struct {
+        n_put: usize = 0,
+        n_range: usize = 0,
+        last_begin: []const u8 = "",
+        last_end: []const u8 = "",
+
+        pub fn put(self: *@This(), _: []const u8, _: []const u8) !void {
+            self.n_put += 1;
+        }
+        pub fn delete(_: *@This(), _: []const u8) !void {}
+        pub fn merge(_: *@This(), _: []const u8, _: []const u8) !void {}
+        pub fn deleteRange(self: *@This(), begin: []const u8, end: []const u8) !void {
+            self.n_range += 1;
+            self.last_begin = begin;
+            self.last_end = end;
+        }
+    };
+
+    var h = Handler{};
+    try wb.iterate(&h);
+    try std.testing.expectEqual(@as(usize, 1), h.n_put);
+    try std.testing.expectEqual(@as(usize, 1), h.n_range);
+    try std.testing.expectEqualStrings("b", h.last_begin);
+    try std.testing.expectEqualStrings("d", h.last_end);
 }

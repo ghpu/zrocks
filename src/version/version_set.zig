@@ -102,6 +102,7 @@ pub const Version = struct {
         f: FileMetaData,
         user_key: []const u8,
         lookup_ikey: []const u8,
+        seq_out: ?*u64,
     ) !?GetResult {
         var it = try tc.newIterator(gpa, f.number, f.file_size);
         defer it.deinit();
@@ -114,6 +115,7 @@ pub const Version = struct {
         if (user_cmp.compare(stored_uk, user_key) != .eq) return null;
 
         const parsed = internal_key.parseInternalKey(stored_ikey) catch return error.Corruption;
+        if (seq_out) |p| p.* = parsed.sequence;
         switch (parsed.type) {
             .value => return .{ .found = try gpa.dupe(u8, it.value()) },
             .deletion, .single_deletion, .range_deletion => return .deleted,
@@ -139,6 +141,21 @@ pub const Version = struct {
         user_key: []const u8,
         sequence: u64,
     ) !?GetResult {
+        return self.getWithSeq(gpa, tc, user_cmp, user_key, sequence, null);
+    }
+
+    /// Like `get`, but writes the sequence of the surfaced entry into `seq_out`
+    /// (when non-null) on a `.found`/`.deleted` result — used by M7.5 to decide
+    /// whether a covering range tombstone shadows the value.
+    pub fn getWithSeq(
+        self: *const Version,
+        gpa: std.mem.Allocator,
+        tc: *TableCache,
+        user_cmp: comparator.Comparator,
+        user_key: []const u8,
+        sequence: u64,
+        seq_out: ?*u64,
+    ) !?GetResult {
         // internal lookup key = user_key ++ fixed64(packSequenceAndType(seq, seek))
         var lookup: std.ArrayListUnmanaged(u8) = .empty;
         defer lookup.deinit(gpa);
@@ -161,7 +178,7 @@ pub const Version = struct {
                 i -= 1;
                 const f = l0[i];
                 if (!fileCovers(user_cmp, f, user_key)) continue;
-                if (try probeFile(gpa, tc, user_cmp, f, user_key, lookup_ikey)) |r| return r;
+                if (try probeFile(gpa, tc, user_cmp, f, user_key, lookup_ikey, seq_out)) |r| return r;
             }
         }
 
@@ -171,7 +188,7 @@ pub const Version = struct {
             const files = self.files[level].items;
             for (files) |f| {
                 if (!fileCovers(user_cmp, f, user_key)) continue;
-                if (try probeFile(gpa, tc, user_cmp, f, user_key, lookup_ikey)) |r| return r;
+                if (try probeFile(gpa, tc, user_cmp, f, user_key, lookup_ikey, seq_out)) |r| return r;
                 // A non-overlapping level has at most one covering file; if it
                 // did not hold the key, no other file at this level can.
                 break;

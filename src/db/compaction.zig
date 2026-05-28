@@ -55,6 +55,7 @@ const bloom = @import("../format/bloom.zig");
 const filename = @import("../version/filename.zig");
 const coding = @import("../util/coding.zig");
 const merge_operator_mod = @import("../rocks/merge_operator.zig");
+const delete_range = @import("../rocks/delete_range.zig");
 
 const FileMetaData = version_edit.FileMetaData;
 const VersionSet = version_set.VersionSet;
@@ -415,11 +416,24 @@ pub fn doCompaction(
         gpa.destroy(tc);
     }
 
+    // M7.5: gather range tombstones from every input file into a single
+    // aggregator.  These are (a) applied to point keys during the merge (a point
+    // key permanently shadowed below the snapshot is dropped) and (b) carried —
+    // whole, unfragmented — into the compaction's output SSTs so the deletion
+    // survives.  Whether a tombstone may itself be DROPPED is decided per
+    // tombstone below (conservative: keep unless clearly safe).
+    var input_tombstones = delete_range.RangeTombstoneList.init(gpa);
+    defer input_tombstones.deinit();
     for (&compaction.inputs) |*list| {
         for (list.items) |f| {
             const it = try tc.newIterator(gpa, f.number, f.file_size);
             errdefer it.deinit();
             try children.append(gpa, it);
+
+            const table = try tc.findTable(f.number, f.file_size);
+            var rtl = try table.rangeTombstones(gpa);
+            defer rtl.deinit();
+            for (rtl.tombstones.items) |t| try input_tombstones.add(t.begin, t.end, t.seq);
         }
     }
 
@@ -473,6 +487,21 @@ pub fn doCompaction(
     var has_last_user_key = false;
     var last_sequence_for_key: u64 = internal_key.kMaxSequenceNumber;
 
+    // M7.5: decide which input tombstones SURVIVE into the output.  A tombstone
+    // may be dropped only when it can no longer affect anything: it is below the
+    // smallest snapshot AND the output reaches the bottom level (nothing deeper
+    // could resurface a covered key).  Anything else is kept — conservative, so a
+    // snapshot read or a deeper level never loses a needed tombstone.
+    const bottom_level = compaction.outputLevel() >= version_set.kNumLevels - 1;
+    var surviving = delete_range.RangeTombstoneList.init(gpa);
+    defer surviving.deinit();
+    for (input_tombstones.tombstones.items) |t| {
+        const droppable = bottom_level and
+            !compaction.keep_tombstones and
+            t.seq <= smallest_snapshot;
+        if (!droppable) try surviving.add(t.begin, t.end, t.seq);
+    }
+
     // A reusable emitter closure-equivalent: append (ikey, value) into the
     // current output, opening a builder if needed and rolling over at the target
     // file size.  `ikey`/`value` may be transient — they are copied as needed.
@@ -490,6 +519,7 @@ pub fn doCompaction(
         .cur_smallest = &cur_smallest,
         .cur_largest = &cur_largest,
         .outputs = &outputs,
+        .surviving_tombstones = &surviving,
     };
 
     mit.seekToFirst();
@@ -564,6 +594,16 @@ pub fn doCompaction(
             // merge) forces retention so an older, un-read L0 run cannot resurrect
             // the deleted key.
             drop = true;
+        } else if (rangeCoversForDrop(&input_tombstones, user_key, parsed.sequence, smallest_snapshot, user_cmp)) {
+            // M7.5: a range tombstone (visible at-or-below the snapshot) covers
+            // this point entry and strictly outranks it, so this version is
+            // PERMANENTLY shadowed for every live reader → drop it.  The tombstone
+            // itself is carried into the output (see `surviving`), so a deeper
+            // level's older value (which the tombstone also covers) stays hidden.
+            // Versions whose sequence is >= the tombstone, or any version a live
+            // snapshot can still see, are NOT dropped (rangeCoversForDrop requires
+            // both the value and the covering tombstone to be <= smallest_snapshot).
+            drop = true;
         }
 
         // --- M7.4: compaction filter on the newest, snapshot-eligible .value --
@@ -607,6 +647,14 @@ pub fn doCompaction(
 
         if (!drop) try emit_ctx.emit(ikey, filtered_value);
         mit.next();
+    }
+
+    // M7.5: if surviving range tombstones were not yet attached to any output
+    // (every point key dropped, or the inputs held only tombstones), force-open a
+    // builder so the tombstones are carried forward (ensureBuilder seeds them +
+    // widens the key range).  Otherwise the deletion would be lost.
+    if (builder == null and !surviving.isEmpty()) {
+        try emit_ctx.ensureBuilder();
     }
 
     // Close any final open output.
@@ -683,6 +731,57 @@ const EmitCtx = struct {
     cur_smallest: *?[]u8,
     cur_largest: *?[]u8,
     outputs: *std.ArrayListUnmanaged(Output),
+    /// M7.5: range tombstones surviving this compaction.  Carried — whole, no
+    /// truncation — into EVERY output SST opened here, and they widen each
+    /// output's key range so reads/overlap over the tombstone span find the file.
+    /// TODO: tombstone truncation at output-file boundaries (we duplicate whole
+    /// tombstones across split outputs, which is correct but not minimal).
+    surviving_tombstones: *const delete_range.RangeTombstoneList,
+
+    /// Open a fresh output builder (if none is open), seeding it with the
+    /// surviving range tombstones and widening its key range to cover them.
+    fn ensureBuilder(self: *EmitCtx) !void {
+        const gpa = self.gpa;
+        if (self.builder.* != null) return;
+        self.cur_number.* = self.versions.newFileNumber();
+        const path = try filename.tableFileName(gpa, self.dbname, self.cur_number.*);
+        defer gpa.free(path);
+        self.cur_file.* = try self.e.newWritableFile(gpa, path);
+        self.builder.* = try table_builder_mod.TableBuilder.init(gpa, self.build_opts, self.cur_file.*.?, self.policy);
+        self.cur_smallest.* = null;
+        self.cur_largest.* = null;
+
+        // Seed range tombstones + widen the key range from their endpoints.
+        for (self.surviving_tombstones.tombstones.items) |t| {
+            try self.builder.*.?.addRangeTombstone(t.begin, t.end, t.seq);
+            const b_ik = try encodeInternalKey(gpa, t.begin, t.seq, .range_deletion);
+            defer gpa.free(b_ik);
+            const e_ik = try encodeInternalKey(gpa, t.end, t.seq, .range_deletion);
+            defer gpa.free(e_ik);
+            self.widenSmallest(b_ik) catch |err| return err;
+            self.widenLargest(e_ik) catch |err| return err;
+        }
+    }
+
+    fn widenSmallest(self: *EmitCtx, ik: []const u8) !void {
+        const gpa = self.gpa;
+        if (self.cur_smallest.* == null or
+            self.build_opts.comparator.compare(ik, self.cur_smallest.*.?) == .lt)
+        {
+            if (self.cur_smallest.*) |s| gpa.free(s);
+            self.cur_smallest.* = try gpa.dupe(u8, ik);
+        }
+    }
+
+    fn widenLargest(self: *EmitCtx, ik: []const u8) !void {
+        const gpa = self.gpa;
+        if (self.cur_largest.* == null or
+            self.build_opts.comparator.compare(ik, self.cur_largest.*.?) == .gt)
+        {
+            if (self.cur_largest.*) |l| gpa.free(l);
+            self.cur_largest.* = try gpa.dupe(u8, ik);
+        }
+    }
 
     /// Append (ikey, value) into the current output, opening a fresh builder if
     /// none is open and rolling over to a new output once the file reaches the
@@ -690,26 +789,39 @@ const EmitCtx = struct {
     /// transient iterator slices).
     fn emit(self: *EmitCtx, ikey: []const u8, value: []const u8) !void {
         const gpa = self.gpa;
-        if (self.builder.* == null) {
-            self.cur_number.* = self.versions.newFileNumber();
-            const path = try filename.tableFileName(gpa, self.dbname, self.cur_number.*);
-            defer gpa.free(path);
-            self.cur_file.* = try self.e.newWritableFile(gpa, path);
-            self.builder.* = try table_builder_mod.TableBuilder.init(gpa, self.build_opts, self.cur_file.*.?, self.policy);
-            self.cur_smallest.* = null;
-            self.cur_largest.* = null;
-        }
+        try self.ensureBuilder();
 
         try self.builder.*.?.add(ikey, value);
-        if (self.cur_smallest.* == null) self.cur_smallest.* = try gpa.dupe(u8, ikey);
-        if (self.cur_largest.*) |l| gpa.free(l);
-        self.cur_largest.* = try gpa.dupe(u8, ikey);
+        try self.widenSmallest(ikey);
+        try self.widenLargest(ikey);
 
         if (self.builder.*.?.fileSize() >= self.target_file_size) {
             try finishOutput(gpa, self.builder, self.cur_file, self.cur_number.*, self.cur_smallest, self.cur_largest, self.outputs);
         }
     }
 };
+
+/// M7.5: true iff some range tombstone PERMANENTLY shadows the point entry
+/// `(user_key, value_seq)` so it may be dropped during compaction:
+///   * coverage:   begin <= user_key < end (by `user_cmp`), and
+///   * shadowing:  value_seq < tomb.seq (the tombstone outranks the value), and
+///   * finality:   tomb.seq <= smallest_snapshot (no live reader sees the value —
+///                 if a snapshot pinned a seq >= the value's, the value's own
+///                 sequence would be > smallest_snapshot and excluded here too).
+/// Requiring `value_seq < tomb.seq <= smallest_snapshot` guarantees every live
+/// reader (at any snapshot >= smallest_snapshot) observes the tombstone over this
+/// value, so dropping it changes nothing observable.  This is exactly the
+/// aggregator's `covered` query with the snapshot bound set to the smallest
+/// snapshot.
+fn rangeCoversForDrop(
+    tombstones: *const delete_range.RangeTombstoneList,
+    user_key: []const u8,
+    value_seq: u64,
+    smallest_snapshot: u64,
+    user_cmp: comparator.Comparator,
+) bool {
+    return tombstones.covered(user_key, value_seq, smallest_snapshot, user_cmp);
+}
 
 /// Encode `user_key ++ fixed64(packSequenceAndType(seq, t))` (caller frees).
 fn encodeInternalKey(gpa: std.mem.Allocator, user_key: []const u8, seq: u64, t: internal_key.ValueType) ![]u8 {

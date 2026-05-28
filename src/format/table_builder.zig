@@ -32,6 +32,7 @@ const block = @import("block.zig");
 const filter_block = @import("filter_block.zig");
 const bloom = @import("bloom.zig");
 const internal_key = @import("internal_key.zig");
+const delete_range = @import("../rocks/delete_range.zig");
 const footer_mod = @import("footer.zig");
 const crc32c = @import("../util/crc32c.zig");
 const coding = @import("../util/coding.zig");
@@ -52,6 +53,12 @@ const kMetaIndexRestartInterval: usize = 1;
 
 /// Prefix of the metaindex key naming the table's filter block.
 const kFilterMetaKeyPrefix: []const u8 = "filter.";
+
+/// Metaindex key naming the table's range-del block (M7.5).  Our own clean
+/// format (see delete_range.zig), NOT RocksDB byte-compatible.
+/// TODO(m7.x): RocksDB stores fragmented range tombstones in a dedicated
+/// "rocksdb.deletion_data" / range_del block with a different layout.
+const kRangeDelMetaKey: []const u8 = "rocksdb.range_del";
 
 pub const TableBuilder = struct {
     gpa: std.mem.Allocator,
@@ -86,6 +93,11 @@ pub const TableBuilder = struct {
     /// Scratch buffer reused for block handle encodings (index/metaindex).
     handle_encoding: std.ArrayListUnmanaged(u8),
 
+    /// Range tombstones to embed in this SST's range-del meta block (M7.5).
+    /// Added via `addRangeTombstone` before `finish`; serialized into a dedicated
+    /// meta block registered under `kRangeDelMetaKey`.
+    range_tombstones: delete_range.RangeTombstoneList,
+
     pub fn init(
         gpa: std.mem.Allocator,
         options: options_mod.Options,
@@ -112,6 +124,7 @@ pub const TableBuilder = struct {
             .pending_handle = .{ .offset = 0, .size = 0 },
             .finished = false,
             .handle_encoding = .empty,
+            .range_tombstones = delete_range.RangeTombstoneList.init(gpa),
         };
     }
 
@@ -121,7 +134,15 @@ pub const TableBuilder = struct {
         self.filter.deinit(self.gpa);
         self.last_key.deinit(self.gpa);
         self.handle_encoding.deinit(self.gpa);
+        self.range_tombstones.deinit();
         self.* = undefined;
+    }
+
+    /// Record a range tombstone `[begin, end)` @ `seq` to embed in this SST's
+    /// range-del meta block (M7.5).  Must be called before `finish`.
+    pub fn addRangeTombstone(self: *TableBuilder, begin: []const u8, end: []const u8, seq: u64) !void {
+        std.debug.assert(!self.finished);
+        try self.range_tombstones.add(begin, end, seq);
     }
 
     pub fn numEntries(self: *const TableBuilder) u64 {
@@ -241,9 +262,23 @@ pub const TableBuilder = struct {
         const filter_contents = try self.filter.finish(self.gpa);
         const filter_handle = try self.writeRawBlock(filter_contents, kNoCompression);
 
-        // 2. Metaindex block: single entry "filter."++name -> filter handle.
-        //    Its keys are plain bytewise meta keys (NOT internal keys), so it is
-        //    ordered/searched with the bytewise comparator, matching the reader.
+        // 1b. Range-del block (M7.5): a serialized RangeTombstoneList.  Written
+        //     only when the table carries tombstones (a table without them has no
+        //     range-del entry in the metaindex, and the reader treats its absence
+        //     as "no tombstones").
+        var range_del_handle: ?BlockHandle = null;
+        if (!self.range_tombstones.isEmpty()) {
+            var rd_buf: std.ArrayListUnmanaged(u8) = .empty;
+            defer rd_buf.deinit(self.gpa);
+            try self.range_tombstones.encode(&rd_buf, self.gpa);
+            range_del_handle = try self.writeRawBlock(rd_buf.items, kNoCompression);
+        }
+
+        // 2. Metaindex block: "filter."++name -> filter handle, and (when present)
+        //    "rocksdb.range_del" -> range-del handle.  Its keys are plain bytewise
+        //    meta keys (NOT internal keys), ordered/searched with the bytewise
+        //    comparator (matching the reader), so entries MUST be added in
+        //    ascending bytewise key order: "filter." < "rocksdb.range_del".
         var metaindex_block = BlockBuilder.init(self.gpa, comparator.bytewise, kMetaIndexRestartInterval);
         defer metaindex_block.deinit();
         {
@@ -255,6 +290,11 @@ pub const TableBuilder = struct {
             self.handle_encoding.clearRetainingCapacity();
             try filter_handle.encodeTo(&self.handle_encoding, self.gpa);
             try metaindex_block.add(key_buf.items, self.handle_encoding.items);
+        }
+        if (range_del_handle) |rdh| {
+            self.handle_encoding.clearRetainingCapacity();
+            try rdh.encodeTo(&self.handle_encoding, self.gpa);
+            try metaindex_block.add(kRangeDelMetaKey, self.handle_encoding.items);
         }
         const metaindex_handle = try self.writeBlock(&metaindex_block);
 

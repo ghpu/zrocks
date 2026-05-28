@@ -48,6 +48,7 @@ const log_format = @import("../format/log_format.zig");
 
 const write_path = @import("write_path.zig");
 const db_iter = @import("db_iter.zig");
+const delete_range = @import("../rocks/delete_range.zig");
 const snapshot_mod = @import("snapshot.zig");
 const recovery = @import("recovery.zig");
 const flush = @import("flush.zig");
@@ -227,6 +228,18 @@ pub const DB = struct {
         var batch = try WriteBatch.init(self.gpa);
         defer batch.deinit(self.gpa);
         try batch.delete(self.gpa, key);
+        try self.write(wopts, &batch);
+    }
+
+    /// Delete every key in `[begin, end)` (half-open, `end` exclusive) as of this
+    /// op's sequence (a one-op range-del WriteBatch, M7.5).  Keys written AFTER
+    /// this (higher sequence) are not affected; keys with a lower sequence covered
+    /// by the range become invisible.  A degenerate range (`begin >= end`) deletes
+    /// nothing.
+    pub fn deleteRange(self: *DB, wopts: WriteOptions, begin: []const u8, end: []const u8) !void {
+        var batch = try WriteBatch.init(self.gpa);
+        defer batch.deinit(self.gpa);
+        try batch.deleteRange(self.gpa, begin, end);
         try self.write(wopts, &batch);
     }
 
@@ -430,19 +443,35 @@ pub const DB = struct {
             return self.mergeGet(key, seq);
         }
 
+        // M7.5: the largest covering range-tombstone sequence visible at `seq`.
+        // A surfaced value with sequence < this is deleted by the range tombstone;
+        // a value with sequence >= it outranks the tombstone and is visible.  When
+        // there are no covering tombstones this is 0 (no shadowing).
+        const cover_seq = try self.maxCoveringTombstoneSeq(key, seq);
+
         var lookup = try memtable_mod.LookupKey.init(self.gpa, key, seq);
         defer lookup.deinit(self.gpa);
 
         // 1. MemTable first (it holds the newest writes).
-        if (self.mem.get(lookup)) |r| switch (r) {
-            .found => |v| return try self.gpa.dupe(u8, v),
-            .deleted => return null,
-        };
+        {
+            var vseq: u64 = 0;
+            if (self.mem.getWithSeq(lookup, &vseq)) |r| switch (r) {
+                .found => |v| {
+                    if (vseq < cover_seq) return null; // shadowed by a range tombstone
+                    return try self.gpa.dupe(u8, v);
+                },
+                .deleted => return null,
+            };
+        }
 
         // 1b. The immutable memtable being flushed (if any) is next-newest.
         if (self.imm) |imm| {
-            if (imm.get(lookup)) |r| switch (r) {
-                .found => |v| return try self.gpa.dupe(u8, v),
+            var vseq: u64 = 0;
+            if (imm.getWithSeq(lookup, &vseq)) |r| switch (r) {
+                .found => |v| {
+                    if (vseq < cover_seq) return null;
+                    return try self.gpa.dupe(u8, v);
+                },
                 .deleted => return null,
             };
         }
@@ -450,15 +479,33 @@ pub const DB = struct {
         // 2. Not in the memtable: consult the on-disk SSTs via the current
         //    Version (LSM point lookup with snapshot + tombstone semantics).
         const version = self.versions.currentVersion();
-        if (try version.get(self.gpa, &self.table_cache, self.options.comparator, key, seq)) |r| {
+        var vseq: u64 = 0;
+        if (try version.getWithSeq(self.gpa, &self.table_cache, self.options.comparator, key, seq, &vseq)) |r| {
             switch (r) {
                 // The value is freshly gpa-allocated by Version.get; the caller
                 // owns and frees it.  Drop const since it is uniquely owned.
-                .found => |v| return @constCast(v),
+                .found => |v| {
+                    if (vseq < cover_seq) {
+                        self.gpa.free(@constCast(v));
+                        return null;
+                    }
+                    return @constCast(v);
+                },
                 .deleted => return null,
             }
         }
         return null;
+    }
+
+    /// The largest range-tombstone sequence (visible at `snapshot`) that covers
+    /// `key`, or 0 if none.  Builds the snapshot-scoped aggregator (live MemTable
+    /// + imm + every SST's range-del block) and folds its covering tombstones
+    /// into one effective deletion sequence.
+    /// TODO(perf): prune by file key-range overlap; cache per-Version aggregation.
+    fn maxCoveringTombstoneSeq(self: *DB, key: []const u8, snapshot: u64) !u64 {
+        var agg = try self.buildRangeAggregator(self.gpa, snapshot);
+        defer agg.deinit();
+        return agg.maxCoveringSeq(key, snapshot, self.options.comparator);
     }
 
     /// Merge-aware point lookup (M7.1).  Builds an internal MergingIterator over
@@ -568,6 +615,15 @@ pub const DB = struct {
         var dbit = DBIterator.init(gpa, merger.iterator(), self.options.comparator, seq);
         dbit.owned_inner = merger;
         dbit.owned_inner_destroy = destroyMerger;
+        // M7.5: a snapshot-scoped range-tombstone aggregator so the scan skips
+        // any surfaced user key whose value is covered by a visible tombstone.
+        // The DBIterator owns it (deinits + frees it).
+        {
+            const agg = try gpa.create(delete_range.RangeTombstoneList);
+            errdefer gpa.destroy(agg);
+            agg.* = try self.buildRangeAggregator(gpa, seq);
+            dbit.range_aggregator = agg;
+        }
         // M7.2: thread the prefix extractor + prefix-bounded scan flag so a
         // `seek` can bound iteration to the seek target's prefix.
         dbit.prefix_extractor = self.options.prefix_extractor;
@@ -632,6 +688,43 @@ pub const DB = struct {
         // release our temporary list (the copies are now owned by the merger).
         children.deinit(gpa);
         return merger;
+    }
+
+    /// Build a snapshot-scoped range-tombstone aggregator (M7.5): collect every
+    /// range tombstone visible at `snapshot` (`tomb.seq <= snapshot`) from the
+    /// live MemTable, the immutable MemTable being flushed (if any), and every SST
+    /// in the current Version.  The caller OWNS the returned list (`deinit`s it).
+    ///
+    /// Correctness-first: we gather tombstones from ALL SSTs (no range-overlap
+    /// pruning) and re-scan them linearly per query.
+    /// TODO(perf): prune by file key-range overlap + a fragmented tombstone iter.
+    fn buildRangeAggregator(self: *DB, gpa: std.mem.Allocator, snapshot: u64) !delete_range.RangeTombstoneList {
+        var agg = delete_range.RangeTombstoneList.init(gpa);
+        errdefer agg.deinit();
+
+        // 1. Live MemTable tombstones.
+        for (self.mem.range_tombstones.tombstones.items) |t| {
+            if (t.seq <= snapshot) try agg.add(t.begin, t.end, t.seq);
+        }
+        // 1b. Immutable MemTable being flushed (if any).
+        if (self.imm) |imm| {
+            for (imm.range_tombstones.tombstones.items) |t| {
+                if (t.seq <= snapshot) try agg.add(t.begin, t.end, t.seq);
+            }
+        }
+        // 2. Every SST in the current Version.
+        const v = self.versions.currentVersion();
+        for (&v.files) |level| {
+            for (level.items) |f| {
+                const table = try self.table_cache.findTable(f.number, f.file_size);
+                var rtl = try table.rangeTombstones(gpa);
+                defer rtl.deinit();
+                for (rtl.tombstones.items) |t| {
+                    if (t.seq <= snapshot) try agg.add(t.begin, t.end, t.seq);
+                }
+            }
+        }
+        return agg;
     }
 
     /// DBIterator ownership hook: tear down the merging iterator (which deinits
@@ -1847,5 +1940,364 @@ test "M6.1 flush: multiple L0 files merge newest-first" {
         const got = try db.get(.{}, kv.k) orelse return error.TestExpectedFound;
         defer gpa.free(got);
         try testing.expectEqualStrings(kv.v, got);
+    }
+}
+
+// ===========================================================================
+// M7.5 — DeleteRange (range tombstones): the correctness gate.
+// ===========================================================================
+
+test "M7.5: basic deleteRange hides [begin,end), end exclusive" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const db = try openTestDB(gpa, &me);
+    defer db.close();
+
+    try db.put(.{}, "a", "av");
+    try db.put(.{}, "b", "bv");
+    try db.put(.{}, "c", "cv");
+    try db.put(.{}, "d", "dv");
+
+    try db.deleteRange(.{}, "b", "d"); // deletes b, c — NOT d (exclusive).
+
+    {
+        const a = try db.get(.{}, "a") orelse return error.TestExpectedFound;
+        defer gpa.free(a);
+        try testing.expectEqualStrings("av", a);
+    }
+    try testing.expect((try db.get(.{}, "b")) == null);
+    try testing.expect((try db.get(.{}, "c")) == null);
+    {
+        const d = try db.get(.{}, "d") orelse return error.TestExpectedFound;
+        defer gpa.free(d);
+        try testing.expectEqualStrings("dv", d);
+    }
+}
+
+test "M7.5: point put AFTER a covering range delete is visible (higher seq wins)" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const db = try openTestDB(gpa, &me);
+    defer db.close();
+
+    // A put BEFORE the covering range delete is hidden.
+    try db.put(.{}, "before", "bv"); // covered by [a,z) below
+    try db.deleteRange(.{}, "a", "z");
+    // A put AFTER the range delete (higher seq) survives.
+    try db.put(.{}, "m", "mv");
+
+    try testing.expect((try db.get(.{}, "before")) == null);
+    {
+        const m = try db.get(.{}, "m") orelse return error.TestExpectedFound;
+        defer gpa.free(m);
+        try testing.expectEqualStrings("mv", m);
+    }
+}
+
+test "M7.5: snapshot sees pre-delete value; latest sees it deleted" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const db = try openTestDB(gpa, &me);
+    defer db.close();
+
+    try db.put(.{}, "k", "kv"); // seq 1
+    const snap = try db.getSnapshot(); // pins seq 1
+    defer db.releaseSnapshot(snap);
+
+    try db.deleteRange(.{}, "a", "z"); // seq 2, covers "k"
+
+    // At the snapshot (before the range delete) "k" is still visible.
+    {
+        const got = try db.get(.{ .snapshot = snap.sequence }, "k") orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings("kv", got);
+    }
+    // Latest read sees "k" deleted.
+    try testing.expect((try db.get(.{}, "k")) == null);
+}
+
+test "M7.5: iterator scan skips covered keys" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const db = try openTestDB(gpa, &me);
+    defer db.close();
+
+    try db.put(.{}, "a", "av");
+    try db.put(.{}, "b", "bv");
+    try db.put(.{}, "c", "cv");
+    try db.put(.{}, "d", "dv");
+    try db.put(.{}, "e", "ev");
+    try db.deleteRange(.{}, "b", "d"); // hides b, c
+    // A re-add of "c" AFTER the range delete is visible again.
+    try db.put(.{}, "c", "c2");
+
+    var it = try db.newIterator(gpa, .{});
+    defer it.deinit();
+
+    const exp_k = [_][]const u8{ "a", "c", "d", "e" };
+    const exp_v = [_][]const u8{ "av", "c2", "dv", "ev" };
+    var i: usize = 0;
+    it.seekToFirst();
+    while (it.valid()) : (it.next()) {
+        try testing.expect(i < exp_k.len);
+        try testing.expectEqualStrings(exp_k[i], it.key());
+        try testing.expectEqualStrings(exp_v[i], it.value());
+        i += 1;
+    }
+    try testing.expectEqual(exp_k.len, i);
+    try testing.expect(it.status() == null);
+}
+
+test "M7.5: range delete survives flush + compaction + reopen" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    {
+        // Tiny buffer + low trigger so writes flush + compact.
+        const db = try DB.open(gpa, e, "rddb", .{
+            .write_buffer_size = 1,
+            .level0_file_num_compaction_trigger = 2,
+        });
+        defer db.close();
+
+        try db.put(.{}, "a", "av");
+        try db.put(.{}, "b", "bv");
+        try db.put(.{}, "c", "cv");
+        try db.put(.{}, "d", "dv");
+        try db.deleteRange(.{}, "b", "d"); // hides b, c
+        // Force a bunch of flushes + compactions.
+        try db.put(.{}, "e", "ev");
+        try db.put(.{}, "f", "fv");
+        try db.put(.{}, "g", "gv");
+
+        try testing.expect((try db.get(.{}, "b")) == null);
+        try testing.expect((try db.get(.{}, "c")) == null);
+    }
+
+    // Reopen: the tombstone (in an SST range-del block and/or the WAL) must
+    // still hide the covered keys.
+    {
+        const db = try DB.open(gpa, e, "rddb", .{
+            .write_buffer_size = 1,
+            .level0_file_num_compaction_trigger = 2,
+        });
+        defer db.close();
+
+        try testing.expect((try db.get(.{}, "b")) == null);
+        try testing.expect((try db.get(.{}, "c")) == null);
+        {
+            const a = try db.get(.{}, "a") orelse return error.TestExpectedFound;
+            defer gpa.free(a);
+            try testing.expectEqualStrings("av", a);
+        }
+        {
+            const d = try db.get(.{}, "d") orelse return error.TestExpectedFound;
+            defer gpa.free(d);
+            try testing.expectEqualStrings("dv", d);
+        }
+    }
+}
+
+// --- THE DELETE-RANGE RANDOMIZED GATE --------------------------------------
+
+/// Reference model for deleteRange semantics: a latest-wins live map.  `put`
+/// overwrites; `delete` removes; `deleteRange(b,e)` removes every CURRENTLY
+/// PRESENT key in `[b,e)` (a later put re-adds it).  This mirrors the DB's
+/// sequence semantics (a put with a higher seq than a covering range tombstone
+/// is visible; one with a lower seq is hidden).
+const RangeRefMap = struct {
+    map: std.StringHashMapUnmanaged([]u8) = .empty,
+    gpa: std.mem.Allocator,
+
+    fn init(gpa: std.mem.Allocator) RangeRefMap {
+        return .{ .gpa = gpa };
+    }
+    fn deinit(self: *RangeRefMap) void {
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            self.gpa.free(entry.key_ptr.*);
+            self.gpa.free(entry.value_ptr.*);
+        }
+        self.map.deinit(self.gpa);
+    }
+    fn put(self: *RangeRefMap, key: []const u8, value: []const u8) !void {
+        const gop = try self.map.getOrPut(self.gpa, key);
+        if (gop.found_existing) {
+            self.gpa.free(gop.value_ptr.*);
+        } else {
+            gop.key_ptr.* = try self.gpa.dupe(u8, key);
+        }
+        gop.value_ptr.* = try self.gpa.dupe(u8, value);
+    }
+    fn delete(self: *RangeRefMap, key: []const u8) void {
+        if (self.map.fetchRemove(key)) |kv| {
+            self.gpa.free(kv.key);
+            self.gpa.free(kv.value);
+        }
+    }
+    /// Remove every present key in [begin, end) (bytewise, end exclusive).
+    fn deleteRange(self: *RangeRefMap, begin: []const u8, end: []const u8) !void {
+        var to_remove: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer to_remove.deinit(self.gpa);
+        var it = self.map.keyIterator();
+        while (it.next()) |kp| {
+            const k = kp.*;
+            if (std.mem.order(u8, k, begin) != .lt and std.mem.order(u8, k, end) == .lt) {
+                try to_remove.append(self.gpa, k);
+            }
+        }
+        for (to_remove.items) |k| self.delete(k);
+    }
+    fn get(self: *RangeRefMap, key: []const u8) ?[]const u8 {
+        return self.map.get(key);
+    }
+};
+
+fn verifyAgainstRangeRef(gpa: std.mem.Allocator, db: *DB, ref: *RangeRefMap, key_space: usize) !void {
+    var i: usize = 0;
+    while (i < key_space) : (i += 1) {
+        var kbuf: [8]u8 = undefined;
+        const k = try std.fmt.bufPrint(&kbuf, "key{d:0>3}", .{i});
+        const want = ref.get(k);
+        const got = try db.get(.{}, k);
+        if (want) |w| {
+            const g = got orelse {
+                std.debug.print("missing key {s}: ref={s} db=null\n", .{ k, w });
+                return error.TestKeyMissing;
+            };
+            defer gpa.free(g);
+            testing.expectEqualSlices(u8, w, g) catch {
+                std.debug.print("mismatch key {s}: ref={s} db={s}\n", .{ k, w, g });
+                return error.TestValueMismatch;
+            };
+        } else {
+            if (got) |g| {
+                defer gpa.free(g);
+                std.debug.print("unexpected key {s}: db={s}\n", .{ k, g });
+                return error.TestUnexpectedKey;
+            }
+        }
+    }
+
+    // Full forward scan == sorted live reference entries.
+    var sorted_keys: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer sorted_keys.deinit(gpa);
+    var it_ref = ref.map.iterator();
+    while (it_ref.next()) |entry| try sorted_keys.append(gpa, entry.key_ptr.*);
+    std.mem.sort([]const u8, sorted_keys.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lt);
+
+    var it = try db.newIterator(gpa, .{});
+    defer it.deinit();
+    var idx: usize = 0;
+    it.seekToFirst();
+    while (it.valid()) : (it.next()) {
+        if (idx >= sorted_keys.items.len) {
+            std.debug.print("scan has extra key {s}\n", .{it.key()});
+            return error.TestScanTooLong;
+        }
+        const want_k = sorted_keys.items[idx];
+        const want_v = ref.get(want_k).?;
+        testing.expectEqualSlices(u8, want_k, it.key()) catch {
+            std.debug.print("scan key mismatch at {d}: ref={s} db={s}\n", .{ idx, want_k, it.key() });
+            return error.TestScanKeyMismatch;
+        };
+        testing.expectEqualSlices(u8, want_v, it.value()) catch {
+            std.debug.print("scan value mismatch at key {s}: ref={s} db={s}\n", .{ want_k, want_v, it.value() });
+            return error.TestScanValueMismatch;
+        };
+        idx += 1;
+    }
+    if (idx != sorted_keys.items.len) {
+        std.debug.print("scan too short: got {d} want {d}\n", .{ idx, sorted_keys.items.len });
+        return error.TestScanTooShort;
+    }
+    try testing.expect(it.status() == null);
+}
+
+test "M7.5: randomized deleteRange gate vs reference map (get + scan + reopen)" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    const key_space: usize = 60; // keys "key000".."key059"
+    const opts = options_mod.Options{
+        .write_buffer_size = 256, // many flushes
+        .level0_file_num_compaction_trigger = 2, // many compactions
+        .max_bytes_for_level_base = 4096,
+        .target_file_size_base = 2048,
+    };
+
+    var ref = RangeRefMap.init(gpa);
+    defer ref.deinit();
+
+    var prng = std.Random.DefaultPrng.init(0xDE1E_7E_4A56);
+    const rand = prng.random();
+
+    {
+        const db = try DB.open(gpa, e, "rangefuzz", opts);
+        defer db.close();
+
+        var op: usize = 0;
+        while (op < 2000) : (op += 1) {
+            const roll = rand.uintLessThan(u32, 100);
+            if (roll < 55) {
+                // 55% put random key -> random value.
+                const key_idx = rand.uintLessThan(usize, key_space);
+                var kbuf: [8]u8 = undefined;
+                const k = try std.fmt.bufPrint(&kbuf, "key{d:0>3}", .{key_idx});
+                var vbuf: [24]u8 = undefined;
+                const vlen = 1 + rand.uintLessThan(usize, vbuf.len);
+                for (vbuf[0..vlen]) |*b| b.* = 'a' + rand.uintLessThan(u8, 26);
+                const v = vbuf[0..vlen];
+                try db.put(.{}, k, v);
+                try ref.put(k, v);
+            } else if (roll < 75) {
+                // 20% point delete.
+                const key_idx = rand.uintLessThan(usize, key_space);
+                var kbuf: [8]u8 = undefined;
+                const k = try std.fmt.bufPrint(&kbuf, "key{d:0>3}", .{key_idx});
+                try db.delete(.{}, k);
+                ref.delete(k);
+            } else {
+                // 25% deleteRange over a random [b, e).
+                var lo = rand.uintLessThan(usize, key_space);
+                var hi = rand.uintLessThan(usize, key_space);
+                if (lo > hi) {
+                    const t = lo;
+                    lo = hi;
+                    hi = t;
+                }
+                hi += 1; // make end exclusive bound past `hi`
+                var bbuf: [8]u8 = undefined;
+                var ebuf: [8]u8 = undefined;
+                const b = try std.fmt.bufPrint(&bbuf, "key{d:0>3}", .{lo});
+                const en = try std.fmt.bufPrint(&ebuf, "key{d:0>3}", .{hi});
+                try db.deleteRange(.{}, b, en);
+                try ref.deleteRange(b, en);
+            }
+
+            if (op % 250 == 249) {
+                try verifyAgainstRangeRef(gpa, db, &ref, key_space);
+            }
+        }
+        try verifyAgainstRangeRef(gpa, db, &ref, key_space);
+    }
+
+    // Reopen and re-verify (tombstones must survive recovery + compaction).
+    {
+        const db = try DB.open(gpa, e, "rangefuzz", opts);
+        defer db.close();
+        try verifyAgainstRangeRef(gpa, db, &ref, key_space);
     }
 }
