@@ -48,6 +48,8 @@ pub const snapshot = @import("db/snapshot.zig");
 
 // Version / MANIFEST (Phase 5).
 pub const version_edit = @import("version/version_edit.zig");
+pub const version_set = @import("version/version_set.zig");
+pub const filename = @import("version/filename.zig");
 
 test "version constant" {
     try std.testing.expectEqualStrings("0.0.0", version);

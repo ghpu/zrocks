@@ -4,11 +4,11 @@ zig_binary: /home/ghpu/zig/zig
 stdlib: /home/ghpu/zig/lib/std
 target_rocksdb: "9.x line; block-based table format_version 5; legacy WAL/MANIFEST log (see docs/adr/000-target-format.md)"
 active_phase: P5
-active_milestone: "M5.1 Version / VersionSet / MANIFEST"
-last_completed: M5.0 VersionEdit
-worktrees: "m5.1-version-set"
+active_milestone: "M5.2 Recovery (DB.open WAL replay + MANIFEST)"
+last_completed: M5.1 Version / VersionSet / MANIFEST
+worktrees: "m5.2-recovery"
 test_command: "/home/ghpu/zig/zig build test"
-test_count: 243
+test_count: 256
 updated: 2026-05-28
 ---
 
@@ -52,8 +52,8 @@ RocksDB reference: https://github.com/facebook/rocksdb/wiki
 
 ### Phase 5 — Persistence: Version/MANIFEST + recovery
 - [x] M5.0 VersionEdit                  (src/version/version_edit.zig)
-- [~] M5.1 Version / VersionSet / MANIFEST  <-- ACTIVE
-- [ ] M5.2 Recovery   (RocksDB real-DB read-interop gate deferred to after Phase 6 SST read path)
+- [x] M5.1 Version / VersionSet / MANIFEST  (src/version/{version_set,filename}.zig)
+- [~] M5.2 Recovery  <-- ACTIVE  (RocksDB real-DB read-interop gate deferred to after Phase 6 SST read path)
 
 ### Phase 6 — Compaction → full embedded KV store
 - [ ] M6.0 Flush (memtable → L0)
