@@ -30,8 +30,17 @@ const bloom = @import("../format/bloom.zig");
 const version_set = @import("../version/version_set.zig");
 const version_edit = @import("../version/version_edit.zig");
 const filename = @import("../version/filename.zig");
+const coding = @import("../util/coding.zig");
 
 const MemTable = memtable_mod.MemTable;
+
+/// Encode `user_key ++ fixed64(packSequenceAndType(seq, t))` (caller frees).
+fn encodeInternalKey(gpa: std.mem.Allocator, user_key: []const u8, seq: u64, t: internal_key.ValueType) ![]u8 {
+    const out = try gpa.alloc(u8, user_key.len + 8);
+    @memcpy(out[0..user_key.len], user_key);
+    coding.encodeFixed64(out[user_key.len..][0..8], internal_key.packSequenceAndType(seq, t));
+    return out;
+}
 
 /// Bloom bits/key used for flushed SSTs.  Must match the TableCache reader,
 /// which opens tables with `BloomFilterPolicy.init(10)`.
@@ -104,6 +113,33 @@ pub fn flushMemTable(
             if (largest) |l| gpa.free(l);
             largest = try gpa.dupe(u8, ikey);
             num_entries += 1;
+        }
+
+        // M7.5: carry the memtable's range tombstones into the SST's range-del
+        // meta block, and widen the file's key range to cover them (so reads /
+        // compaction inputs over the tombstone span pick up this file).  The
+        // smallest/largest are INTERNAL keys; we synthesize them from the
+        // tombstone begin/end at this memtable's sequence range.  A tombstone's
+        // begin extends `smallest`; its end (exclusive) extends `largest`.
+        for (imm.range_tombstones.tombstones.items) |t| {
+            try tb.addRangeTombstone(t.begin, t.end, t.seq);
+            // Synthesize internal keys for range widening (type/seq only matter
+            // for the IKC user-key comparison done by overlap/get).
+            const b_ik = try encodeInternalKey(gpa, t.begin, t.seq, .range_deletion);
+            defer gpa.free(b_ik);
+            const e_ik = try encodeInternalKey(gpa, t.end, t.seq, .range_deletion);
+            defer gpa.free(e_ik);
+            if (smallest == null or ikc.compare(b_ik, smallest.?) == .lt) {
+                if (smallest) |s| gpa.free(s);
+                smallest = try gpa.dupe(u8, b_ik);
+            }
+            if (largest == null or ikc.compare(e_ik, largest.?) == .gt) {
+                if (largest) |l| gpa.free(l);
+                largest = try gpa.dupe(u8, e_ik);
+            }
+            // The SST is non-empty if it carries any tombstone, even without
+            // point entries, so it must be registered below.
+            if (num_entries == 0) num_entries = 1;
         }
 
         try tb.finish();

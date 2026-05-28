@@ -62,6 +62,17 @@ pub const WriteBatch = struct {
         self.setCount(self.count() + 1);
     }
 
+    /// Append a DeleteRange record (M7.5) and increment the count.  It deletes
+    /// every key in `[begin, end)` (half-open, `end` exclusive) as of this
+    /// record's sequence.  Wire format: type byte 0x0F (range_deletion) followed
+    /// by length-prefixed `begin` then length-prefixed `end`.
+    pub fn deleteRange(self: *WriteBatch, gpa: std.mem.Allocator, begin: []const u8, end: []const u8) !void {
+        try self.rep.append(gpa, @intFromEnum(ValueType.range_deletion));
+        try coding.putLengthPrefixedSlice(&self.rep, gpa, begin);
+        try coding.putLengthPrefixedSlice(&self.rep, gpa, end);
+        self.setCount(self.count() + 1);
+    }
+
     /// Read the record count from the header (fixed32 LE at offset 8).
     pub fn count(self: *const WriteBatch) u32 {
         const bytes: *const [4]u8 = self.rep.items[kCountOffset..][0..4];
@@ -149,6 +160,17 @@ pub const WriteBatch = struct {
                 const key = coding.getLengthPrefixedSlice(&input) catch return error.Corruption;
                 const value = coding.getLengthPrefixedSlice(&input) catch return error.Corruption;
                 try handler.merge(key, value);
+                parsed_count += 1;
+            } else if (type_byte == @intFromEnum(ValueType.range_deletion)) {
+                // DeleteRange record (M7.5): begin + end (both user keys).
+                const begin = coding.getLengthPrefixedSlice(&input) catch return error.Corruption;
+                const end = coding.getLengthPrefixedSlice(&input) catch return error.Corruption;
+                // Only handlers that implement `deleteRange` accept range records;
+                // a range record reaching a handler without the method is a usage
+                // error (e.g. an old put/delete-only handler) and is rejected.
+                const Handler = @typeInfo(@TypeOf(handler)).pointer.child;
+                if (!@hasDecl(Handler, "deleteRange")) return error.Corruption;
+                try handler.deleteRange(begin, end);
                 parsed_count += 1;
             } else {
                 return error.Corruption;

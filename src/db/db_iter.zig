@@ -23,6 +23,7 @@ const internal_key = @import("../format/internal_key.zig");
 const coding = @import("../util/coding.zig");
 const prefix = @import("../rocks/prefix.zig");
 const merge_operator_mod = @import("../rocks/merge_operator.zig");
+const delete_range = @import("../rocks/delete_range.zig");
 
 /// User-facing iterator over a single internal iterator at a fixed snapshot.
 pub const DBIterator = struct {
@@ -73,6 +74,13 @@ pub const DBIterator = struct {
     /// over that entry.
     inner_past_run: bool = false,
 
+    /// Optional snapshot-scoped range-tombstone aggregator (M7.5).  When set, a
+    /// surfaced value whose sequence is shadowed by a covering tombstone
+    /// (value_seq < tomb.seq <= snapshot, begin <= key < end) is HIDDEN — the
+    /// scan treats the key as deleted and skips its older versions.  Owned by the
+    /// DBIterator (built by DB.newIterator); `deinit` frees it.
+    range_aggregator: ?*delete_range.RangeTombstoneList = null,
+
     pub fn init(
         gpa: std.mem.Allocator,
         inner: iterator.Iterator,
@@ -91,6 +99,11 @@ pub const DBIterator = struct {
         self.saved_key.deinit(self.gpa);
         self.saved_value.deinit(self.gpa);
         self.prefix_bound.deinit(self.gpa);
+        if (self.range_aggregator) |agg| {
+            agg.deinit();
+            self.gpa.destroy(agg);
+            self.range_aggregator = null;
+        }
         if (self.owned_inner) |ctx| {
             if (self.owned_inner_destroy) |destroy| destroy(self.gpa, ctx);
             self.owned_inner = null;
@@ -201,6 +214,12 @@ pub const DBIterator = struct {
                             self.user_cmp.compare(ikey.user_key, self.saved_key.items) != .gt)
                         {
                             // An older version of an already-handled user key.
+                        } else if (self.coveredByRangeTombstone(ikey.user_key, ikey.sequence)) {
+                            // M7.5: this newest value is shadowed by a visible
+                            // range tombstone — hide the key and skip its older
+                            // versions, exactly like a point deletion.
+                            try self.saveKey(ikey.user_key);
+                            skipping = true;
                         } else if (self.outsidePrefixBound(ikey.user_key)) {
                             // M7.2: this entry's prefix differs from the seek
                             // prefix.  Entries are in ascending user-key order,
@@ -334,6 +353,14 @@ pub const DBIterator = struct {
         self.is_valid = true;
         self.inner_past_run = true;
         return true;
+    }
+
+    /// M7.5: true when a range tombstone visible at this iterator's snapshot
+    /// covers `user_key` and shadows a value at `value_seq` (value_seq < tomb.seq
+    /// <= snapshot, begin <= key < end).  False when no aggregator is configured.
+    fn coveredByRangeTombstone(self: *const DBIterator, user_key: []const u8, value_seq: u64) bool {
+        const agg = self.range_aggregator orelse return false;
+        return agg.covered(user_key, value_seq, self.snapshot, self.user_cmp);
     }
 
     /// True when a prefix bound is active and `user_key`'s prefix differs from

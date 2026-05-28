@@ -27,6 +27,7 @@ const internal_key = @import("../format/internal_key.zig");
 const arena = @import("../util/arena.zig");
 const comparator = @import("../util/comparator.zig");
 const coding = @import("../util/coding.zig");
+const delete_range = @import("../rocks/delete_range.zig");
 
 // ---------------------------------------------------------------------------
 // LookupKey
@@ -102,6 +103,12 @@ pub const MemTable = struct {
     arena: arena.Arena,
     ikcmp: internal_key.InternalKeyComparator,
     table: skiplist.SkipList,
+    /// Range tombstones recorded via `add(.range_deletion, begin, end)` (M7.5).
+    /// These are kept OUT of the skiplist (which orders point entries) and
+    /// queried by the read path's aggregator + carried to SSTs on flush.  Owns
+    /// its key bytes in the gpa (not the arena) so they survive independently;
+    /// freed in `deinit`.
+    range_tombstones: delete_range.RangeTombstoneList,
 
     /// Construct a heap-allocated MemTable.  Heap allocation keeps `arena` and
     /// `ikcmp` at stable addresses for the lifetime of the table, which matters
@@ -113,6 +120,7 @@ pub const MemTable = struct {
 
         self.arena = arena.Arena.init(gpa);
         self.ikcmp = .{ .user = user_cmp };
+        self.range_tombstones = delete_range.RangeTombstoneList.init(gpa);
 
         // Entry comparator: ctx = &self.ikcmp (stable). Each "key" handed to it
         // is an encoded entry buffer; it extracts the length-prefixed internal
@@ -127,6 +135,7 @@ pub const MemTable = struct {
 
     pub fn deinit(self: *MemTable) void {
         const gpa = self.arena.backing;
+        self.range_tombstones.deinit();
         self.arena.deinit();
         gpa.destroy(self);
     }
@@ -145,6 +154,14 @@ pub const MemTable = struct {
         key: []const u8,
         value: []const u8,
     ) !void {
+        // A range tombstone (M7.5) is NOT a skiplist point entry: `key` is the
+        // begin user key and `value` is the end user key.  Record it in the
+        // tombstone list at `sequence` and return.
+        if (t == .range_deletion) {
+            try self.range_tombstones.add(key, value, sequence);
+            return;
+        }
+
         const gpa = self.arena.backing;
         const internal_key_size = key.len + 8;
         const encoded_len = coding.varintLength(@intCast(internal_key_size)) + internal_key_size +
@@ -178,6 +195,14 @@ pub const MemTable = struct {
     ///   - `.deleted` if it is a tombstone,
     ///   - `null` if there is no entry for the user key at/under the snapshot.
     pub fn get(self: *MemTable, lookup: LookupKey) ?GetResult {
+        return self.getWithSeq(lookup, null);
+    }
+
+    /// Like `get`, but also writes the sequence of the surfaced entry into
+    /// `seq_out` (when non-null) on a `.found`/`.deleted` result.  M7.5 uses the
+    /// sequence to decide whether a covering range tombstone (at some seq T)
+    /// shadows the value (value_seq < T) or the value outranks it (value_seq >= T).
+    pub fn getWithSeq(self: *MemTable, lookup: LookupKey, seq_out: ?*u64) ?GetResult {
         var it = skiplist.SkipList.Iterator.init(&self.table);
         // Seek using the encoded memtable key (length-prefixed internal key).
         // Because entries sort by user key then trailer DESCENDING, the first
@@ -195,6 +220,7 @@ pub const MemTable = struct {
         if (self.ikcmp.user.compare(stored_uk, lookup.userKey()) != .eq) return null;
 
         const parsed = internal_key.parseInternalKey(stored_ikey) catch return null;
+        if (seq_out) |p| p.* = parsed.sequence;
         switch (parsed.type) {
             .value => {
                 const value = coding.getLengthPrefixedSlice(&rest) catch return null;

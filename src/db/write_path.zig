@@ -45,6 +45,15 @@ pub const MemTableInserter = struct {
         try self.mem.add(self.sequence, .merge, key, value);
         self.sequence += 1;
     }
+
+    /// Handle a DeleteRange record (M7.5): record a range tombstone over
+    /// `[begin, end)` in the memtable's tombstone list at the current sequence,
+    /// then bump the sequence.  Encoded as `.range_deletion` (key=begin,
+    /// value=end), which `MemTable.add` routes into `range_tombstones`.
+    pub fn deleteRange(self: *MemTableInserter, begin: []const u8, end: []const u8) !void {
+        try self.mem.add(self.sequence, .range_deletion, begin, end);
+        self.sequence += 1;
+    }
 };
 
 /// Insert every record of `batch` into `mem`, assigning sequence numbers

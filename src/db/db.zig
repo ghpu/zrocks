@@ -48,6 +48,7 @@ const log_format = @import("../format/log_format.zig");
 
 const write_path = @import("write_path.zig");
 const db_iter = @import("db_iter.zig");
+const delete_range = @import("../rocks/delete_range.zig");
 const snapshot_mod = @import("snapshot.zig");
 const recovery = @import("recovery.zig");
 const flush = @import("flush.zig");
@@ -227,6 +228,18 @@ pub const DB = struct {
         var batch = try WriteBatch.init(self.gpa);
         defer batch.deinit(self.gpa);
         try batch.delete(self.gpa, key);
+        try self.write(wopts, &batch);
+    }
+
+    /// Delete every key in `[begin, end)` (half-open, `end` exclusive) as of this
+    /// op's sequence (a one-op range-del WriteBatch, M7.5).  Keys written AFTER
+    /// this (higher sequence) are not affected; keys with a lower sequence covered
+    /// by the range become invisible.  A degenerate range (`begin >= end`) deletes
+    /// nothing.
+    pub fn deleteRange(self: *DB, wopts: WriteOptions, begin: []const u8, end: []const u8) !void {
+        var batch = try WriteBatch.init(self.gpa);
+        defer batch.deinit(self.gpa);
+        try batch.deleteRange(self.gpa, begin, end);
         try self.write(wopts, &batch);
     }
 
@@ -430,19 +443,35 @@ pub const DB = struct {
             return self.mergeGet(key, seq);
         }
 
+        // M7.5: the largest covering range-tombstone sequence visible at `seq`.
+        // A surfaced value with sequence < this is deleted by the range tombstone;
+        // a value with sequence >= it outranks the tombstone and is visible.  When
+        // there are no covering tombstones this is 0 (no shadowing).
+        const cover_seq = try self.maxCoveringTombstoneSeq(key, seq);
+
         var lookup = try memtable_mod.LookupKey.init(self.gpa, key, seq);
         defer lookup.deinit(self.gpa);
 
         // 1. MemTable first (it holds the newest writes).
-        if (self.mem.get(lookup)) |r| switch (r) {
-            .found => |v| return try self.gpa.dupe(u8, v),
-            .deleted => return null,
-        };
+        {
+            var vseq: u64 = 0;
+            if (self.mem.getWithSeq(lookup, &vseq)) |r| switch (r) {
+                .found => |v| {
+                    if (vseq < cover_seq) return null; // shadowed by a range tombstone
+                    return try self.gpa.dupe(u8, v);
+                },
+                .deleted => return null,
+            };
+        }
 
         // 1b. The immutable memtable being flushed (if any) is next-newest.
         if (self.imm) |imm| {
-            if (imm.get(lookup)) |r| switch (r) {
-                .found => |v| return try self.gpa.dupe(u8, v),
+            var vseq: u64 = 0;
+            if (imm.getWithSeq(lookup, &vseq)) |r| switch (r) {
+                .found => |v| {
+                    if (vseq < cover_seq) return null;
+                    return try self.gpa.dupe(u8, v);
+                },
                 .deleted => return null,
             };
         }
@@ -450,15 +479,62 @@ pub const DB = struct {
         // 2. Not in the memtable: consult the on-disk SSTs via the current
         //    Version (LSM point lookup with snapshot + tombstone semantics).
         const version = self.versions.currentVersion();
-        if (try version.get(self.gpa, &self.table_cache, self.options.comparator, key, seq)) |r| {
+        var vseq: u64 = 0;
+        if (try version.getWithSeq(self.gpa, &self.table_cache, self.options.comparator, key, seq, &vseq)) |r| {
             switch (r) {
                 // The value is freshly gpa-allocated by Version.get; the caller
                 // owns and frees it.  Drop const since it is uniquely owned.
-                .found => |v| return @constCast(v),
+                .found => |v| {
+                    if (vseq < cover_seq) {
+                        self.gpa.free(@constCast(v));
+                        return null;
+                    }
+                    return @constCast(v);
+                },
                 .deleted => return null,
             }
         }
         return null;
+    }
+
+    /// The largest range-tombstone sequence (visible at `snapshot`) that covers
+    /// `key`, or 0 if none.  Scans the live MemTable + imm + every SST's range-del
+    /// block.  This is the read-side aggregator query specialized to point gets.
+    /// TODO(perf): prune by file key-range overlap; cache per-Version aggregation.
+    fn maxCoveringTombstoneSeq(self: *DB, key: []const u8, snapshot: u64) !u64 {
+        const user_cmp = self.options.comparator;
+        var best: u64 = 0;
+
+        const consider = struct {
+            fn f(best_p: *u64, t_begin: []const u8, t_end: []const u8, t_seq: u64, k: []const u8, snap: u64, cmp: comparator.Comparator) void {
+                if (t_seq > snap) return;
+                if (t_seq <= best_p.*) return;
+                if (cmp.compare(k, t_begin) == .lt) return;
+                if (cmp.compare(k, t_end) != .lt) return; // k >= end
+                best_p.* = t_seq;
+            }
+        }.f;
+
+        for (self.mem.range_tombstones.tombstones.items) |t| {
+            consider(&best, t.begin, t.end, t.seq, key, snapshot, user_cmp);
+        }
+        if (self.imm) |imm| {
+            for (imm.range_tombstones.tombstones.items) |t| {
+                consider(&best, t.begin, t.end, t.seq, key, snapshot, user_cmp);
+            }
+        }
+        const v = self.versions.currentVersion();
+        for (&v.files) |level| {
+            for (level.items) |f| {
+                const table = try self.table_cache.findTable(f.number, f.file_size);
+                var rtl = try table.rangeTombstones(self.gpa);
+                defer rtl.deinit();
+                for (rtl.tombstones.items) |t| {
+                    consider(&best, t.begin, t.end, t.seq, key, snapshot, user_cmp);
+                }
+            }
+        }
+        return best;
     }
 
     /// Merge-aware point lookup (M7.1).  Builds an internal MergingIterator over
@@ -568,6 +644,15 @@ pub const DB = struct {
         var dbit = DBIterator.init(gpa, merger.iterator(), self.options.comparator, seq);
         dbit.owned_inner = merger;
         dbit.owned_inner_destroy = destroyMerger;
+        // M7.5: a snapshot-scoped range-tombstone aggregator so the scan skips
+        // any surfaced user key whose value is covered by a visible tombstone.
+        // The DBIterator owns it (deinits + frees it).
+        {
+            const agg = try gpa.create(delete_range.RangeTombstoneList);
+            errdefer gpa.destroy(agg);
+            agg.* = try self.buildRangeAggregator(gpa, seq);
+            dbit.range_aggregator = agg;
+        }
         // M7.2: thread the prefix extractor + prefix-bounded scan flag so a
         // `seek` can bound iteration to the seek target's prefix.
         dbit.prefix_extractor = self.options.prefix_extractor;
@@ -632,6 +717,43 @@ pub const DB = struct {
         // release our temporary list (the copies are now owned by the merger).
         children.deinit(gpa);
         return merger;
+    }
+
+    /// Build a snapshot-scoped range-tombstone aggregator (M7.5): collect every
+    /// range tombstone visible at `snapshot` (`tomb.seq <= snapshot`) from the
+    /// live MemTable, the immutable MemTable being flushed (if any), and every SST
+    /// in the current Version.  The caller OWNS the returned list (`deinit`s it).
+    ///
+    /// Correctness-first: we gather tombstones from ALL SSTs (no range-overlap
+    /// pruning) and re-scan them linearly per query.
+    /// TODO(perf): prune by file key-range overlap + a fragmented tombstone iter.
+    fn buildRangeAggregator(self: *DB, gpa: std.mem.Allocator, snapshot: u64) !delete_range.RangeTombstoneList {
+        var agg = delete_range.RangeTombstoneList.init(gpa);
+        errdefer agg.deinit();
+
+        // 1. Live MemTable tombstones.
+        for (self.mem.range_tombstones.tombstones.items) |t| {
+            if (t.seq <= snapshot) try agg.add(t.begin, t.end, t.seq);
+        }
+        // 1b. Immutable MemTable being flushed (if any).
+        if (self.imm) |imm| {
+            for (imm.range_tombstones.tombstones.items) |t| {
+                if (t.seq <= snapshot) try agg.add(t.begin, t.end, t.seq);
+            }
+        }
+        // 2. Every SST in the current Version.
+        const v = self.versions.currentVersion();
+        for (&v.files) |level| {
+            for (level.items) |f| {
+                const table = try self.table_cache.findTable(f.number, f.file_size);
+                var rtl = try table.rangeTombstones(gpa);
+                defer rtl.deinit();
+                for (rtl.tombstones.items) |t| {
+                    if (t.seq <= snapshot) try agg.add(t.begin, t.end, t.seq);
+                }
+            }
+        }
+        return agg;
     }
 
     /// DBIterator ownership hook: tear down the merging iterator (which deinits
