@@ -282,7 +282,6 @@ pub fn pickUniversalCompaction(
     gpa: std.mem.Allocator,
     versions: *VersionSet,
     options: options_mod.Options,
-    user_cmp: comparator.Comparator,
 ) !?Compaction {
     const v = versions.currentVersion();
     const n = v.numFiles(0);
@@ -364,7 +363,6 @@ pub fn pickUniversalCompaction(
             .largest = try gpa.dupe(u8, f.largest),
         });
     }
-    _ = user_cmp; // (kept for signature symmetry with pickCompaction)
 
     return c;
 }

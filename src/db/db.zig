@@ -337,7 +337,6 @@ pub const DB = struct {
                         self.gpa,
                         self.versions,
                         self.options,
-                        self.options.comparator,
                     )) orelse break;
                     defer c.deinit(self.gpa);
 
