@@ -32,6 +32,7 @@ pub const bloom = @import("format/bloom.zig");
 pub const filter_block = @import("format/filter_block.zig");
 pub const footer = @import("format/footer.zig");
 pub const table_builder = @import("format/table_builder.zig");
+pub const table_reader = @import("format/table_reader.zig");
 
 test "version constant" {
     try std.testing.expectEqualStrings("0.0.0", version);
