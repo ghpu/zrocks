@@ -3,13 +3,13 @@ project: zrocks
 zig_binary: /home/ghpu/zig/zig
 stdlib: /home/ghpu/zig/lib/std
 target_rocksdb: "9.x line; block-based table format_version 5; legacy WAL/MANIFEST log (see docs/adr/000-target-format.md)"
-active_phase: P6
-active_milestone: "M6.3 Snapshots (full) + CLI + integration gate"
-last_completed: M6.2 Leveled compaction (randomized fuzz gate passes; deep L0/L1/L2)
-worktrees: "m6.3-snapshots"
+active_phase: P7 (not started)
+active_milestone: "LEVELDB-EQUIVALENT CORE COMPLETE (Phases 0–6). Next: Phase 7 RocksDB extensions."
+last_completed: M6.3 Snapshots + CLI + integration gate (Phase 6 COMPLETE)
+worktrees: "(none — clean)"
 test_command: "/home/ghpu/zig/zig build test"
-test_count: 289
-note: "M6.3 is ALLOWED to edit build.zig (add main.zig exe + tests/ integration test artifact) — exception to the usual no-build.zig rule."
+test_count: 296
+artifacts: "zig build -> zig-out/lib/libzrocks.a + zig-out/bin/zrocks (CLI). CLI verified end-to-end (put/get/scan/bench, durable across processes)."
 updated: 2026-05-28
 ---
 
@@ -60,7 +60,19 @@ RocksDB reference: https://github.com/facebook/rocksdb/wiki
 - [x] M6.0 SST read path (src/version/table_cache.zig + Iterator.deinit + Version.get/iters; DB reads memtable+SSTs)
 - [x] M6.1 Flush (immutable memtable → L0 SST + VersionEdit + log switch + write_buffer trigger)  (src/db/flush.zig)
 - [x] M6.2 Leveled compaction (src/db/compaction.zig; picker + merge + tombstone/overwrite drop)
-- [~] M6.3 Snapshots (full SnapshotList; compaction respects oldest) + CLI + integration gate  <-- ACTIVE
+- [x] M6.3 Snapshots (full SnapshotList; compaction respects oldest) + CLI + integration gate
+- [x] GATE: LevelDB-equivalent core COMPLETE — durable, crash-recoverable, leveled-compacting LSM KV store + CLI
+
+### Phase 7 — RocksDB extensions (not started; each independent on the core)
+- [ ] M7.0 Column Families
+- [ ] M7.1 MergeOperator
+- [ ] M7.2 Prefix bloom & prefix seek
+- [ ] M7.3 Universal + FIFO compaction
+- [ ] M7.4 CompactionFilter
+- [ ] M7.5 DeleteRange (range tombstones)
+- [ ] M7.6 Transactions (optimistic + pessimistic)
+- [ ] M7.7 Checkpoints
+- [ ] (revisit) RocksDB real-DB read-interop gate (now feasible: SST read path + manifest exist; needs RocksDB kNewFile4 manifest tag + full-filter format)
 
 ### Phase 7 — RocksDB extensions
 - [ ] M7.0 Column Families
@@ -72,7 +84,11 @@ RocksDB reference: https://github.com/facebook/rocksdb/wiki
 - [ ] M7.6 Transactions (optimistic + pessimistic)
 - [ ] M7.7 Checkpoints
 
-## Active: Phase 6 — Compaction → full LSM (4 milestones)
+## STATUS: LevelDB-equivalent core COMPLETE (Phases 0–6, 296 tests). Next: Phase 7 (RocksDB extensions).
+
+zrocks is a working, durable, crash-recoverable, leveled-compacting LSM key-value store with byte-compatible on-disk formats and a CLI. `zig build` → `libzrocks.a` + `zrocks` binary. To resume: pick a Phase 7 milestone from the checklist above, create a worktree `../zrocks-wt/<slug>` off main, dispatch a subagent with the standard TDD + capability-style + 0.16-gotchas brief, integrate (merge --no-ff, wire root.zig, `zig build test`, update this file, remove worktree).
+
+## (historical) Active: Phase 6 — Compaction → full LSM (4 milestones)
 
 ### Phase 6 plan
 - M6.0 SST read path (O) — needs version_set + table_reader + cache + iterator. New: src/version/table_cache.zig; modify db.zig read path + add Version.get / Version.newIterators. FIRST add an optional `deinit: ?*const fn(ctx)void` to the `iterator.Iterator` vtable and have Merging/TwoLevel call children's deinit (the gap noted below). table_cache opens/caches Table handles by file number (filename.tableFileName). DB.get: check memtable, then current Version's files (L0 newest-first by file number, then levels 1.. by key range); DB.newIterator merges memtable iter + per-file table iters. Tested by building SSTs via TableBuilder, registering them with a VersionEdit, reading through DB.
@@ -108,6 +124,12 @@ Foundation · Env capability over std.Io (+MemEnv, append) · WAL (byte-compat) 
 8. Build module-first: addExecutable/addTest/addLibrary take root_module: *Module. .zon .name & .fingerprint are enum literals.
 9. CRC32C = std.hash.crc.Crc32Iscsi (not Crc32) + RocksDB mask.
 10. std.Io.Reader/Writer have no takeInt/writeInt — combine with std.mem. Varint hand-rolled (NOT std.leb128).
+
+### CLI / process / time signatures (verified in M6.3, src/main.zig)
+- `pub fn main(init: std.process.Init) !u8` — 0.16 populates `init` with `gpa`, `io` (a ready `std.Io.Threaded` — NO manual init/deinit), `arena`, `minimal.args`. Build a RealEnv with `RealEnv.init(init.io, std.Io.Dir.cwd())`.
+- Args: `std.process.args`/`argsAlloc` are GONE. Use `std.process.Args.Iterator.initAllocator(init.minimal.args, gpa)` then `.next()`/`.deinit()`. Iterator-owned slices valid until `.deinit()`.
+- stdout: no ambient buffered stdout — `std.Io.File.stdout().writeStreamingAll(io, bytes)`. `std.debug.print` still ok for stderr/usage.
+- Timing: `std.time.Timer` is GONE. Use `std.Io.Timestamp.now(io, .awake)` and `start.durationTo(end).nanoseconds` (an i96).
 
 ### std.Io filesystem signatures (verified in M1.0 — use via the Env capability, src/env/env.zig)
 - Obtain io: `std.Io.Threaded.init(gpa, opts)` then `.io()`; `.deinit()` to tear down. Tests: global `std.testing.io` + `std.testing.tmpDir(.{})` (cleanup with `defer tmp.cleanup()`).
