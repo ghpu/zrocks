@@ -36,17 +36,16 @@ pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
     const io = init.io;
 
-    // Collect args into a slice we can index.  `init.minimal.args` is the raw
-    // process args; iterate with the gpa-backed iterator (cross-platform).
+    // Collect args into an indexable slice.  `init.minimal.args` is the raw
+    // process args; iterate with the gpa-backed iterator (cross-platform).  The
+    // iterator owns the returned slices until `deinit`, which outlives every use
+    // below, so we can borrow them directly (no per-arg dupe needed).
     var arg_it = try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa);
     defer arg_it.deinit();
 
     var args: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer {
-        for (args.items) |a| gpa.free(a);
-        args.deinit(gpa);
-    }
-    while (arg_it.next()) |a| try args.append(gpa, try gpa.dupe(u8, a));
+    defer args.deinit(gpa);
+    while (arg_it.next()) |a| try args.append(gpa, a);
 
     // args[0] = program name; need at least program + dbpath + command.
     if (args.items.len < 3) {
