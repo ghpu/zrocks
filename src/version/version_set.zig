@@ -180,6 +180,106 @@ pub const Version = struct {
         return null;
     }
 
+    /// Total bytes of all files at `level`.
+    pub fn totalFileSize(self: *const Version, level: usize) u64 {
+        var sum: u64 = 0;
+        for (self.files[level].items) |f| sum += f.file_size;
+        return sum;
+    }
+
+    /// Number of files at `level`.
+    pub fn numFiles(self: *const Version, level: usize) usize {
+        return self.files[level].items.len;
+    }
+
+    /// Files at `level` whose USER-key range overlaps `[begin, end]` (both
+    /// internal keys; null = unbounded on that side).  For level 0, where files
+    /// may overlap arbitrarily, the result is expanded: after collecting the
+    /// initial overlaps, the accumulated user-key range is widened by every
+    /// newly-included file and the scan repeats until it stabilises — mirroring
+    /// LevelDB's `Version::GetOverlappingInputs` loop for level 0.
+    ///
+    /// The returned list deep-owns its FileMetaData key bytes (caller frees each
+    /// `.smallest`/`.largest` then `deinit`s the list — or hands it to a
+    /// Compaction which does so).
+    pub fn overlappingInputs(
+        self: *const Version,
+        gpa: std.mem.Allocator,
+        level: usize,
+        begin_ikey: ?[]const u8,
+        end_ikey: ?[]const u8,
+        user_cmp: comparator.Comparator,
+    ) !std.ArrayListUnmanaged(FileMetaData) {
+        var out: std.ArrayListUnmanaged(FileMetaData) = .empty;
+        errdefer {
+            for (out.items) |f| {
+                gpa.free(f.smallest);
+                gpa.free(f.largest);
+            }
+            out.deinit(gpa);
+        }
+
+        // Working user-key bounds (slices into the Version's owned bytes or the
+        // caller-supplied keys; never duped because we only read them).
+        var user_begin: ?[]const u8 = if (begin_ikey) |b| internal_key.extractUserKey(b) else null;
+        var user_end: ?[]const u8 = if (end_ikey) |e| internal_key.extractUserKey(e) else null;
+
+        const files = self.files[level].items;
+        // Outer loop re-runs the scan whenever a level-0 file widens the range;
+        // for levels >= 1 it runs exactly once.
+        scan: while (true) {
+            var i: usize = 0;
+            while (i < files.len) : (i += 1) {
+                const f = files[i];
+                const f_start = internal_key.extractUserKey(f.smallest);
+                const f_limit = internal_key.extractUserKey(f.largest);
+
+                if (user_begin != null and user_cmp.compare(f_limit, user_begin.?) == .lt) {
+                    continue; // file entirely before the range
+                }
+                if (user_end != null and user_cmp.compare(f_start, user_end.?) == .gt) {
+                    continue; // file entirely after the range
+                }
+
+                // For level 0, a newly-overlapping file may widen the
+                // accumulated range and so pull in files we already skipped.
+                // When that happens, widen the bounds, drop everything collected
+                // so far, and restart the scan from the beginning (LevelDB's
+                // GetOverlappingInputs loop).
+                if (level == 0) {
+                    var restart = false;
+                    if (user_begin == null or user_cmp.compare(f_start, user_begin.?) == .lt) {
+                        user_begin = f_start;
+                        restart = true;
+                    }
+                    if (user_end == null or user_cmp.compare(f_limit, user_end.?) == .gt) {
+                        user_end = f_limit;
+                        restart = true;
+                    }
+                    if (restart) {
+                        for (out.items) |of| {
+                            gpa.free(of.smallest);
+                            gpa.free(of.largest);
+                        }
+                        out.clearRetainingCapacity();
+                        continue :scan;
+                    }
+                }
+
+                try out.append(gpa, .{
+                    .number = f.number,
+                    .file_size = f.file_size,
+                    .smallest = try gpa.dupe(u8, f.smallest),
+                    .largest = try gpa.dupe(u8, f.largest),
+                });
+                // The just-appended entry owns its bytes; on a later error the
+                // errdefer above frees the whole list.
+            }
+            break;
+        }
+        return out;
+    }
+
     /// Append one generic table iterator per file in this Version (all levels)
     /// to `list`.  Each appended iterator OWNS its backing adapter (freed by its
     /// `deinit`); the caller (DB.newIterator) merges them and frees them by
@@ -300,6 +400,51 @@ pub const VersionSet = struct {
 
     pub fn setLogNumber(self: *VersionSet, v: u64) void {
         self.log_number = v;
+    }
+
+    // -- compaction scoring ----------------------------------------------
+
+    /// Byte budget for `level` (>= 1).  L1 = max_bytes_for_level_base; each
+    /// deeper level multiplies by 10 (LevelDB's MaxBytesForLevel).
+    pub fn maxBytesForLevel(self: *const VersionSet, level: usize) u64 {
+        std.debug.assert(level >= 1);
+        var result: u64 = self.options.max_bytes_for_level_base;
+        var l: usize = 1;
+        while (l < level) : (l += 1) {
+            result *= 10;
+        }
+        return result;
+    }
+
+    /// Compaction score for `level`: L0 is scored by FILE COUNT relative to the
+    /// trigger (L0 files overlap, so size is a poor proxy); deeper levels by
+    /// TOTAL BYTES relative to their budget.  A score >= 1.0 means the level
+    /// wants compaction.
+    pub fn compactionScore(self: *const VersionSet, level: usize) f64 {
+        const v = self.currentVersion();
+        if (level == 0) {
+            const trigger: f64 = @floatFromInt(self.options.level0_file_num_compaction_trigger);
+            return @as(f64, @floatFromInt(v.numFiles(0))) / trigger;
+        }
+        const bytes: f64 = @floatFromInt(v.totalFileSize(level));
+        return bytes / @as(f64, @floatFromInt(self.maxBytesForLevel(level)));
+    }
+
+    /// The level whose compaction score is highest, provided it is >= 1.0;
+    /// otherwise null (nothing needs compacting).  Only levels 0..N-2 are
+    /// candidates — the last level has nowhere to compact down to.
+    pub fn pickCompactionLevel(self: *const VersionSet) ?usize {
+        var best_level: ?usize = null;
+        var best_score: f64 = 1.0;
+        var level: usize = 0;
+        while (level + 1 < kNumLevels) : (level += 1) {
+            const score = self.compactionScore(level);
+            if (score >= best_score) {
+                best_score = score;
+                best_level = level;
+            }
+        }
+        return best_level;
     }
 
     // -- apply / log -----------------------------------------------------
@@ -802,6 +947,166 @@ test "recover across multiple edits accumulates layout" {
     // Sorted by smallest: 22 (a..c) then 21 (m..p); 20 was removed.
     try testing.expectEqual(@as(u64, 22), v.files[1].items[0].number);
     try testing.expectEqual(@as(u64, 21), v.files[1].items[1].number);
+}
+
+// ===========================================================================
+// M6.2 — Version compaction helpers (size/count + overlapping inputs + score).
+// ===========================================================================
+
+/// Free a list returned by overlappingInputs (deep-owned key bytes + list).
+fn freeFileList(gpa: std.mem.Allocator, list: *std.ArrayListUnmanaged(FileMetaData)) void {
+    for (list.items) |f| {
+        gpa.free(f.smallest);
+        gpa.free(f.largest);
+    }
+    list.deinit(gpa);
+}
+
+test "M6.2: totalFileSize / numFiles per level" {
+    const gpa = testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+
+    var vs = try VersionSet.init(gpa, me.env(), "db", .{});
+    defer vs.deinit();
+
+    var edit = VersionEdit.init();
+    defer edit.deinit(gpa);
+    try edit.addFile(gpa, 0, 10, 100, ikey("a"), ikey("b"));
+    try edit.addFile(gpa, 0, 11, 250, ikey("c"), ikey("d"));
+    try edit.addFile(gpa, 1, 20, 1000, ikey("m"), ikey("n"));
+    try vs.logAndApply(&edit);
+
+    const v = vs.currentVersion();
+    try testing.expectEqual(@as(usize, 2), v.numFiles(0));
+    try testing.expectEqual(@as(usize, 1), v.numFiles(1));
+    try testing.expectEqual(@as(usize, 0), v.numFiles(2));
+    try testing.expectEqual(@as(u64, 350), v.totalFileSize(0));
+    try testing.expectEqual(@as(u64, 1000), v.totalFileSize(1));
+}
+
+test "M6.2: overlappingInputs on a sorted level picks only the overlapping files" {
+    const gpa = testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+
+    var vs = try VersionSet.init(gpa, me.env(), "db", .{});
+    defer vs.deinit();
+
+    // Level 1 (sorted, non-overlapping): [a,c] [e,g] [m,p].
+    var edit = VersionEdit.init();
+    defer edit.deinit(gpa);
+    try edit.addFile(gpa, 1, 31, 100, ikey("a"), ikey("c"));
+    try edit.addFile(gpa, 1, 32, 100, ikey("e"), ikey("g"));
+    try edit.addFile(gpa, 1, 33, 100, ikey("m"), ikey("p"));
+    try vs.logAndApply(&edit);
+
+    const v = vs.currentVersion();
+
+    // Query [b, f] overlaps [a,c] and [e,g] but not [m,p].
+    {
+        var list = try v.overlappingInputs(gpa, 1, ikey("b"), ikey("f"), comparator.bytewise);
+        defer freeFileList(gpa, &list);
+        try testing.expectEqual(@as(usize, 2), list.items.len);
+        try testing.expectEqual(@as(u64, 31), list.items[0].number);
+        try testing.expectEqual(@as(u64, 32), list.items[1].number);
+    }
+
+    // Unbounded (null,null) → every file.
+    {
+        var list = try v.overlappingInputs(gpa, 1, null, null, comparator.bytewise);
+        defer freeFileList(gpa, &list);
+        try testing.expectEqual(@as(usize, 3), list.items.len);
+    }
+
+    // Query [x, z] overlaps nothing.
+    {
+        var list = try v.overlappingInputs(gpa, 1, ikey("x"), ikey("z"), comparator.bytewise);
+        defer freeFileList(gpa, &list);
+        try testing.expectEqual(@as(usize, 0), list.items.len);
+    }
+}
+
+test "M6.2: overlappingInputs expands the range for level 0 (overlapping files)" {
+    const gpa = testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+
+    var vs = try VersionSet.init(gpa, me.env(), "db", .{});
+    defer vs.deinit();
+
+    // L0 files overlap arbitrarily:
+    //   f10 = [a, c], f11 = [b, e], f12 = [d, f], f13 = [x, z]
+    // A query that touches f11 ([b,e]) must expand to also include f10 (touches
+    // b) and f12 (touches d/e), but NOT f13 ([x,z]).
+    var edit = VersionEdit.init();
+    defer edit.deinit(gpa);
+    try edit.addFile(gpa, 0, 10, 100, ikey("a"), ikey("c"));
+    try edit.addFile(gpa, 0, 11, 100, ikey("b"), ikey("e"));
+    try edit.addFile(gpa, 0, 12, 100, ikey("d"), ikey("f"));
+    try edit.addFile(gpa, 0, 13, 100, ikey("x"), ikey("z"));
+    try vs.logAndApply(&edit);
+
+    const v = vs.currentVersion();
+
+    // Query exactly file 11's range [b, e]; expansion pulls in 10 and 12.
+    var list = try v.overlappingInputs(gpa, 0, ikey("b"), ikey("e"), comparator.bytewise);
+    defer freeFileList(gpa, &list);
+
+    var saw = [_]bool{false} ** 4; // index 0..3 -> numbers 10..13
+    for (list.items) |f| {
+        try testing.expect(f.number >= 10 and f.number <= 13);
+        saw[f.number - 10] = true;
+    }
+    try testing.expect(saw[0]); // 10 [a,c]
+    try testing.expect(saw[1]); // 11 [b,e]
+    try testing.expect(saw[2]); // 12 [d,f]
+    try testing.expect(!saw[3]); // 13 [x,z] — disjoint
+    try testing.expectEqual(@as(usize, 3), list.items.len);
+}
+
+test "M6.2: pickCompactionLevel — L0 by file count, Ln by size" {
+    const gpa = testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+
+    // Small triggers so the test can force a pick deterministically.
+    const opts = options.Options{
+        .level0_file_num_compaction_trigger = 4,
+        .max_bytes_for_level_base = 1000,
+    };
+
+    // No files: nothing to compact.
+    {
+        var vs = try VersionSet.init(gpa, me.env(), "noc", opts);
+        defer vs.deinit();
+        try testing.expect(vs.pickCompactionLevel() == null);
+    }
+
+    // 4 L0 files reach the trigger (score 1.0) → pick L0.
+    {
+        var vs = try VersionSet.init(gpa, me.env(), "l0", opts);
+        defer vs.deinit();
+        var edit = VersionEdit.init();
+        defer edit.deinit(gpa);
+        try edit.addFile(gpa, 0, 10, 10, ikey("a"), ikey("b"));
+        try edit.addFile(gpa, 0, 11, 10, ikey("c"), ikey("d"));
+        try edit.addFile(gpa, 0, 12, 10, ikey("e"), ikey("f"));
+        try edit.addFile(gpa, 0, 13, 10, ikey("g"), ikey("h"));
+        try vs.logAndApply(&edit);
+        try testing.expectEqual(@as(usize, 0), vs.pickCompactionLevel().?);
+    }
+
+    // L1 over its byte budget (max_bytes_for_level_base=1000) → pick L1.
+    {
+        var vs = try VersionSet.init(gpa, me.env(), "l1", opts);
+        defer vs.deinit();
+        var edit = VersionEdit.init();
+        defer edit.deinit(gpa);
+        try edit.addFile(gpa, 1, 20, 1500, ikey("a"), ikey("z"));
+        try vs.logAndApply(&edit);
+        try testing.expectEqual(@as(usize, 1), vs.pickCompactionLevel().?);
+    }
 }
 
 // ===========================================================================
