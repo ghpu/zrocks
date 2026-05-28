@@ -25,11 +25,22 @@ const comparator = @import("../util/comparator.zig");
 const coding = @import("../util/coding.zig");
 const options = @import("../options.zig");
 const filename = @import("filename.zig");
+const internal_key = @import("../format/internal_key.zig");
+const iterator = @import("../iterator/iterator.zig");
+const table_cache = @import("table_cache.zig");
 
 const FileMetaData = version_edit.FileMetaData;
 const VersionEdit = version_edit.VersionEdit;
+const TableCache = table_cache.TableCache;
 
 pub const kNumLevels = 7;
+
+/// Result of a Version point lookup: a value (caller-owned bytes), a tombstone,
+/// or — via the `?GetResult` return — "not present in any file".
+pub const GetResult = union(enum) {
+    found: []const u8,
+    deleted,
+};
 
 // ---------------------------------------------------------------------------
 // Version
@@ -69,6 +80,124 @@ pub const Version = struct {
             .smallest = s,
             .largest = l,
         });
+    }
+
+    /// Whether `[file.smallest, file.largest]` (by USER key) covers `user_key`.
+    fn fileCovers(user_cmp: comparator.Comparator, f: FileMetaData, user_key: []const u8) bool {
+        const smallest_uk = internal_key.extractUserKey(f.smallest);
+        const largest_uk = internal_key.extractUserKey(f.largest);
+        return user_cmp.compare(user_key, smallest_uk) != .lt and
+            user_cmp.compare(user_key, largest_uk) != .gt;
+    }
+
+    /// Probe a single SST file for `user_key` at `lookup_ikey` (an internal key
+    /// `user_key ++ trailer(sequence, seek)`).  Opens a table iterator via the
+    /// cache, seeks, and on an exact user-key hit returns the parsed result
+    /// (value duped with `gpa`, or `.deleted`).  Returns null when the file does
+    /// not contain `user_key`.  The iterator is always deinited.
+    fn probeFile(
+        gpa: std.mem.Allocator,
+        tc: *TableCache,
+        user_cmp: comparator.Comparator,
+        f: FileMetaData,
+        user_key: []const u8,
+        lookup_ikey: []const u8,
+    ) !?GetResult {
+        var it = try tc.newIterator(gpa, f.number, f.file_size);
+        defer it.deinit();
+        it.seek(lookup_ikey);
+        if (it.status()) |e| return e;
+        if (!it.valid()) return null;
+
+        const stored_ikey = it.key();
+        const stored_uk = internal_key.extractUserKey(stored_ikey);
+        if (user_cmp.compare(stored_uk, user_key) != .eq) return null;
+
+        const parsed = internal_key.parseInternalKey(stored_ikey) catch return error.Corruption;
+        switch (parsed.type) {
+            .value => return .{ .found = try gpa.dupe(u8, it.value()) },
+            .deletion, .single_deletion, .range_deletion => return .deleted,
+            .merge => return null, // merge operands not handled at this layer
+        }
+    }
+
+    /// LSM point lookup across this Version for `user_key` visible at `sequence`.
+    ///
+    /// Builds an internal lookup key `user_key ++ trailer(sequence, seek)` and
+    /// probes files newest-first:
+    ///   * Level 0 files may overlap; every covering file is probed in
+    ///     descending file-number order (newest first) and the FIRST hit wins.
+    ///   * Levels >= 1 are sorted, non-overlapping; the single covering file (if
+    ///     any) is located and probed.
+    /// Returns `.found`/`.deleted` on the first match, or null if no file holds
+    /// the user key (the caller then falls through to lower levels / null).
+    pub fn get(
+        self: *const Version,
+        gpa: std.mem.Allocator,
+        tc: *TableCache,
+        user_cmp: comparator.Comparator,
+        user_key: []const u8,
+        sequence: u64,
+    ) !?GetResult {
+        // internal lookup key = user_key ++ fixed64(packSequenceAndType(seq, seek))
+        var lookup: std.ArrayListUnmanaged(u8) = .empty;
+        defer lookup.deinit(gpa);
+        try lookup.appendSlice(gpa, user_key);
+        const trailer = internal_key.packSequenceAndType(sequence, internal_key.kValueTypeForSeek);
+        var tbuf: [8]u8 = undefined;
+        coding.encodeFixed64(&tbuf, trailer);
+        try lookup.appendSlice(gpa, &tbuf);
+        const lookup_ikey = lookup.items;
+
+        // -- Level 0: overlapping; probe covering files newest-first ---------
+        // L0 is stored in insertion order (oldest first, newest last; see
+        // applyEdit), and file numbers increase with write recency, so iterating
+        // in reverse visits the newest files first.  The first covering hit is
+        // the newest version visible at the snapshot, so it wins.
+        {
+            const l0 = self.files[0].items;
+            var i = l0.len;
+            while (i > 0) {
+                i -= 1;
+                const f = l0[i];
+                if (!fileCovers(user_cmp, f, user_key)) continue;
+                if (try probeFile(gpa, tc, user_cmp, f, user_key, lookup_ikey)) |r| return r;
+            }
+        }
+
+        // -- Levels 1..N-1: sorted, non-overlapping; one covering file -------
+        var level: usize = 1;
+        while (level < kNumLevels) : (level += 1) {
+            const files = self.files[level].items;
+            for (files) |f| {
+                if (!fileCovers(user_cmp, f, user_key)) continue;
+                if (try probeFile(gpa, tc, user_cmp, f, user_key, lookup_ikey)) |r| return r;
+                // A non-overlapping level has at most one covering file; if it
+                // did not hold the key, no other file at this level can.
+                break;
+            }
+        }
+        return null;
+    }
+
+    /// Append one generic table iterator per file in this Version (all levels)
+    /// to `list`.  Each appended iterator OWNS its backing adapter (freed by its
+    /// `deinit`); the caller (DB.newIterator) merges them and frees them by
+    /// deiniting the MergingIterator.
+    pub fn addIterators(
+        self: *const Version,
+        gpa: std.mem.Allocator,
+        tc: *TableCache,
+        list: *std.ArrayListUnmanaged(iterator.Iterator),
+    ) !void {
+        var level: usize = 0;
+        while (level < kNumLevels) : (level += 1) {
+            for (self.files[level].items) |f| {
+                const it = try tc.newIterator(gpa, f.number, f.file_size);
+                errdefer it.deinit();
+                try list.append(gpa, it);
+            }
+        }
     }
 };
 
@@ -673,4 +802,275 @@ test "recover across multiple edits accumulates layout" {
     // Sorted by smallest: 22 (a..c) then 21 (m..p); 20 was removed.
     try testing.expectEqual(@as(u64, 22), v.files[1].items[0].number);
     try testing.expectEqual(@as(u64, 21), v.files[1].items[1].number);
+}
+
+// ===========================================================================
+// Version.get / addIterators tests (M6.0 — SST read path).
+// ===========================================================================
+
+const table_builder = @import("../format/table_builder.zig");
+const bloom = @import("../format/bloom.zig");
+
+/// An internal-key entry to write into an SST, plus its decoded user value.
+const SSTEntry = struct { user: []const u8, seq: u64, t: internal_key.ValueType, value: []const u8 };
+
+/// Encode `user ++ fixed64(packSequenceAndType(seq, t))` into `buf` (caller owns).
+fn encodeIkey(gpa: std.mem.Allocator, user: []const u8, seq: u64, t: internal_key.ValueType) ![]u8 {
+    const out = try gpa.alloc(u8, user.len + 8);
+    @memcpy(out[0..user.len], user);
+    coding.encodeFixed64(out[user.len..][0..8], internal_key.packSequenceAndType(seq, t));
+    return out;
+}
+
+/// Build an SST at `db/<number>.sst` from `entries`, which MUST already be in
+/// internal-key order (user ascending, then sequence descending).  Returns the
+/// file size; the smallest/largest internal keys are written into `smallest`/
+/// `largest` (caller-owned).
+fn buildInternalSST(
+    gpa: std.mem.Allocator,
+    e: env.Env,
+    dbname: []const u8,
+    number: u64,
+    policy: bloom.BloomFilterPolicy,
+    entries: []const SSTEntry,
+    smallest: *[]u8,
+    largest: *[]u8,
+) !u64 {
+    const path = try filename.tableFileName(gpa, dbname, number);
+    defer gpa.free(path);
+
+    var first: ?[]u8 = null;
+    var last: ?[]u8 = null;
+    errdefer {
+        if (first) |s| gpa.free(s);
+        if (last) |l| gpa.free(l);
+    }
+
+    // SSTs store internal keys, so build/sort them with the IKC (user asc, then
+    // trailer DESC) — the same comparator the TableCache opens tables with.
+    var ikc = internal_key.InternalKeyComparator{ .user = comparator.bytewise };
+    const build_opts = options.Options{ .comparator = ikc.comparatorInterface() };
+
+    var wf = try e.newWritableFile(gpa, path);
+    errdefer wf.close() catch {};
+    var tb = try table_builder.TableBuilder.init(gpa, build_opts, wf, policy);
+    defer tb.deinit();
+    for (entries) |en| {
+        const ik = try encodeIkey(gpa, en.user, en.seq, en.t);
+        defer gpa.free(ik);
+        try tb.add(ik, en.value);
+        if (first == null) first = try gpa.dupe(u8, ik);
+        if (last) |l| gpa.free(l);
+        last = try gpa.dupe(u8, ik);
+    }
+    try tb.finish();
+    try wf.close();
+
+    smallest.* = first.?;
+    largest.* = last.?;
+    return e.getFileSize(path);
+}
+
+// A VersionSet uses the InternalKeyComparator over internal keys, so the SST is
+// built/sorted with that comparator.  Construct a Version holding one L0 file.
+test "Version.get: found / deleted / absent / snapshot semantics" {
+    const gpa = testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+    try e.makeDir("db");
+
+    const policy = bloom.BloomFilterPolicy.init(10);
+    const user_cmp = comparator.bytewise;
+
+    // Entries in internal-key order: user asc (each user once — the M6.0 block
+    // builder sorts data blocks bytewise, so distinct user keys are required for
+    // bytewise == InternalKeyComparator order within a file; multi-version per
+    // file is M6.1+ once the block builder learns the IKC).
+    //   a: value@5 = "a5"
+    //   b: value@10 = "b10"
+    //   c: deletion@7
+    const entries = [_]SSTEntry{
+        .{ .user = "a", .seq = 5, .t = .value, .value = "a5" },
+        .{ .user = "b", .seq = 10, .t = .value, .value = "b10" },
+        .{ .user = "c", .seq = 7, .t = .deletion, .value = "" },
+    };
+
+    var smallest: []u8 = undefined;
+    var largest: []u8 = undefined;
+    const size = try buildInternalSST(gpa, e, "db", 7, policy, &entries, &smallest, &largest);
+    defer gpa.free(smallest);
+    defer gpa.free(largest);
+
+    // Build a Version with that file at L0.
+    var version = Version.initEmpty();
+    defer version.deinit(gpa);
+    try version.addFileOwned(gpa, 0, .{ .number = 7, .file_size = size, .smallest = smallest, .largest = largest });
+
+    var tc = TableCache.init(gpa, e, "db", .{}, null);
+    defer tc.deinit();
+
+    // b at a high snapshot → value "b10".
+    {
+        const r = (try version.get(gpa, &tc, user_cmp, "b", 1000)) orelse return error.TestExpectedFound;
+        switch (r) {
+            .found => |val| {
+                defer gpa.free(val);
+                try testing.expectEqualStrings("b10", val);
+            },
+            .deleted => return error.TestUnexpectedDeleted,
+        }
+    }
+
+    // a → "a5".
+    {
+        const r = (try version.get(gpa, &tc, user_cmp, "a", 1000)) orelse return error.TestExpectedFound;
+        switch (r) {
+            .found => |val| {
+                defer gpa.free(val);
+                try testing.expectEqualStrings("a5", val);
+            },
+            .deleted => return error.TestUnexpectedDeleted,
+        }
+    }
+
+    // c → tombstone → .deleted.
+    {
+        const r = (try version.get(gpa, &tc, user_cmp, "c", 1000)) orelse return error.TestExpectedDeleted;
+        try testing.expect(r == .deleted);
+    }
+
+    // Absent user "z" → not covered (> largest) → null.
+    try testing.expect((try version.get(gpa, &tc, user_cmp, "z", 1000)) == null);
+
+    // Absent user that sorts before the file's range → not covered → null.
+    try testing.expect((try version.get(gpa, &tc, user_cmp, "0", 1000)) == null);
+
+    // Snapshot hides newer entries: b@10 is invisible at snapshot 4 → null.
+    try testing.expect((try version.get(gpa, &tc, user_cmp, "b", 4)) == null);
+
+    // a@5 IS visible at snapshot 5 (seq <= snapshot).
+    {
+        const r = (try version.get(gpa, &tc, user_cmp, "a", 5)) orelse return error.TestExpectedFound;
+        switch (r) {
+            .found => |val| {
+                defer gpa.free(val);
+                try testing.expectEqualStrings("a5", val);
+            },
+            .deleted => return error.TestUnexpectedDeleted,
+        }
+    }
+
+    // a@5 invisible at snapshot 4 → null.
+    try testing.expect((try version.get(gpa, &tc, user_cmp, "a", 4)) == null);
+
+    // Snapshot below c's tombstone (seq 7) → not visible → null.
+    try testing.expect((try version.get(gpa, &tc, user_cmp, "c", 6)) == null);
+}
+
+test "Version.get: L0 newest-file shadows older overlapping file" {
+    const gpa = testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+    try e.makeDir("db");
+
+    const policy = bloom.BloomFilterPolicy.init(10);
+    const user_cmp = comparator.bytewise;
+
+    // Older file (number 7): k = value@1 "old".
+    const old_entries = [_]SSTEntry{.{ .user = "k", .seq = 1, .t = .value, .value = "old" }};
+    var s_old: []u8 = undefined;
+    var l_old: []u8 = undefined;
+    const size_old = try buildInternalSST(gpa, e, "db", 7, policy, &old_entries, &s_old, &l_old);
+    defer gpa.free(s_old);
+    defer gpa.free(l_old);
+
+    // Newer file (number 9): k = value@5 "new".
+    const new_entries = [_]SSTEntry{.{ .user = "k", .seq = 5, .t = .value, .value = "new" }};
+    var s_new: []u8 = undefined;
+    var l_new: []u8 = undefined;
+    const size_new = try buildInternalSST(gpa, e, "db", 9, policy, &new_entries, &s_new, &l_new);
+    defer gpa.free(s_new);
+    defer gpa.free(l_new);
+
+    var version = Version.initEmpty();
+    defer version.deinit(gpa);
+    // Insertion order = oldest first (7), then newest (9): newest is probed first.
+    try version.addFileOwned(gpa, 0, .{ .number = 7, .file_size = size_old, .smallest = s_old, .largest = l_old });
+    try version.addFileOwned(gpa, 0, .{ .number = 9, .file_size = size_new, .smallest = s_new, .largest = l_new });
+
+    var tc = TableCache.init(gpa, e, "db", .{}, null);
+    defer tc.deinit();
+
+    // High snapshot → newest file (9) wins → "new".
+    {
+        const r = (try version.get(gpa, &tc, user_cmp, "k", 1000)) orelse return error.TestExpectedFound;
+        switch (r) {
+            .found => |val| {
+                defer gpa.free(val);
+                try testing.expectEqualStrings("new", val);
+            },
+            .deleted => return error.TestUnexpectedDeleted,
+        }
+    }
+
+    // Snapshot 1 hides the @5 entry; the older file (@1) supplies "old".
+    {
+        const r = (try version.get(gpa, &tc, user_cmp, "k", 1)) orelse return error.TestExpectedFound;
+        switch (r) {
+            .found => |val| {
+                defer gpa.free(val);
+                try testing.expectEqualStrings("old", val);
+            },
+            .deleted => return error.TestUnexpectedDeleted,
+        }
+    }
+}
+
+test "Version.addIterators: merged scan yields every file's entries" {
+    const gpa = testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+    try e.makeDir("db");
+
+    const policy = bloom.BloomFilterPolicy.init(10);
+
+    const entries = [_]SSTEntry{
+        .{ .user = "a", .seq = 1, .t = .value, .value = "av" },
+        .{ .user = "b", .seq = 1, .t = .value, .value = "bv" },
+    };
+    var smallest: []u8 = undefined;
+    var largest: []u8 = undefined;
+    const size = try buildInternalSST(gpa, e, "db", 7, policy, &entries, &smallest, &largest);
+    defer gpa.free(smallest);
+    defer gpa.free(largest);
+
+    var version = Version.initEmpty();
+    defer version.deinit(gpa);
+    try version.addFileOwned(gpa, 0, .{ .number = 7, .file_size = size, .smallest = smallest, .largest = largest });
+
+    var tc = TableCache.init(gpa, e, "db", .{}, null);
+    defer tc.deinit();
+
+    var list: std.ArrayListUnmanaged(iterator.Iterator) = .empty;
+    defer {
+        for (list.items) |it| it.deinit();
+        list.deinit(gpa);
+    }
+    try version.addIterators(gpa, &tc, &list);
+    try testing.expectEqual(@as(usize, 1), list.items.len);
+
+    // Scan the single table iterator: 2 internal-key entries in order.
+    const it = list.items[0];
+    it.seekToFirst();
+    var count: usize = 0;
+    while (it.valid()) : (it.next()) {
+        const uk = internal_key.extractUserKey(it.key());
+        if (count == 0) try testing.expectEqualStrings("a", uk);
+        if (count == 1) try testing.expectEqualStrings("b", uk);
+        count += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), count);
 }

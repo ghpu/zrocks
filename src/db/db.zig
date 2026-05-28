@@ -1,25 +1,26 @@
-//! db.zig — the embedded key/value store (M4.1 store + M5.2 durability).
+//! db.zig — the embedded key/value store (M4.1 store + M5.2 durability +
+//! M6.0 SST read path).
 //!
-//! Ties the building blocks into a usable DB: a single MemTable behind a
-//! write-ahead log, with snapshot-aware point lookups and a tombstone-hiding
-//! forward iterator.  `open` recovers durable state: a VersionSet reconstructs
-//! the MANIFEST/CURRENT and the active WAL is replayed into the MemTable, then
-//! that SAME log is reused for new appends so committed writes survive reopen
-//! (the "reuse-logs" design).  No flush to SST / immutable memtable / compaction
-//! (Phase 6) yet — recovered data lives in the single MemTable kept durable by
-//! the reused log.
+//! Ties the building blocks into a usable DB: a MemTable behind a write-ahead
+//! log plus the on-disk SSTs of the current Version, with snapshot-aware point
+//! lookups and a tombstone-hiding forward iterator.  `open` recovers durable
+//! state: a VersionSet reconstructs the MANIFEST/CURRENT and the active WAL is
+//! replayed into the MemTable, then that SAME log is reused for new appends so
+//! committed writes survive reopen (the "reuse-logs" design).  No flush to SST
+//! / immutable memtable / compaction yet — SSTs are injected via VersionEdit
+//! until M6.1 adds flush.
 //!
-//! Single source for reads (the live MemTable).  `newIterator` wraps the
-//! memtable's internal iterator behind the generic `iterator.Iterator` and then
-//! a `DBIterator` for user-facing snapshot/tombstone semantics; later phases add
-//! SST sources by composing a MergingIterator in that same slot.
+//! Reads consult the MemTable FIRST (newest writes) and fall through to the
+//! current Version's SSTs via a `TableCache` (M6.0).  `get` returns the newest
+//! value visible at the snapshot, or null on a tombstone/absence.
+//! `newIterator` merges the memtable iterator with one iterator per SST file
+//! into a `MergingIterator` (ordered by the InternalKeyComparator) and wraps it
+//! in a `DBIterator` for user-facing snapshot/tombstone semantics.
 //!
 //! Standalone test note (Zig 0.16): this file uses `../...` imports that only
 //! resolve when compiled as part of the `src`-rooted module.  To run the suite:
 //!   printf 'test { _ = @import("db/db.zig"); }' > src/_verify.zig \
 //!     && zig test src/_verify.zig && rm src/_verify.zig
-
-// RED phase: declarations with @panic stubs + full tests.
 
 const std = @import("std");
 
@@ -32,9 +33,11 @@ const memtable_mod = @import("../memtable/memtable.zig");
 const write_batch = @import("../format/write_batch.zig");
 const log_writer = @import("../format/log_writer.zig");
 const iterator = @import("../iterator/iterator.zig");
+const merging_iterator = @import("../iterator/merging_iterator.zig");
 
 const version_set = @import("../version/version_set.zig");
 const version_edit = @import("../version/version_edit.zig");
+const table_cache_mod = @import("../version/table_cache.zig");
 const filename = @import("../version/filename.zig");
 const log_format = @import("../format/log_format.zig");
 
@@ -60,6 +63,10 @@ pub const DB = struct {
     ikcmp: internal_key.InternalKeyComparator,
     mem: *MemTable,
     versions: *version_set.VersionSet,
+    /// Opens + caches SST `Table` readers for the current Version's files.  Its
+    /// InternalKeyComparator's address is taken into opened tables, so the cache
+    /// must stay pinned — it lives inline in this heap-allocated DB.
+    table_cache: table_cache_mod.TableCache,
     wal_file: env.WritableFile,
     wal: log_writer.Writer,
     last_sequence: u64,
@@ -103,6 +110,12 @@ pub const DB = struct {
         vs.* = try version_set.VersionSet.init(gpa, e, name, options);
         errdefer vs.deinit();
         self.versions = vs;
+
+        // SST reader cache for the current Version's files.  `self.name` is the
+        // borrowed DB directory; `self` is pinned (heap-allocated) so the cache's
+        // internal comparator address stays stable.  No block cache wired yet.
+        self.table_cache = table_cache_mod.TableCache.init(gpa, e, self.name, options, null);
+        errdefer self.table_cache.deinit();
 
         const current_path = try filename.currentFileName(gpa, name);
         defer gpa.free(current_path);
@@ -159,10 +172,12 @@ pub const DB = struct {
         return self;
     }
 
-    /// Flush+close the WAL, deinit the VersionSet + MemTable, free the DB.
+    /// Flush+close the WAL, deinit the table cache + VersionSet + MemTable,
+    /// free the DB.
     pub fn close(self: *DB) void {
         const gpa = self.gpa;
         self.wal_file.close() catch {};
+        self.table_cache.deinit();
         self.versions.deinit();
         gpa.destroy(self.versions);
         self.mem.deinit();
@@ -218,31 +233,83 @@ pub const DB = struct {
         var lookup = try memtable_mod.LookupKey.init(self.gpa, key, seq);
         defer lookup.deinit(self.gpa);
 
-        switch (self.mem.get(lookup) orelse return null) {
+        // 1. MemTable first (it holds the newest writes).
+        if (self.mem.get(lookup)) |r| switch (r) {
             .found => |v| return try self.gpa.dupe(u8, v),
             .deleted => return null,
+        };
+
+        // 2. Not in the memtable: consult the on-disk SSTs via the current
+        //    Version (LSM point lookup with snapshot + tombstone semantics).
+        const version = self.versions.currentVersion();
+        if (try version.get(self.gpa, &self.table_cache, self.options.comparator, key, seq)) |r| {
+            switch (r) {
+                // The value is freshly gpa-allocated by Version.get; the caller
+                // owns and frees it.  Drop const since it is uniquely owned.
+                .found => |v| return @constCast(v),
+                .deleted => return null,
+            }
         }
+        return null;
     }
 
-    /// Forward, snapshot-aware, tombstone-hiding iterator over the live
-    /// MemTable.  Caller must call `.deinit()` on the returned iterator.
+    /// Forward, snapshot-aware, tombstone-hiding iterator over the live MemTable
+    /// merged with every SST file in the current Version.  Caller must call
+    /// `.deinit()` on the returned iterator.
     ///
-    /// The single MemTable source is wrapped behind the generic
-    /// `iterator.Iterator` by a small heap-allocated adapter (so its address is
-    /// stable behind the returned-by-value DBIterator); the DBIterator owns and
-    /// frees that adapter on deinit.  Later phases slot a MergingIterator over
-    /// MemTable + SSTs into the same `inner` position.
+    /// Builds a child list — [memtable adapter] ++ one table iterator per file —
+    /// merges them with a heap-allocated MergingIterator (ordered by the
+    /// InternalKeyComparator, so equal user keys are visited newest-sequence
+    /// first), and wraps that in a DBIterator at the snapshot.  The DBIterator
+    /// owns the MergingIterator via `owned_inner_destroy`, whose deinit tears
+    /// down every child (freeing the memtable adapter + the wrapped table
+    /// iterators) before freeing the merging iterator itself.
     pub fn newIterator(self: *DB, gpa: std.mem.Allocator, ropts: ReadOptions) !DBIterator {
         const seq = ropts.snapshot orelse self.last_sequence;
 
-        const adapter = try gpa.create(MemIterAdapter);
-        errdefer gpa.destroy(adapter);
-        adapter.* = .{ .gpa = gpa, .it = MemTable.Iterator.init(self.mem) };
+        // Collect child iterators; on any error, deinit whatever we built.
+        var children: std.ArrayListUnmanaged(iterator.Iterator) = .empty;
+        errdefer {
+            for (children.items) |it| it.deinit();
+            children.deinit(gpa);
+        }
 
-        var dbit = DBIterator.init(gpa, adapter.genericIterator(), self.options.comparator, seq);
-        dbit.owned_inner = adapter;
-        dbit.owned_inner_destroy = MemIterAdapter.destroy;
+        // 1. MemTable adapter (its vtable.deinit frees the heap adapter).
+        const adapter = try gpa.create(MemIterAdapter);
+        {
+            errdefer gpa.destroy(adapter);
+            adapter.* = .{ .gpa = gpa, .it = MemTable.Iterator.init(self.mem) };
+            try children.append(gpa, adapter.genericIterator());
+        }
+
+        // 2. One table iterator per file in the current Version.
+        try self.versions.currentVersion().addIterators(gpa, &self.table_cache, &children);
+
+        // 3. Merge over the internal-key order.  The merging iterator is heap
+        //    allocated so its address is stable behind the DBIterator.
+        const merger = try gpa.create(merging_iterator.MergingIterator);
+        errdefer gpa.destroy(merger);
+        merger.* = try merging_iterator.MergingIterator.init(
+            gpa,
+            self.ikcmp.comparatorInterface(),
+            children.items,
+        );
+        // MergingIterator.init copied the children slice into its own buffer, so
+        // release our temporary list (the copies are now owned by the merger).
+        children.deinit(gpa);
+
+        var dbit = DBIterator.init(gpa, merger.iterator(), self.options.comparator, seq);
+        dbit.owned_inner = merger;
+        dbit.owned_inner_destroy = destroyMerger;
         return dbit;
+    }
+
+    /// DBIterator ownership hook: tear down the merging iterator (which deinits
+    /// every child) and free its heap allocation.
+    fn destroyMerger(gpa: std.mem.Allocator, ctx: *anyopaque) void {
+        const merger: *merging_iterator.MergingIterator = @ptrCast(@alignCast(ctx));
+        merger.deinit();
+        gpa.destroy(merger);
     }
 
     /// A snapshot pinned at the current latest sequence.
@@ -274,12 +341,6 @@ const MemIterAdapter = struct {
         return .{ .ctx = self, .vtable = &vtable };
     }
 
-    fn destroy(gpa: std.mem.Allocator, ctx: *anyopaque) void {
-        const self: *MemIterAdapter = @ptrCast(@alignCast(ctx));
-        self.seek_buf.deinit(gpa);
-        gpa.destroy(self);
-    }
-
     const vtable = iterator.Iterator.VTable{
         .seekToFirst = vSeekToFirst,
         .seekToLast = vSeekToLast,
@@ -290,10 +351,21 @@ const MemIterAdapter = struct {
         .key = vKey,
         .value = vValue,
         .status = vStatus,
+        .deinit = vDeinit,
     };
 
     fn cast(ctx: *anyopaque) *MemIterAdapter {
         return @ptrCast(@alignCast(ctx));
+    }
+
+    /// Generic-Iterator destructor: free the scratch buffer + the heap adapter.
+    /// Reached when the adapter is handed out as a generic `Iterator` child of a
+    /// MergingIterator (newIterator); the adapter was created with `self.gpa`.
+    fn vDeinit(ctx: *anyopaque) void {
+        const self = cast(ctx);
+        const gpa = self.gpa;
+        self.seek_buf.deinit(gpa);
+        gpa.destroy(self);
     }
 
     fn vSeekToFirst(ctx: *anyopaque) void {
@@ -738,4 +810,184 @@ fn readAllBytes(e: env.Env, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
         try out.appendSlice(gpa, chunk[0..n]);
     }
     return out.toOwnedSlice(gpa);
+}
+
+// ===========================================================================
+// M6.0 — SST read path: reads consult the current Version's SSTs + memtable.
+// ===========================================================================
+
+const table_builder = @import("../format/table_builder.zig");
+const bloom = @import("../format/bloom.zig");
+
+/// Encode `user ++ fixed64(packSequenceAndType(seq, t))` (caller frees).
+fn encodeIkey(gpa: std.mem.Allocator, user: []const u8, seq: u64, t: internal_key.ValueType) ![]u8 {
+    const out = try gpa.alloc(u8, user.len + 8);
+    @memcpy(out[0..user.len], user);
+    coding.encodeFixed64(out[user.len..][0..8], internal_key.packSequenceAndType(seq, t));
+    return out;
+}
+
+const M6Entry = struct { user: []const u8, seq: u64, t: internal_key.ValueType, value: []const u8 };
+
+/// Build an SST of internal keys at `<dbname>/<number>.sst` (entries in
+/// internal-key order), opened later with the InternalKeyComparator.  Writes the
+/// smallest/largest internal keys (caller-owned) and returns the file size.
+fn buildM6SST(
+    gpa: std.mem.Allocator,
+    e: env.Env,
+    dbname: []const u8,
+    number: u64,
+    entries: []const M6Entry,
+    smallest: *[]u8,
+    largest: *[]u8,
+) !u64 {
+    const path = try filename.tableFileName(gpa, dbname, number);
+    defer gpa.free(path);
+
+    const policy = bloom.BloomFilterPolicy.init(10);
+    var ikc = internal_key.InternalKeyComparator{ .user = comparator.bytewise };
+    const opts = Options{ .comparator = ikc.comparatorInterface() };
+
+    var first: ?[]u8 = null;
+    var last: ?[]u8 = null;
+    errdefer {
+        if (first) |s| gpa.free(s);
+        if (last) |l| gpa.free(l);
+    }
+
+    var wf = try e.newWritableFile(gpa, path);
+    errdefer wf.close() catch {};
+    var tb = try table_builder.TableBuilder.init(gpa, opts, wf, policy);
+    defer tb.deinit();
+    for (entries) |en| {
+        const ik = try encodeIkey(gpa, en.user, en.seq, en.t);
+        defer gpa.free(ik);
+        try tb.add(ik, en.value);
+        if (first == null) first = try gpa.dupe(u8, ik);
+        if (last) |l| gpa.free(l);
+        last = try gpa.dupe(u8, ik);
+    }
+    try tb.finish();
+    try wf.close();
+
+    smallest.* = first.?;
+    largest.* = last.?;
+    return e.getFileSize(path);
+}
+
+test "M6.0: get reads from SST; memtable shadows SST by sequence; scan merges both" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    const db = try DB.open(gpa, e, "m6db", .{});
+    defer db.close();
+
+    // Build an SST with x@1="sst_x", y@2="sst_y" (internal-key order: x then y).
+    const entries = [_]M6Entry{
+        .{ .user = "x", .seq = 1, .t = .value, .value = "sst_x" },
+        .{ .user = "y", .seq = 2, .t = .value, .value = "sst_y" },
+    };
+    var smallest: []u8 = undefined;
+    var largest: []u8 = undefined;
+    const file_number = db.versions.newFileNumber();
+    const size = try buildM6SST(gpa, e, "m6db", file_number, &entries, &smallest, &largest);
+    defer gpa.free(smallest);
+    defer gpa.free(largest);
+
+    // Add the SST to L0 via a VersionEdit (test reaches into private fields).
+    {
+        var edit = version_edit.VersionEdit.init();
+        defer edit.deinit(gpa);
+        try edit.addFile(gpa, 0, file_number, size, smallest, largest);
+        edit.setLastSequence(2);
+        try db.versions.logAndApply(&edit);
+    }
+
+    // The SST used sequences 1,2; make the memtable write outrank them.
+    db.last_sequence = 2;
+    try db.put(.{}, "y", "mem_y"); // gets seq 3 → shadows y@2 in the SST
+
+    // get("x") → from the SST (not in memtable).
+    {
+        const got = try db.get(.{}, "x") orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings("sst_x", got);
+    }
+
+    // get("y") → memtable shadows the SST (higher sequence).
+    {
+        const got = try db.get(.{}, "y") orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings("mem_y", got);
+    }
+
+    // get absent → null.
+    try testing.expect((try db.get(.{}, "zzz")) == null);
+
+    // Full scan merges memtable + SST: x→"sst_x", y→"mem_y" (memtable wins), in
+    // user-key order.
+    {
+        var it = try db.newIterator(gpa, .{});
+        defer it.deinit();
+        const exp_k = [_][]const u8{ "x", "y" };
+        const exp_v = [_][]const u8{ "sst_x", "mem_y" };
+        var i: usize = 0;
+        it.seekToFirst();
+        while (it.valid()) : (it.next()) {
+            try testing.expect(i < exp_k.len);
+            try testing.expectEqualStrings(exp_k[i], it.key());
+            try testing.expectEqualStrings(exp_v[i], it.value());
+            i += 1;
+        }
+        try testing.expectEqual(exp_k.len, i);
+        try testing.expect(it.status() == null);
+    }
+}
+
+test "M6.0: SST tombstone hides an older memtable value at the right snapshot" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    const db = try DB.open(gpa, e, "m6tomb", .{});
+    defer db.close();
+
+    // SST holds k = value@5 "kept".
+    const entries = [_]M6Entry{.{ .user = "k", .seq = 5, .t = .value, .value = "kept" }};
+    var smallest: []u8 = undefined;
+    var largest: []u8 = undefined;
+    const file_number = db.versions.newFileNumber();
+    const size = try buildM6SST(gpa, e, "m6tomb", file_number, &entries, &smallest, &largest);
+    defer gpa.free(smallest);
+    defer gpa.free(largest);
+
+    {
+        var edit = version_edit.VersionEdit.init();
+        defer edit.deinit(gpa);
+        try edit.addFile(gpa, 0, file_number, size, smallest, largest);
+        edit.setLastSequence(5);
+        try db.versions.logAndApply(&edit);
+    }
+    db.last_sequence = 5;
+
+    // Latest read sees the SST value.
+    {
+        const got = try db.get(.{}, "k") orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings("kept", got);
+    }
+
+    // A memtable tombstone (seq 6) hides it.
+    try db.delete(.{}, "k");
+    try testing.expect((try db.get(.{}, "k")) == null);
+
+    // But at a snapshot BEFORE the tombstone, the SST value is still visible.
+    {
+        const got = try db.get(.{ .snapshot = 5 }, "k") orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings("kept", got);
+    }
 }
