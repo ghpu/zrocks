@@ -3,12 +3,12 @@ project: zrocks
 zig_binary: /home/ghpu/zig/zig
 stdlib: /home/ghpu/zig/lib/std
 target_rocksdb: "9.x line; block-based table format_version 5; legacy WAL/MANIFEST log (see docs/adr/000-target-format.md)"
-active_phase: P4
-active_milestone: "M4.1 In-memory DB"
-last_completed: M4.0 Iterator framework
-worktrees: "m4.1-db"
+active_phase: P5 (not started)
+active_milestone: "next up: M5.0 VersionEdit (Phase 5 persistence/recovery)"
+last_completed: M4.1 In-memory DB (Phase 4 COMPLETE — usable in-memory KV store)
+worktrees: "(none — clean)"
 test_command: "/home/ghpu/zig/zig build test"
-test_count: 221
+test_count: 235
 updated: 2026-05-28
 ---
 
@@ -48,7 +48,7 @@ RocksDB reference: https://github.com/facebook/rocksdb/wiki
 
 ### Phase 4 — Iterators & in-memory DB
 - [x] M4.0 Iterator interface + merging/two-level  (src/iterator/*.zig)
-- [~] M4.1 In-memory DB (Put/Get/Delete/Write/iter)  <-- ACTIVE
+- [x] M4.1 In-memory DB (Put/Get/Delete/Write/iter)  (src/db/*.zig)
 
 ### Phase 5 — Persistence: Version/MANIFEST + recovery
 - [ ] M5.0 VersionEdit
@@ -71,18 +71,20 @@ RocksDB reference: https://github.com/facebook/rocksdb/wiki
 - [ ] M7.6 Transactions (optimistic + pessimistic)
 - [ ] M7.7 Checkpoints
 
-## Active: Phase 4 — iterators + in-memory DB (sequential: M4.0 → M4.1)
-- M4.0 Iterator framework (O) — generic Iterator vtable interface (seekToFirst/seek/next/valid/key/value/status; reverse best-effort) + MergingIterator (merge N children by comparator) + generic TwoLevelIterator + a VectorIterator test helper. New: src/iterator/{iterator,merging_iterator,two_level_iterator}.zig. Deps: comparator only (tests use VectorIterator; adapters for memtable/table live in M4.1).
-- M4.1 In-memory DB (O) — needs M4.0 + memtable + WAL (log_writer) + write_batch + internal_key. New: src/db/{db,write_path,db_iter,snapshot}.zig. Put/Get/Delete/Write(batch) over a single memtable, WAL append on write, sequence assignment, DBIterator (snapshot + tombstone skipping over a merging iterator wrapping the memtable). Persistence/recovery deferred to Phase 5.
+## Active: PHASE 4 COMPLETE — next is Phase 5 (persistence/recovery)
+
+### Phase 5 plan — Version/MANIFEST + recovery (sequential-ish)
+- M5.0 VersionEdit (S) — encode/decode the MANIFEST VersionEdit tag set (comparator name, log#, next-file#, last-seq, deleted/added files per level). New: src/version/version_edit.zig. Deps: coding. Golden bytes. (Independent — can run alone first.)
+- M5.1 Version / VersionSet / MANIFEST (O) — needs M5.0 + table_reader + log_writer/reader. New: src/version/{version_set,table_cache}.zig. FileMetaData, per-level file lists, apply edits, write/read MANIFEST log (reuse the WAL log format), CURRENT file, file-number allocation. Minimal default-CF records for interop.
+- M5.2 Recovery (O) — needs M5.1 + db.zig. DB.open: read CURRENT→MANIFEST→VersionSet, replay WAL(s) into a fresh memtable, restore last_sequence. Wire into the existing db.zig open path (which currently starts empty). INTEROP GATE: open a small DB written by real RocksDB (default CF) and read it back.
 
 ## Next steps (ordered)
-1. M4.0 iterator framework (solo, Opus) → integrate.
-2. M4.1 in-memory DB (solo, Opus) → integrate. Phase 4 done — first usable embedded KV (no persistence yet).
-3. Phase 5 — Version/MANIFEST + recovery (M5.0 VersionEdit, M5.1 VersionSet/MANIFEST, M5.2 recovery + RocksDB-DB read interop gate).
-4. Phase 6 — flush + leveled compaction + snapshots → LevelDB-equivalent core complete.
+1. Phase 5: dispatch M5.0 (VersionEdit) first; then M5.1 (VersionSet/MANIFEST); then M5.2 (recovery + db.open wiring + RocksDB read-interop gate).
+2. Phase 6 — flush (memtable→L0 SST) + leveled compaction + full snapshots → "LevelDB-equivalent core complete" (add CLI in main.zig + integration test).
+3. Phase 7 — RocksDB extensions (column families, merge operator, prefix seek, universal/FIFO compaction, compaction filter, DeleteRange, transactions, checkpoints).
 
-## Engine capabilities so far (on main, 204 tests)
-Foundation (slice/status/coding/comparator/arena/crc32c/options) · Env capability over std.Io (+MemEnv) · WAL (byte-compat) · Skiplist · MemTable (snapshot+tombstone get) · WriteBatch · full block-based SST (block/bloom/filter/footer/TableBuilder/TableReader, byte-compat, CRC-verified, round-trips) · sharded LRU block cache.
+## Engine capabilities so far (on main, 235 tests, Phases 0–4 COMPLETE)
+Foundation (slice/status/coding/comparator/arena/crc32c/options) · Env capability over std.Io (+MemEnv) · WAL (byte-compat) · Skiplist · MemTable (snapshot+tombstone get) · WriteBatch · full block-based SST (block/bloom/filter/footer/TableBuilder/TableReader, byte-compat, CRC-verified, round-trips) · sharded LRU block cache · generic Iterator/Merging/TwoLevel · **in-memory DB: open/put/get/delete/write(batch)/newIterator/snapshot over MemTable+WAL (no persistence/recovery yet)**.
 
 ## Decision log (ADR pointers)
 - ADR-000: RocksDB format target pinned (format_version 5 SST, legacy WAL/MANIFEST, CRC32C mask). docs/adr/000-target-format.md

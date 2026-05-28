@@ -40,6 +40,12 @@ pub const iterator = @import("iterator/iterator.zig");
 pub const merging_iterator = @import("iterator/merging_iterator.zig");
 pub const two_level_iterator = @import("iterator/two_level_iterator.zig");
 
+// DB layer (Phase 4).
+pub const db = @import("db/db.zig");
+pub const db_iter = @import("db/db_iter.zig");
+pub const write_path = @import("db/write_path.zig");
+pub const snapshot = @import("db/snapshot.zig");
+
 test "version constant" {
     try std.testing.expectEqualStrings("0.0.0", version);
 }
