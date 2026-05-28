@@ -11,10 +11,17 @@
 //!   - Fixed prefix:  first `n` bytes; inDomain ⇔ key.len >= n.
 //!   - Capped prefix: first min(key.len, n) bytes; inDomain is always true.
 //!
+//! Because the prefix length `n` is a runtime value and the vtable `ctx` must
+//! point at stable storage holding it, the built-ins are exposed as small
+//! structs (`FixedPrefixExtractor` / `CappedPrefixExtractor`) with an
+//! `.extractor()` accessor — exactly like `InternalKeyComparator`.  The caller
+//! MUST keep the struct alive for the lifetime of any `PrefixExtractor` it
+//! hands out (e.g. store it next to the `Options` it is passed into).  A bare
+//! `fixedPrefix(n)` free function is intentionally NOT provided: it would
+//! return a fat pointer into a dead temporary.
+//!
 //! IMPORTANT (import-cycle): this module is imported by `options.zig`, so it
 //! MUST NOT import `options.zig`.  It depends only on `std`.
-//!
-//! RED phase: declarations with @panic stubs + full tests.
 
 const std = @import("std");
 
