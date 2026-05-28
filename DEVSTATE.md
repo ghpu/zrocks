@@ -4,11 +4,11 @@ zig_binary: /home/ghpu/zig/zig
 stdlib: /home/ghpu/zig/lib/std
 target_rocksdb: "9.x line; block-based table format_version 5; legacy WAL/MANIFEST log (see docs/adr/000-target-format.md)"
 active_phase: P4
-active_milestone: "M4.0 Iterator interface + merging + two-level"
-last_completed: M3.5 LRU block cache (Phase 3 COMPLETE)
-worktrees: "m4.0-iterators"
+active_milestone: "M4.1 In-memory DB"
+last_completed: M4.0 Iterator framework
+worktrees: "m4.1-db"
 test_command: "/home/ghpu/zig/zig build test"
-test_count: 204
+test_count: 221
 updated: 2026-05-28
 ---
 
@@ -47,8 +47,8 @@ RocksDB reference: https://github.com/facebook/rocksdb/wiki
 - [x] M3.5 LRU block cache             (src/util/cache.zig + table_reader integration; file-handle/table cache deferred to M5.1)
 
 ### Phase 4 — Iterators & in-memory DB
-- [ ] M4.0 Iterator interface + merging/two-level
-- [ ] M4.1 In-memory DB (Put/Get/Delete/Write/iter)
+- [x] M4.0 Iterator interface + merging/two-level  (src/iterator/*.zig)
+- [~] M4.1 In-memory DB (Put/Get/Delete/Write/iter)  <-- ACTIVE
 
 ### Phase 5 — Persistence: Version/MANIFEST + recovery
 - [ ] M5.0 VersionEdit
@@ -86,6 +86,7 @@ Foundation (slice/status/coding/comparator/arena/crc32c/options) · Env capabili
 
 ## Decision log (ADR pointers)
 - ADR-000: RocksDB format target pinned (format_version 5 SST, legacy WAL/MANIFEST, CRC32C mask). docs/adr/000-target-format.md
+- KNOWN GAP (from M4.0): the generic `iterator.Iterator` vtable has NO deinit/close. Memtable iters are arena-backed (no per-iter alloc) so the in-memory DB is fine, but table/SST iterators allocate block buffers — before merging SSTs into reads/compaction (Phase 5/6), add an optional `deinit: ?*const fn(ctx) void` to the Iterator vtable and have Merging/TwoLevel call it on children. TwoLevelIterator already documents that 2nd-level sources must own cleanup.
 - Interface convention (from M0.3): runtime vtable = `struct { ctx: *const anyopaque, vtable: *const VTable }` with thin method wrappers calling `self.vtable.fn(self.ctx, ...)`. Reuse this for all runtime-swappable capabilities (comparator, filter policy, env files, iterators). See src/util/comparator.zig.
 - Parallel-batch workflow validated: independent foundation milestones built in 5 concurrent worktrees, each adding only its own file (verified standalone via `zig test <file>`), root.zig wiring done once at integration. Branches merged without conflict.
 

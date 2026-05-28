@@ -35,6 +35,11 @@ pub const footer = @import("format/footer.zig");
 pub const table_builder = @import("format/table_builder.zig");
 pub const table_reader = @import("format/table_reader.zig");
 
+// Iterators (Phase 4).
+pub const iterator = @import("iterator/iterator.zig");
+pub const merging_iterator = @import("iterator/merging_iterator.zig");
+pub const two_level_iterator = @import("iterator/two_level_iterator.zig");
+
 test "version constant" {
     try std.testing.expectEqualStrings("0.0.0", version);
 }
