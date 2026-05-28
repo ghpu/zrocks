@@ -38,6 +38,13 @@ pub const MemTableInserter = struct {
         try self.mem.add(self.sequence, .deletion, key, "");
         self.sequence += 1;
     }
+
+    /// Handle a Merge record (M7.1): insert as a `.merge` operand entry, then
+    /// bump the sequence.  The operand is combined lazily on read/compaction.
+    pub fn merge(self: *MemTableInserter, key: []const u8, value: []const u8) !void {
+        try self.mem.add(self.sequence, .merge, key, value);
+        self.sequence += 1;
+    }
 };
 
 /// Insert every record of `batch` into `mem`, assigning sequence numbers

@@ -13,9 +13,17 @@
 //! then sequence descending), so the FIRST occurrence of each user key is the
 //! newest version.
 //!
+//! Merge operands (M7.1): a `.merge` entry COMBINES with older entries rather
+//! than superseding them, so the per-version drop rule must not touch it.  When
+//! the newest surviving entry for a user key is a `.merge` and an operator is
+//! configured, `collapseMergeRun` accumulates the operand run and collapses it
+//! (with the underlying base/deletion) into a single value — keeping
+//! above-snapshot operands verbatim and never losing an operand.
+//!
 //! What is implemented vs left as TODO:
 //!   * Size-based output split — implemented (correctness-sufficient).
 //!   * Tombstone drop at the base level — implemented (isBaseLevelForKey).
+//!   * Merge operand collapse — implemented (collapseMergeRun, M7.1).
 //!   * Grandparent-overlap split — TODO (refinement; size split suffices).
 //!   * Boundary-input expansion ("AddBoundaryInputs") — TODO (refinement).
 //!   * Obsolete .sst deletion from disk — TODO (files are dropped from the
@@ -35,6 +43,8 @@ const iterator = @import("../iterator/iterator.zig");
 const table_builder_mod = @import("../format/table_builder.zig");
 const bloom = @import("../format/bloom.zig");
 const filename = @import("../version/filename.zig");
+const coding = @import("../util/coding.zig");
+const merge_operator_mod = @import("../rocks/merge_operator.zig");
 
 const FileMetaData = version_edit.FileMetaData;
 const VersionSet = version_set.VersionSet;
@@ -253,8 +263,27 @@ pub fn doCompaction(
     var has_last_user_key = false;
     var last_sequence_for_key: u64 = internal_key.kMaxSequenceNumber;
 
+    // A reusable emitter closure-equivalent: append (ikey, value) into the
+    // current output, opening a builder if needed and rolling over at the target
+    // file size.  `ikey`/`value` may be transient — they are copied as needed.
+    var emit_ctx = EmitCtx{
+        .gpa = gpa,
+        .e = e,
+        .dbname = dbname,
+        .build_opts = build_opts,
+        .policy = policy,
+        .versions = versions,
+        .target_file_size = options.target_file_size_base,
+        .builder = &builder,
+        .cur_file = &cur_file,
+        .cur_number = &cur_number,
+        .cur_smallest = &cur_smallest,
+        .cur_largest = &cur_largest,
+        .outputs = &outputs,
+    };
+
     mit.seekToFirst();
-    while (mit.valid()) : (mit.next()) {
+    while (mit.valid()) {
         if (mit.status()) |err| return err;
 
         const ikey = mit.key();
@@ -262,71 +291,69 @@ pub fn doCompaction(
 
         // On a parse failure, keep the entry verbatim (defensive — should not
         // happen for well-formed SSTs).
-        var drop = false;
-        var parsed_ok = true;
-        const parsed = internal_key.parseInternalKey(ikey) catch blk: {
-            parsed_ok = false;
-            break :blk internal_key.ParsedInternalKey{
-                .user_key = ikey,
-                .sequence = 0,
-                .type = .value,
-            };
+        const parsed = internal_key.parseInternalKey(ikey) catch {
+            try emit_ctx.emit(ikey, value);
+            mit.next();
+            continue;
         };
 
-        if (parsed_ok) {
-            const user_key = parsed.user_key;
-            const first_for_key = !has_last_user_key or
-                user_cmp.compare(user_key, last_user_key.items) != .eq;
+        const user_key = parsed.user_key;
+        const first_for_key = !has_last_user_key or
+            user_cmp.compare(user_key, last_user_key.items) != .eq;
 
-            if (first_for_key) {
-                // New user key: remember it, and reset the per-key sequence so
-                // this (newest) version is always kept.
-                last_user_key.clearRetainingCapacity();
-                try last_user_key.appendSlice(gpa, user_key);
-                has_last_user_key = true;
-                last_sequence_for_key = internal_key.kMaxSequenceNumber;
-            }
-
-            if (last_sequence_for_key <= smallest_snapshot) {
-                // A strictly-newer version for this key was already emitted and
-                // sits at-or-below the oldest snapshot, so no live read can see
-                // this older entry → drop.
-                drop = true;
-            } else if (parsed.type == .deletion and
-                parsed.sequence <= smallest_snapshot and
-                isBaseLevelForKey(versions, compaction.level, user_key, user_cmp))
-            {
-                // A tombstone no longer needed (nothing deeper would resurface
-                // and no snapshot needs it) → drop.
-                drop = true;
-            }
-
-            // Record this entry's sequence as the "previous" for the next one.
-            last_sequence_for_key = parsed.sequence;
+        if (first_for_key) {
+            // New user key: remember it, and reset the per-key sequence so this
+            // (newest) version is always kept.
+            last_user_key.clearRetainingCapacity();
+            try last_user_key.appendSlice(gpa, user_key);
+            has_last_user_key = true;
+            last_sequence_for_key = internal_key.kMaxSequenceNumber;
         }
 
-        if (drop) continue;
-
-        // --- emit the surviving entry into the current output builder ------
-        if (builder == null) {
-            cur_number = versions.newFileNumber();
-            const path = try filename.tableFileName(gpa, dbname, cur_number);
-            defer gpa.free(path);
-            cur_file = try e.newWritableFile(gpa, path);
-            builder = try table_builder_mod.TableBuilder.init(gpa, build_opts, cur_file.?, policy);
-            cur_smallest = null;
-            cur_largest = null;
+        // --- M7.1: a merge operand at the head of this key's run -------------
+        // Merge operands COMBINE rather than supersede, so the per-version drop
+        // rule below would corrupt them.  When the newest surviving entry for a
+        // user key is a `.merge` and an operator is configured, collapse the
+        // operand run here (it advances `mit` past everything it consumes).
+        if (parsed.type == .merge and
+            options.merge_operator != null and
+            last_sequence_for_key == internal_key.kMaxSequenceNumber) // first-for-key (newest)
+        {
+            try collapseMergeRun(
+                gpa,
+                mit,
+                user_cmp,
+                options.merge_operator.?,
+                smallest_snapshot,
+                user_key,
+                &emit_ctx,
+            );
+            // collapseMergeRun consumed the whole run; the next loop iteration
+            // starts at a fresh user key, so reset the per-key state.
+            has_last_user_key = false;
+            continue;
         }
 
-        try builder.?.add(ikey, value);
-        if (cur_smallest == null) cur_smallest = try gpa.dupe(u8, ikey);
-        if (cur_largest) |l| gpa.free(l);
-        cur_largest = try gpa.dupe(u8, ikey);
-
-        // Roll over to a fresh output once the current one reaches target size.
-        if (builder.?.fileSize() >= options.target_file_size_base) {
-            try finishOutput(gpa, &builder, &cur_file, cur_number, &cur_smallest, &cur_largest, &outputs);
+        var drop = false;
+        if (last_sequence_for_key <= smallest_snapshot) {
+            // A strictly-newer version for this key was already emitted and sits
+            // at-or-below the oldest snapshot, so no live read can see this older
+            // entry → drop.
+            drop = true;
+        } else if (parsed.type == .deletion and
+            parsed.sequence <= smallest_snapshot and
+            isBaseLevelForKey(versions, compaction.level, user_key, user_cmp))
+        {
+            // A tombstone no longer needed (nothing deeper would resurface and no
+            // snapshot needs it) → drop.
+            drop = true;
         }
+
+        // Record this entry's sequence as the "previous" for the next one.
+        last_sequence_for_key = parsed.sequence;
+
+        if (!drop) try emit_ctx.emit(ikey, value);
+        mit.next();
     }
 
     // Close any final open output.
@@ -382,6 +409,254 @@ fn finishOutput(
     cur_smallest.* = null;
     cur_largest.* = null;
 }
+
+/// Bundles the compaction's output-builder state + the knobs `emit` needs, so a
+/// single entry can be appended into the rolling output SST from several call
+/// sites (the main loop and the merge-collapse helper).
+const EmitCtx = struct {
+    gpa: std.mem.Allocator,
+    e: env.Env,
+    dbname: []const u8,
+    build_opts: options_mod.Options,
+    policy: bloom.BloomFilterPolicy,
+    versions: *VersionSet,
+    target_file_size: u64,
+    builder: *?table_builder_mod.TableBuilder,
+    cur_file: *?env.WritableFile,
+    cur_number: *u64,
+    cur_smallest: *?[]u8,
+    cur_largest: *?[]u8,
+    outputs: *std.ArrayListUnmanaged(Output),
+
+    /// Append (ikey, value) into the current output, opening a fresh builder if
+    /// none is open and rolling over to a new output once the file reaches the
+    /// target size.  `ikey`/`value` are copied as needed (their bytes may be
+    /// transient iterator slices).
+    fn emit(self: *EmitCtx, ikey: []const u8, value: []const u8) !void {
+        const gpa = self.gpa;
+        if (self.builder.* == null) {
+            self.cur_number.* = self.versions.newFileNumber();
+            const path = try filename.tableFileName(gpa, self.dbname, self.cur_number.*);
+            defer gpa.free(path);
+            self.cur_file.* = try self.e.newWritableFile(gpa, path);
+            self.builder.* = try table_builder_mod.TableBuilder.init(gpa, self.build_opts, self.cur_file.*.?, self.policy);
+            self.cur_smallest.* = null;
+            self.cur_largest.* = null;
+        }
+
+        try self.builder.*.?.add(ikey, value);
+        if (self.cur_smallest.* == null) self.cur_smallest.* = try gpa.dupe(u8, ikey);
+        if (self.cur_largest.*) |l| gpa.free(l);
+        self.cur_largest.* = try gpa.dupe(u8, ikey);
+
+        if (self.builder.*.?.fileSize() >= self.target_file_size) {
+            try finishOutput(gpa, self.builder, self.cur_file, self.cur_number.*, self.cur_smallest, self.cur_largest, self.outputs);
+        }
+    }
+};
+
+/// Encode `user_key ++ fixed64(packSequenceAndType(seq, t))` (caller frees).
+fn encodeInternalKey(gpa: std.mem.Allocator, user_key: []const u8, seq: u64, t: internal_key.ValueType) ![]u8 {
+    const out = try gpa.alloc(u8, user_key.len + 8);
+    @memcpy(out[0..user_key.len], user_key);
+    coding.encodeFixed64(out[user_key.len..][0..8], internal_key.packSequenceAndType(seq, t));
+    return out;
+}
+
+/// Collapse the run of `.merge` operands for `user_key` beginning at the current
+/// `mit` position (which must be the newest operand of the run).  Advances `mit`
+/// PAST the whole run (every operand plus an underlying `.value`/`.deletion`).
+///
+/// Correctness contract — a merge operand must NEVER be lost:
+///   * Operands with `sequence > smallest_snapshot` are NOT collapsible (a live
+///     snapshot may observe the intermediate state), so they are emitted VERBATIM
+///     as `.merge` entries (kept).
+///   * The remaining operands (`sequence <= smallest_snapshot`) together with the
+///     underlying base/deletion are collapsed:
+///       - `.value` base reached → `fullMerge(operands, base)` → one `.value`.
+///       - `.deletion` reached   → `fullMerge(operands, no base)` → one `.value`
+///         (a Delete STOPS the merge; operands merge with no base).
+///       - run ends with no base in this compaction's inputs → a base (a Put)
+///         may still live in a deeper level we did not read, so we must NOT
+///         resolve to a final value (that could discard a base).  Shrink the run
+///         to ONE operand via `partialMerge` if supported, else keep the operands
+///         VERBATIM so a deeper compaction (which reads the base) finishes it.
+fn collapseMergeRun(
+    gpa: std.mem.Allocator,
+    mit: iterator.Iterator,
+    user_cmp: comparator.Comparator,
+    merge_op: merge_operator_mod.MergeOperator,
+    smallest_snapshot: u64,
+    user_key_in: []const u8,
+    emit_ctx: *EmitCtx,
+) !void {
+    // Stable copy of the user key (iterator slices are transient).
+    const user_key = try gpa.dupe(u8, user_key_in);
+    defer gpa.free(user_key);
+
+    // Operands above the snapshot: kept verbatim (newest-first), each tagged with
+    // its sequence so we re-emit it as a `.merge` at the same sequence.
+    var kept: std.ArrayListUnmanaged(struct { seq: u64, op: []u8 }) = .empty;
+    defer {
+        for (kept.items) |k| gpa.free(k.op);
+        kept.deinit(gpa);
+    }
+    // Operands at-or-below the snapshot: collapsible (newest-first).  We track
+    // the newest such sequence to stamp the collapsed output entry.
+    var collapsible: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (collapsible.items) |op| gpa.free(op);
+        collapsible.deinit(gpa);
+    }
+    var newest_collapsible_seq: u64 = 0;
+    var have_collapsible_seq = false;
+
+    var base: ?[]u8 = null;
+    defer if (base) |b| gpa.free(b);
+    var have_base = false;
+    var base_seq: u64 = 0;
+    var saw_deletion = false;
+    var deletion_seq: u64 = 0;
+
+    // Walk the run.
+    while (mit.valid()) {
+        if (mit.status()) |err| return err;
+        const ik = mit.key();
+        const parsed = internal_key.parseInternalKey(ik) catch break;
+        if (user_cmp.compare(parsed.user_key, user_key) != .eq) break;
+        switch (parsed.type) {
+            .merge => {
+                if (parsed.sequence > smallest_snapshot) {
+                    try kept.append(gpa, .{ .seq = parsed.sequence, .op = try gpa.dupe(u8, mit.value()) });
+                } else {
+                    try collapsible.append(gpa, try gpa.dupe(u8, mit.value()));
+                    if (!have_collapsible_seq) {
+                        newest_collapsible_seq = parsed.sequence;
+                        have_collapsible_seq = true;
+                    }
+                }
+                mit.next();
+            },
+            .value => {
+                // The base is the newest non-merge below the operands.  It is
+                // only a collapse base for operands at-or-below the snapshot.
+                base = try gpa.dupe(u8, mit.value());
+                have_base = true;
+                base_seq = parsed.sequence;
+                mit.next();
+                break;
+            },
+            .deletion, .single_deletion, .range_deletion => {
+                saw_deletion = true;
+                deletion_seq = parsed.sequence;
+                mit.next();
+                break;
+            },
+        }
+    }
+
+    // 1. Re-emit any above-snapshot operands verbatim (newest-first preserves
+    //    IKC order: higher sequence sorts first for the same user key).
+    for (kept.items) |k| {
+        const ik = try encodeInternalKey(gpa, user_key, k.seq, .merge);
+        defer gpa.free(ik);
+        try emit_ctx.emit(ik, k.op);
+    }
+
+    // 2. Collapse the at-or-below-snapshot operands.
+    if (collapsible.items.len == 0) {
+        // Nothing collapsible (all operands were above the snapshot and kept
+        // verbatim above): re-emit the underlying base/deletion verbatim at its
+        // ORIGINAL sequence so a snapshot read still resolves the run correctly.
+        if (have_base) {
+            const ik = try encodeInternalKey(gpa, user_key, base_seq, .value);
+            defer gpa.free(ik);
+            try emit_ctx.emit(ik, base.?);
+        } else if (saw_deletion) {
+            const ik = try encodeInternalKey(gpa, user_key, deletion_seq, .deletion);
+            defer gpa.free(ik);
+            try emit_ctx.emit(ik, "");
+        }
+        return;
+    }
+
+    // Reverse collapsible operands to OLDEST-first for the operator.
+    std.mem.reverse([]u8, collapsible.items);
+    const view = try gpa.alloc([]const u8, collapsible.items.len);
+    defer gpa.free(view);
+    for (collapsible.items, 0..) |op, i| view[i] = op;
+
+    const collapse_seq = if (have_collapsible_seq) newest_collapsible_seq else 0;
+
+    if (have_base) {
+        // fullMerge with the base → a single value.
+        const merged = (try merge_op.fullMerge(user_key, base.?, view, gpa)) orelse {
+            // Operator failure: keep the base + operands verbatim (never lose).
+            try emitOperandsVerbatim(gpa, user_key, collapsible.items, collapse_seq, emit_ctx);
+            const ik = try encodeInternalKey(gpa, user_key, collapse_seq, .value);
+            defer gpa.free(ik);
+            try emit_ctx.emit(ik, base.?);
+            return;
+        };
+        defer gpa.free(merged);
+        const ik = try encodeInternalKey(gpa, user_key, collapse_seq, .value);
+        defer gpa.free(ik);
+        try emit_ctx.emit(ik, merged);
+        return;
+    }
+
+    if (saw_deletion) {
+        // A Delete stops the merge: operands merge with NO base → one value.
+        const merged = (try merge_op.fullMerge(user_key, null, view, gpa)) orelse {
+            try emitOperandsVerbatim(gpa, user_key, collapsible.items, collapse_seq, emit_ctx);
+            return;
+        };
+        defer gpa.free(merged);
+        const ik = try encodeInternalKey(gpa, user_key, collapse_seq, .value);
+        defer gpa.free(ik);
+        try emit_ctx.emit(ik, merged);
+        return;
+    }
+
+    // No base reached within this compaction's inputs.  A base (a Put) MAY still
+    // live in a deeper level that this compaction did not read, so we must NOT
+    // resolve the merge to a final value here — that could discard a base.
+    // Instead shrink the run into ONE operand via partialMerge (the safe, lossy-
+    // free reduction); if the operator does not support partial merge, keep the
+    // operands verbatim so a deeper compaction (which reads the base) finishes
+    // the merge.  Either way NO operand is lost.
+    if (try merge_op.partialMerge(user_key, view, gpa)) |combined| {
+        defer gpa.free(combined);
+        const ik = try encodeInternalKey(gpa, user_key, collapse_seq, .merge);
+        defer gpa.free(ik);
+        try emit_ctx.emit(ik, combined);
+    } else {
+        try emitOperandsVerbatim(gpa, user_key, collapsible.items, collapse_seq, emit_ctx);
+    }
+}
+
+/// Re-emit `operands` (OLDEST-first as stored after the reverse) verbatim as
+/// `.merge` entries.  They are stamped with descending sequences ending at
+/// `newest_seq` so they keep their relative IKC order (newest sorts first).
+fn emitOperandsVerbatim(
+    gpa: std.mem.Allocator,
+    user_key: []const u8,
+    operands_oldest_first: []const []u8,
+    newest_seq: u64,
+    emit_ctx: *EmitCtx,
+) !void {
+    // operands_oldest_first[last] is the newest; emit newest-first.
+    var i: usize = operands_oldest_first.len;
+    var seq = newest_seq;
+    while (i > 0) {
+        i -= 1;
+        const ik = try encodeInternalKey(gpa, user_key, seq, .merge);
+        defer gpa.free(ik);
+        try emit_ctx.emit(ik, operands_oldest_first[i]);
+        if (seq > 0) seq -= 1;
+    }
+}
+
 
 // ===========================================================================
 // Tests
@@ -663,5 +938,188 @@ test "M6.2: randomized 2000-op gate vs reference map (get + scan + reopen)" {
         const db = try DB.open(gpa, e, "fuzz", opts);
         defer db.close();
         try verifyAgainstRef(gpa, db, &ref, key_space);
+    }
+}
+
+// --- THE MERGE GATE (M7.1) -------------------------------------------------
+
+const Uint64AddOperator = merge_operator_mod.Uint64AddOperator;
+
+/// Reference model for u64-counter merge semantics: put=set, merge=add,
+/// delete=remove.  A merge on an absent key starts the accumulation from 0.
+const CounterRef = struct {
+    map: std.StringHashMapUnmanaged(u64) = .empty,
+    gpa: std.mem.Allocator,
+
+    fn init(gpa: std.mem.Allocator) CounterRef {
+        return .{ .gpa = gpa };
+    }
+    fn deinit(self: *CounterRef) void {
+        var it = self.map.iterator();
+        while (it.next()) |entry| self.gpa.free(entry.key_ptr.*);
+        self.map.deinit(self.gpa);
+    }
+    fn put(self: *CounterRef, key: []const u8, value: u64) !void {
+        const gop = try self.map.getOrPut(self.gpa, key);
+        if (!gop.found_existing) gop.key_ptr.* = try self.gpa.dupe(u8, key);
+        gop.value_ptr.* = value;
+    }
+    fn merge(self: *CounterRef, key: []const u8, operand: u64) !void {
+        const gop = try self.map.getOrPut(self.gpa, key);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try self.gpa.dupe(u8, key);
+            gop.value_ptr.* = 0;
+        }
+        gop.value_ptr.* +%= operand;
+    }
+    fn delete(self: *CounterRef, key: []const u8) void {
+        if (self.map.fetchRemove(key)) |kv| self.gpa.free(kv.key);
+    }
+    fn get(self: *CounterRef, key: []const u8) ?u64 {
+        return self.map.get(key);
+    }
+};
+
+fn u64le(buf: *[8]u8, v: u64) []const u8 {
+    std.mem.writeInt(u64, buf, v, .little);
+    return buf[0..];
+}
+
+fn decU64(bytes: []const u8) !u64 {
+    if (bytes.len != 8) return error.TestBadValueLen;
+    return std.mem.readInt(u64, bytes[0..8], .little);
+}
+
+/// Assert DB.get matches the counter reference for every key, and a full scan
+/// equals the sorted live entries (with merged values).
+fn verifyCounterRef(gpa: std.mem.Allocator, db: *DB, ref: *CounterRef, key_space: usize) !void {
+    var i: usize = 0;
+    while (i < key_space) : (i += 1) {
+        var kbuf: [8]u8 = undefined;
+        const k = try std.fmt.bufPrint(&kbuf, "key{d:0>3}", .{i});
+        const want = ref.get(k);
+        const got = try db.get(.{}, k);
+        if (want) |w| {
+            const g = got orelse {
+                std.debug.print("missing key {s}: ref={d} db=null\n", .{ k, w });
+                return error.TestKeyMissing;
+            };
+            defer gpa.free(g);
+            const gv = try decU64(g);
+            if (gv != w) {
+                std.debug.print("mismatch key {s}: ref={d} db={d}\n", .{ k, w, gv });
+                return error.TestValueMismatch;
+            }
+        } else {
+            if (got) |g| {
+                defer gpa.free(g);
+                std.debug.print("unexpected key {s}: db={d}\n", .{ k, try decU64(g) });
+                return error.TestUnexpectedKey;
+            }
+        }
+    }
+
+    // Full scan == sorted live reference entries.
+    var sorted_keys: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer sorted_keys.deinit(gpa);
+    var it_ref = ref.map.iterator();
+    while (it_ref.next()) |entry| try sorted_keys.append(gpa, entry.key_ptr.*);
+    std.mem.sort([]const u8, sorted_keys.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lt);
+
+    var it = try db.newIterator(gpa, .{});
+    defer it.deinit();
+    var idx: usize = 0;
+    it.seekToFirst();
+    while (it.valid()) : (it.next()) {
+        if (idx >= sorted_keys.items.len) {
+            std.debug.print("scan has extra key {s}\n", .{it.key()});
+            return error.TestScanTooLong;
+        }
+        const want_k = sorted_keys.items[idx];
+        const want_v = ref.get(want_k).?;
+        if (!std.mem.eql(u8, want_k, it.key())) {
+            std.debug.print("scan key mismatch at {d}: ref={s} db={s}\n", .{ idx, want_k, it.key() });
+            return error.TestScanKeyMismatch;
+        }
+        const got_v = try decU64(it.value());
+        if (got_v != want_v) {
+            std.debug.print("scan value mismatch at key {s}: ref={d} db={d}\n", .{ want_k, want_v, got_v });
+            return error.TestScanValueMismatch;
+        }
+        idx += 1;
+    }
+    if (idx != sorted_keys.items.len) {
+        std.debug.print("scan too short: got {d} want {d}\n", .{ idx, sorted_keys.items.len });
+        return error.TestScanTooShort;
+    }
+    try testing.expect(it.status() == null);
+}
+
+test "M7.1: randomized merge gate vs counter reference (flush + compaction + reopen)" {
+    const gpa = testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    var add = Uint64AddOperator{};
+    const key_space: usize = 40; // small key space -> heavy operand stacking
+    const opts = options_mod.Options{
+        .merge_operator = add.operator(),
+        .write_buffer_size = 256, // many flushes
+        .level0_file_num_compaction_trigger = 2, // many compactions
+        .max_bytes_for_level_base = 4096, // small levels -> deep compaction
+        .target_file_size_base = 2048, // small output files
+    };
+
+    var ref = CounterRef.init(gpa);
+    defer ref.deinit();
+
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE_5EED);
+    const rand = prng.random();
+
+    {
+        const db = try DB.open(gpa, e, "mergefuzz", opts);
+        defer db.close();
+
+        var op: usize = 0;
+        while (op < 3000) : (op += 1) {
+            const key_idx = rand.uintLessThan(usize, key_space);
+            var kbuf: [8]u8 = undefined;
+            const k = try std.fmt.bufPrint(&kbuf, "key{d:0>3}", .{key_idx});
+
+            const roll = rand.uintLessThan(u32, 100);
+            var vbuf: [8]u8 = undefined;
+            if (roll < 60) {
+                // 60% merge (add a small operand).
+                const operand = rand.uintLessThan(u64, 100);
+                try db.merge(.{}, k, u64le(&vbuf, operand));
+                try ref.merge(k, operand);
+            } else if (roll < 85) {
+                // 25% put (set a base).
+                const value = rand.uintLessThan(u64, 1000);
+                try db.put(.{}, k, u64le(&vbuf, value));
+                try ref.put(k, value);
+            } else {
+                // 15% delete.
+                try db.delete(.{}, k);
+                ref.delete(k);
+            }
+
+            if (op % 300 == 299) {
+                try verifyCounterRef(gpa, db, &ref, key_space);
+            }
+        }
+        try verifyCounterRef(gpa, db, &ref, key_space);
+    }
+
+    // Reopen: merges must survive compaction + recovery.
+    {
+        const db = try DB.open(gpa, e, "mergefuzz", opts);
+        defer db.close();
+        try verifyCounterRef(gpa, db, &ref, key_space);
     }
 }

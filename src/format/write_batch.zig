@@ -5,8 +5,9 @@
 ///   header := sequence (fixed64 LE, 8 bytes) ++ count (fixed32 LE, 4 bytes)
 ///   record (Put)    := 0x01  varint32(len(key)) key  varint32(len(value)) value
 ///   record (Delete) := 0x00  varint32(len(key)) key
+///   record (Merge)  := 0x02  varint32(len(key)) key  varint32(len(value)) value
 ///
-/// The type bytes 0x01 / 0x00 match ValueType.value / ValueType.deletion.
+/// The type bytes 0x01 / 0x00 / 0x02 match ValueType.value / .deletion / .merge.
 const std = @import("std");
 const coding = @import("../util/coding.zig");
 const internal_key = @import("internal_key.zig");
@@ -49,6 +50,15 @@ pub const WriteBatch = struct {
     pub fn delete(self: *WriteBatch, gpa: std.mem.Allocator, key: []const u8) !void {
         try self.rep.append(gpa, @intFromEnum(ValueType.deletion));
         try coding.putLengthPrefixedSlice(&self.rep, gpa, key);
+        self.setCount(self.count() + 1);
+    }
+
+    /// Append a Merge record (a read-modify-write operand, M7.1) and increment
+    /// the count.  Wire format mirrors Put but with the merge type byte 0x02.
+    pub fn merge(self: *WriteBatch, gpa: std.mem.Allocator, key: []const u8, value: []const u8) !void {
+        try self.rep.append(gpa, @intFromEnum(ValueType.merge));
+        try coding.putLengthPrefixedSlice(&self.rep, gpa, key);
+        try coding.putLengthPrefixedSlice(&self.rep, gpa, value);
         self.setCount(self.count() + 1);
     }
 
@@ -104,6 +114,7 @@ pub const WriteBatch = struct {
     /// The handler must implement:
     ///   fn put(self: @TypeOf(handler), key: []const u8, value: []const u8) !void
     ///   fn delete(self: @TypeOf(handler), key: []const u8) !void
+    ///   fn merge(self: @TypeOf(handler), key: []const u8, value: []const u8) !void
     ///
     /// Returns error.Corruption if:
     ///   - the rep is shorter than the header,
@@ -132,6 +143,12 @@ pub const WriteBatch = struct {
                 // Delete record: key only
                 const key = coding.getLengthPrefixedSlice(&input) catch return error.Corruption;
                 try handler.delete(key);
+                parsed_count += 1;
+            } else if (type_byte == @intFromEnum(ValueType.merge)) {
+                // Merge record: key + value (operand)
+                const key = coding.getLengthPrefixedSlice(&input) catch return error.Corruption;
+                const value = coding.getLengthPrefixedSlice(&input) catch return error.Corruption;
+                try handler.merge(key, value);
                 parsed_count += 1;
             } else {
                 return error.Corruption;
@@ -162,6 +179,58 @@ test "golden bytes: put(foo, bar) produces exact wire encoding" {
         0x03, 'b', 'a', 'r', // varint32(3) + "bar"
     };
     try std.testing.expectEqualSlices(u8, &expected, wb.contents());
+}
+
+test "golden bytes: merge(c, op) produces exact wire encoding (type 0x02)" {
+    const gpa = std.testing.allocator;
+    var wb = try WriteBatch.init(gpa);
+    defer wb.deinit(gpa);
+
+    try wb.merge(gpa, "c", "op");
+
+    // seq=0 (8B), count=1 (4B), 0x02, varint32(1)+"c", varint32(2)+"op".
+    const expected = [_]u8{
+        0, 0, 0, 0, 0, 0, 0, 0, // seq=0 fixed64 LE
+        1, 0, 0, 0, // count=1 fixed32 LE
+        0x02, // ValueType.merge
+        0x01, 'c',
+        0x02, 'o', 'p',
+    };
+    try std.testing.expectEqualSlices(u8, &expected, wb.contents());
+}
+
+test "iterate: merge handler called with key + operand" {
+    const gpa = std.testing.allocator;
+    var wb = try WriteBatch.init(gpa);
+    defer wb.deinit(gpa);
+
+    try wb.put(gpa, "p", "pv");
+    try wb.merge(gpa, "c", "op1");
+    try wb.merge(gpa, "c", "op2");
+
+    const Handler = struct {
+        n_put: usize = 0,
+        n_merge: usize = 0,
+        last_merge_key: []const u8 = "",
+        last_merge_val: []const u8 = "",
+
+        pub fn put(self: *@This(), _: []const u8, _: []const u8) !void {
+            self.n_put += 1;
+        }
+        pub fn delete(_: *@This(), _: []const u8) !void {}
+        pub fn merge(self: *@This(), key: []const u8, value: []const u8) !void {
+            self.n_merge += 1;
+            self.last_merge_key = key;
+            self.last_merge_val = value;
+        }
+    };
+
+    var h = Handler{};
+    try wb.iterate(&h);
+    try std.testing.expectEqual(@as(usize, 1), h.n_put);
+    try std.testing.expectEqual(@as(usize, 2), h.n_merge);
+    try std.testing.expectEqualStrings("c", h.last_merge_key);
+    try std.testing.expectEqualStrings("op2", h.last_merge_val);
 }
 
 test "count increments: put then delete" {
@@ -209,6 +278,7 @@ test "iterate: put + delete handler called in order" {
     const Record = union(enum) {
         put: struct { key: []const u8, value: []const u8 },
         del: struct { key: []const u8 },
+        mrg: struct { key: []const u8, value: []const u8 },
     };
 
     const Handler = struct {
@@ -224,6 +294,11 @@ test "iterate: put + delete handler called in order" {
             self.records[self.n] = .{ .del = .{ .key = key } };
             self.n += 1;
         }
+
+        pub fn merge(self: *@This(), key: []const u8, value: []const u8) !void {
+            self.records[self.n] = .{ .mrg = .{ .key = key, .value = value } };
+            self.n += 1;
+        }
     };
 
     var handler = Handler{};
@@ -236,14 +311,14 @@ test "iterate: put + delete handler called in order" {
             try std.testing.expectEqualSlices(u8, "foo", p.key);
             try std.testing.expectEqualSlices(u8, "bar", p.value);
         },
-        .del => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
     }
 
     switch (handler.records[1]) {
         .del => |d| {
             try std.testing.expectEqualSlices(u8, "baz", d.key);
         },
-        .put => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
     }
 }
 
@@ -275,6 +350,12 @@ test "round-trip via setContents" {
         }
 
         pub fn delete(_: *@This(), _: []const u8) !void {}
+
+        pub fn merge(self: *@This(), key: []const u8, value: []const u8) !void {
+            self.keys[self.n] = key;
+            self.values[self.n] = value;
+            self.n += 1;
+        }
     };
 
     var h1 = Handler{};
@@ -307,6 +388,7 @@ test "corruption: truncated value in put record" {
     const NoopHandler = struct {
         pub fn put(_: *@This(), _: []const u8, _: []const u8) !void {}
         pub fn delete(_: *@This(), _: []const u8) !void {}
+        pub fn merge(_: *@This(), _: []const u8, _: []const u8) !void {}
     };
     var h = NoopHandler{};
     try std.testing.expectError(error.Corruption, wb2.iterate(&h));
@@ -325,6 +407,7 @@ test "corruption: header count exceeds actual records" {
     const NoopHandler = struct {
         pub fn put(_: *@This(), _: []const u8, _: []const u8) !void {}
         pub fn delete(_: *@This(), _: []const u8) !void {}
+        pub fn merge(_: *@This(), _: []const u8, _: []const u8) !void {}
     };
     var h = NoopHandler{};
     try std.testing.expectError(error.Corruption, wb.iterate(&h));

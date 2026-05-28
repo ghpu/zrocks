@@ -230,6 +230,19 @@ pub const DB = struct {
         try self.write(wopts, &batch);
     }
 
+    /// Record a merge operand for `key` (a one-op WriteBatch, M7.1).  The operand
+    /// is combined lazily — on read/compaction — with the existing value and any
+    /// other pending operands via the configured `merge_operator`.  Returns
+    /// `error.MergeOperatorNotConfigured` if no operator is configured (a usage
+    /// error: an unmerged operand could never be interpreted on read).
+    pub fn merge(self: *DB, wopts: WriteOptions, key: []const u8, value: []const u8) !void {
+        if (self.options.merge_operator == null) return error.MergeOperatorNotConfigured;
+        var batch = try WriteBatch.init(self.gpa);
+        defer batch.deinit(self.gpa);
+        try batch.merge(self.gpa, key, value);
+        try self.write(wopts, &batch);
+    }
+
     /// Atomically apply `batch`: stamp its sequence, append it to the WAL
     /// (unless disabled), insert its records into the MemTable, and advance the
     /// last sequence by the batch's record count.
@@ -358,6 +371,15 @@ pub const DB = struct {
     /// or null if the key is absent or deleted at that snapshot.
     pub fn get(self: *DB, ropts: ReadOptions, key: []const u8) !?[]u8 {
         const seq = ropts.snapshot orelse self.last_sequence;
+
+        // With a merge operator configured, route through the merge-aware path:
+        // the newest entries for the key may be a run of merge operands on top of
+        // an optional Put/Delete that the fast point-lookup path cannot combine.
+        // TODO(perf): GetContext operand accumulation instead of a full re-scan.
+        if (self.options.merge_operator != null) {
+            return self.mergeGet(key, seq);
+        }
+
         var lookup = try memtable_mod.LookupKey.init(self.gpa, key, seq);
         defer lookup.deinit(self.gpa);
 
@@ -389,6 +411,93 @@ pub const DB = struct {
         return null;
     }
 
+    /// Merge-aware point lookup (M7.1).  Builds an internal MergingIterator over
+    /// memtable+imm+SSTs scoped by `seq`, seeks to `key`, and walks the entries
+    /// for that user key in IKC order (newest first): it gathers `.merge`
+    /// operands until it hits a `.value` base (stop, use as base), a `.deletion`
+    /// (stop, no base), or the user key changes / the source ends.  The gathered
+    /// operands are reversed to OLDEST-first and combined via the merge operator.
+    ///
+    /// Returns a freshly gpa-allocated value the CALLER OWNS, or null when the
+    /// key is absent / a tombstone with no overlying operands / fullMerge fails.
+    fn mergeGet(self: *DB, key: []const u8, seq: u64) !?[]u8 {
+        const merge_op = self.options.merge_operator.?;
+
+        const merger = try self.buildInternalIterator(self.gpa, seq);
+        defer destroyMerger(self.gpa, merger);
+        const it = merger.iterator();
+
+        // Seek to the newest version of `key` at/below the snapshot.  Use a
+        // max-type seek trailer so the seek lands at/before EVERY entry at this
+        // sequence — including `.merge` (0x2), whose type byte exceeds the plain
+        // `kValueTypeForSeek` (.value = 0x1) and would otherwise sort before the
+        // seek key and be skipped.  The trailer is only ever compared (never
+        // parsed), so a raw 0xFF type byte is safe.
+        var lookup: std.ArrayListUnmanaged(u8) = .empty;
+        defer lookup.deinit(self.gpa);
+        try lookup.appendSlice(self.gpa, key);
+        var tbuf: [8]u8 = undefined;
+        coding.encodeFixed64(&tbuf, (seq << 8) | 0xFF);
+        try lookup.appendSlice(self.gpa, &tbuf);
+        it.seek(lookup.items);
+
+        // Gather operands (newest-first) + an optional base for this user key.
+        var operands: std.ArrayListUnmanaged([]u8) = .empty;
+        defer {
+            for (operands.items) |op| self.gpa.free(op);
+            operands.deinit(self.gpa);
+        }
+        var base: ?[]u8 = null;
+        defer if (base) |b| self.gpa.free(b);
+        var have_base = false; // a Put base reached (vs Delete / end)
+
+        while (it.valid()) : (it.next()) {
+            if (it.status()) |err| return err;
+            const ikey = try internal_key.parseInternalKey(it.key());
+            if (self.options.comparator.compare(ikey.user_key, key) != .eq) break;
+            if (ikey.sequence > seq) continue; // not visible at this snapshot
+            switch (ikey.type) {
+                .merge => try operands.append(self.gpa, try self.gpa.dupe(u8, it.value())),
+                .value => {
+                    base = try self.gpa.dupe(u8, it.value());
+                    have_base = true;
+                    break;
+                },
+                .deletion, .single_deletion, .range_deletion => break, // Delete stops the merge.
+            }
+        }
+
+        if (operands.items.len == 0) {
+            // No operands: ordinary point-lookup result.  Hand ownership of the
+            // base to the caller (null it out so the `defer` does not free it).
+            if (have_base) {
+                const out = base.?;
+                base = null;
+                return out;
+            }
+            return null; // tombstone or absent
+        }
+
+        // Reverse operands to OLDEST-first for the operator.
+        std.mem.reverse([]u8, operands.items);
+        // Build a []const []const u8 view for the operator.
+        const view = try self.gpa.alloc([]const u8, operands.items.len);
+        defer self.gpa.free(view);
+        for (operands.items, 0..) |op, i| view[i] = op;
+
+        const existing: ?[]const u8 = if (have_base) base.? else null;
+        const merged = (try merge_op.fullMerge(key, existing, view, self.gpa)) orelse {
+            // Operator failed: fall back to the existing value (or not-found).
+            if (have_base) {
+                const out = base.?;
+                base = null; // hand ownership to the caller
+                return out;
+            }
+            return null;
+        };
+        return merged;
+    }
+
     /// Forward, snapshot-aware, tombstone-hiding iterator over the live MemTable
     /// merged with every SST file in the current Version.  Caller must call
     /// `.deinit()` on the returned iterator.
@@ -402,6 +511,37 @@ pub const DB = struct {
     /// iterators) before freeing the merging iterator itself.
     pub fn newIterator(self: *DB, gpa: std.mem.Allocator, ropts: ReadOptions) !DBIterator {
         const seq = ropts.snapshot orelse self.last_sequence;
+
+        const merger = try self.buildInternalIterator(gpa, seq);
+        errdefer destroyMerger(gpa, merger);
+
+        var dbit = DBIterator.init(gpa, merger.iterator(), self.options.comparator, seq);
+        dbit.owned_inner = merger;
+        dbit.owned_inner_destroy = destroyMerger;
+        // M7.2: thread the prefix extractor + prefix-bounded scan flag so a
+        // `seek` can bound iteration to the seek target's prefix.
+        dbit.prefix_extractor = self.options.prefix_extractor;
+        dbit.prefix_same_as_start = ropts.prefix_same_as_start;
+        // M7.1: thread the merge operator so a merge-operand run surfaces its
+        // combined value.
+        dbit.merge_operator = self.options.merge_operator;
+        return dbit;
+    }
+
+    /// Build the internal MergingIterator (keys = internal keys, values = user
+    /// values) over the live MemTable, the immutable MemTable being flushed (if
+    /// any), and one iterator per SST file in the current Version, all ordered by
+    /// the InternalKeyComparator (equal user keys visited newest-sequence first).
+    ///
+    /// Returns a heap-allocated `*MergingIterator` whose address is stable for
+    /// the caller; free it with `destroyMerger` (which tears down every child).
+    /// Shared by `newIterator` (wraps it in a DBIterator) and `mergeGet`.
+    fn buildInternalIterator(
+        self: *DB,
+        gpa: std.mem.Allocator,
+        seq: u64,
+    ) !*merging_iterator.MergingIterator {
+        _ = seq; // snapshot scoping is applied by the DBIterator / mergeGet walk.
 
         // Collect child iterators; on any error, deinit whatever we built.
         var children: std.ArrayListUnmanaged(iterator.Iterator) = .empty;
@@ -430,7 +570,7 @@ pub const DB = struct {
         try self.versions.currentVersion().addIterators(gpa, &self.table_cache, &children);
 
         // 3. Merge over the internal-key order.  The merging iterator is heap
-        //    allocated so its address is stable behind the DBIterator.
+        //    allocated so its address is stable behind the DBIterator / mergeGet.
         const merger = try gpa.create(merging_iterator.MergingIterator);
         errdefer gpa.destroy(merger);
         merger.* = try merging_iterator.MergingIterator.init(
@@ -441,15 +581,7 @@ pub const DB = struct {
         // MergingIterator.init copied the children slice into its own buffer, so
         // release our temporary list (the copies are now owned by the merger).
         children.deinit(gpa);
-
-        var dbit = DBIterator.init(gpa, merger.iterator(), self.options.comparator, seq);
-        dbit.owned_inner = merger;
-        dbit.owned_inner_destroy = destroyMerger;
-        // M7.2: thread the prefix extractor + prefix-bounded scan flag so a
-        // `seek` can bound iteration to the seek target's prefix.
-        dbit.prefix_extractor = self.options.prefix_extractor;
-        dbit.prefix_same_as_start = ropts.prefix_same_as_start;
-        return dbit;
+        return merger;
     }
 
     /// DBIterator ownership hook: tear down the merging iterator (which deinits
@@ -1187,6 +1319,290 @@ test "M7.2: prefix_same_as_start scan stops at the prefix boundary" {
     it2.seek("aa");
     while (it2.valid()) : (it2.next()) seen += 1;
     try testing.expectEqual(@as(usize, 3), seen);
+}
+
+// ===========================================================================
+// M7.1 — MergeOperator: lazy read-modify-write operands.
+// ===========================================================================
+
+const merge_operator_mod = @import("../rocks/merge_operator.zig");
+const Uint64AddOperator = merge_operator_mod.Uint64AddOperator;
+
+/// Build an 8-byte LE u64 in a caller buffer (merge-operand helper for tests).
+fn u64le(buf: *[8]u8, v: u64) []const u8 {
+    std.mem.writeInt(u64, buf, v, .little);
+    return buf[0..];
+}
+
+/// Decode an 8-byte LE u64 (test helper).
+fn decU64(bytes: []const u8) !u64 {
+    try testing.expectEqual(@as(usize, 8), bytes.len);
+    return std.mem.readInt(u64, bytes[0..8], .little);
+}
+
+test "M7.1 merge: merge on empty key sums from 0" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+
+    var add = Uint64AddOperator{};
+    const db = try DB.open(gpa, me.env(), "mergebasic", .{ .merge_operator = add.operator() });
+    defer db.close();
+
+    var b: [8]u8 = undefined;
+    try db.merge(.{}, "c", u64le(&b, 5));
+    {
+        const got = try db.get(.{}, "c") orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqual(@as(u64, 5), try decU64(got));
+    }
+
+    try db.merge(.{}, "c", u64le(&b, 3));
+    {
+        const got = try db.get(.{}, "c") orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqual(@as(u64, 8), try decU64(got));
+    }
+}
+
+test "M7.1 merge: put base then merge operand combines" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+
+    var add = Uint64AddOperator{};
+    const db = try DB.open(gpa, me.env(), "mergebase", .{ .merge_operator = add.operator() });
+    defer db.close();
+
+    var b: [8]u8 = undefined;
+    try db.put(.{}, "c", u64le(&b, 100));
+    try db.merge(.{}, "c", u64le(&b, 1));
+
+    const got = try db.get(.{}, "c") orelse return error.TestExpectedFound;
+    defer gpa.free(got);
+    try testing.expectEqual(@as(u64, 101), try decU64(got));
+}
+
+test "M7.1 merge: delete then merge starts a fresh accumulation" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+
+    var add = Uint64AddOperator{};
+    const db = try DB.open(gpa, me.env(), "mergedel", .{ .merge_operator = add.operator() });
+    defer db.close();
+
+    var b: [8]u8 = undefined;
+    try db.put(.{}, "c", u64le(&b, 100));
+    try db.delete(.{}, "c");
+    try db.merge(.{}, "c", u64le(&b, 7));
+
+    const got = try db.get(.{}, "c") orelse return error.TestExpectedFound;
+    defer gpa.free(got);
+    // Delete stops the merge — operand merges with no base → 7.
+    try testing.expectEqual(@as(u64, 7), try decU64(got));
+}
+
+test "M7.1 merge: many operands accumulate" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+
+    var add = Uint64AddOperator{};
+    const db = try DB.open(gpa, me.env(), "mergemany", .{ .merge_operator = add.operator() });
+    defer db.close();
+
+    var b: [8]u8 = undefined;
+    var expected: u64 = 0;
+    var i: u64 = 1;
+    while (i <= 50) : (i += 1) {
+        try db.merge(.{}, "c", u64le(&b, i));
+        expected += i;
+    }
+    const got = try db.get(.{}, "c") orelse return error.TestExpectedFound;
+    defer gpa.free(got);
+    try testing.expectEqual(expected, try decU64(got));
+}
+
+test "M7.1 merge: null operator -> merge entry treated as not-found on get" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+
+    // No merge_operator configured.
+    const db = try DB.open(gpa, me.env(), "mergenull", .{});
+    defer db.close();
+
+    // DB.merge with no operator is a usage error.
+    var b: [8]u8 = undefined;
+    try testing.expectError(error.MergeOperatorNotConfigured, db.merge(.{}, "c", u64le(&b, 1)));
+}
+
+test "M7.1 merge: get reads merge across a flush boundary" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+
+    var add = Uint64AddOperator{};
+    // Tiny write buffer so operands spread across SSTs + the live memtable.
+    const db = try DB.open(gpa, me.env(), "mergeflush", .{
+        .merge_operator = add.operator(),
+        .write_buffer_size = 1,
+    });
+    defer db.close();
+
+    var b: [8]u8 = undefined;
+    try db.put(.{}, "c", u64le(&b, 10)); // base -> flush
+    try db.merge(.{}, "c", u64le(&b, 1)); // operand -> flush
+    try db.merge(.{}, "c", u64le(&b, 2)); // operand -> flush
+    try db.merge(.{}, "c", u64le(&b, 3)); // operand (live memtable)
+
+    const got = try db.get(.{}, "c") orelse return error.TestExpectedFound;
+    defer gpa.free(got);
+    try testing.expectEqual(@as(u64, 16), try decU64(got));
+}
+
+test "M7.1 merge: iterator scan surfaces merged values" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+
+    var add = Uint64AddOperator{};
+    const db = try DB.open(gpa, me.env(), "mergeiter", .{ .merge_operator = add.operator() });
+    defer db.close();
+
+    var b: [8]u8 = undefined;
+    // a: base 10 + 1 + 2 = 13
+    try db.put(.{}, "a", u64le(&b, 10));
+    try db.merge(.{}, "a", u64le(&b, 1));
+    try db.merge(.{}, "a", u64le(&b, 2));
+    // b: pure merges 5 + 5 = 10
+    try db.merge(.{}, "b", u64le(&b, 5));
+    try db.merge(.{}, "b", u64le(&b, 5));
+    // d: plain put = 42
+    try db.put(.{}, "d", u64le(&b, 42));
+
+    var it = try db.newIterator(gpa, .{});
+    defer it.deinit();
+
+    const exp_k = [_][]const u8{ "a", "b", "d" };
+    const exp_v = [_]u64{ 13, 10, 42 };
+    var i: usize = 0;
+    it.seekToFirst();
+    while (it.valid()) : (it.next()) {
+        try testing.expect(i < exp_k.len);
+        try testing.expectEqualStrings(exp_k[i], it.key());
+        try testing.expectEqual(exp_v[i], try decU64(it.value()));
+        i += 1;
+    }
+    try testing.expectEqual(exp_k.len, i);
+    try testing.expect(it.status() == null);
+}
+
+test "M7.1 merge: snapshot sees the merge state as of its sequence" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+
+    var add = Uint64AddOperator{};
+    const db = try DB.open(gpa, me.env(), "mergesnap", .{ .merge_operator = add.operator() });
+    defer db.close();
+
+    var b: [8]u8 = undefined;
+    try db.put(.{}, "c", u64le(&b, 100)); // base = 100
+    try db.merge(.{}, "c", u64le(&b, 5)); // -> 105
+    const snap = try db.getSnapshot();
+    defer db.releaseSnapshot(snap);
+    try db.merge(.{}, "c", u64le(&b, 7)); // -> 112 (after the snapshot)
+
+    // At the snapshot: 100 + 5 = 105 (the +7 is not visible).
+    {
+        const got = try db.get(.{ .snapshot = snap.sequence }, "c") orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqual(@as(u64, 105), try decU64(got));
+    }
+    // Latest: 100 + 5 + 7 = 112.
+    {
+        const got = try db.get(.{}, "c") orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqual(@as(u64, 112), try decU64(got));
+    }
+}
+
+test "M7.1 merge: snapshot-pinned merge survives compaction" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+
+    var add = Uint64AddOperator{};
+    // Tiny buffer + low trigger so flushes + a compaction fire while a snapshot
+    // pins the intermediate merge state (exercises the keep-above-snapshot path).
+    const db = try DB.open(gpa, me.env(), "mergesnapc", .{
+        .merge_operator = add.operator(),
+        .write_buffer_size = 1,
+        .level0_file_num_compaction_trigger = 2,
+    });
+    defer db.close();
+
+    var b: [8]u8 = undefined;
+    try db.put(.{}, "c", u64le(&b, 100));
+    try db.merge(.{}, "c", u64le(&b, 5));
+    const snap = try db.getSnapshot(); // pins 105
+    defer db.releaseSnapshot(snap);
+
+    // More merges + unrelated keys to force flushes + compaction.
+    try db.merge(.{}, "c", u64le(&b, 7));
+    try db.merge(.{}, "c", u64le(&b, 9));
+    try db.put(.{}, "a", u64le(&b, 1));
+    try db.put(.{}, "z", u64le(&b, 2));
+    try db.merge(.{}, "c", u64le(&b, 11));
+
+    {
+        const got = try db.get(.{ .snapshot = snap.sequence }, "c") orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqual(@as(u64, 105), try decU64(got));
+    }
+    {
+        const got = try db.get(.{}, "c") orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqual(@as(u64, 132), try decU64(got)); // 100+5+7+9+11
+    }
+}
+
+test "M7.1 merge: iterator scan surfaces merged values across a flush" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+
+    var add = Uint64AddOperator{};
+    const db = try DB.open(gpa, me.env(), "mergeiterflush", .{
+        .merge_operator = add.operator(),
+        .write_buffer_size = 1,
+    });
+    defer db.close();
+
+    var b: [8]u8 = undefined;
+    try db.put(.{}, "a", u64le(&b, 10)); // flush
+    try db.merge(.{}, "a", u64le(&b, 1)); // flush
+    try db.merge(.{}, "a", u64le(&b, 2)); // flush
+    try db.merge(.{}, "b", u64le(&b, 5)); // flush
+    try db.merge(.{}, "b", u64le(&b, 5)); // live
+
+    var it = try db.newIterator(gpa, .{});
+    defer it.deinit();
+
+    const exp_k = [_][]const u8{ "a", "b" };
+    const exp_v = [_]u64{ 13, 10 };
+    var i: usize = 0;
+    it.seekToFirst();
+    while (it.valid()) : (it.next()) {
+        try testing.expect(i < exp_k.len);
+        try testing.expectEqualStrings(exp_k[i], it.key());
+        try testing.expectEqual(exp_v[i], try decU64(it.value()));
+        i += 1;
+    }
+    try testing.expectEqual(exp_k.len, i);
+    try testing.expect(it.status() == null);
 }
 
 // ===========================================================================
