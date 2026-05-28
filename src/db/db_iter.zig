@@ -129,11 +129,11 @@ pub const DBIterator = struct {
     // Core LevelDB DBIter forward loop.
     // -----------------------------------------------------------------------
     //
-    // Scan inner entries.  `skipping` true means: hide every entry whose user
-    // key is <= `saved_key` (the key we just returned / the key of a tombstone
-    // we just saw).  Stop at the first surfaced value.
-    fn findNextUserEntry(self: *DBIterator, skipping_init: bool) !void {
-        var skipping = skipping_init;
+    // Scan inner entries.  `skipping` true means: hide every value entry whose
+    // user key is <= `saved_key` (the key we just returned, or the key of a
+    // tombstone we just saw).  Stop at the first surfaced value.
+    fn findNextUserEntry(self: *DBIterator, skipping_start: bool) !void {
+        var skipping = skipping_start;
         while (self.inner.valid()) {
             const ikey = try internal_key.parseInternalKey(self.inner.key());
             if (ikey.sequence <= self.snapshot) {
