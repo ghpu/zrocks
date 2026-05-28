@@ -327,20 +327,24 @@ fn readFully(file: env.RandomAccessFile, offset: u64, buf: []u8) !void {
 /// (caller frees with `gpa`).
 fn readBlock(gpa: std.mem.Allocator, file: env.RandomAccessFile, handle: BlockHandle) ![]u8 {
     const size: usize = @intCast(handle.size);
-    const total = size + kBlockTrailerSize;
 
-    const raw = try gpa.alloc(u8, total);
+    // Read the contents plus the 5-byte trailer in one positional read.
+    const raw = try gpa.alloc(u8, size + kBlockTrailerSize);
     defer gpa.free(raw);
     try readFully(file, handle.offset, raw);
 
-    const compression_type = raw[size];
+    const contents = raw[0..size];
+    const trailer = raw[size..][0..kBlockTrailerSize];
+
+    // trailer[0] = compression type; trailer[1..5] = fixed32_LE(masked crc32c).
+    const compression_type = trailer[0];
     if (compression_type != kNoCompression) return error.NotSupported;
 
-    const stored_masked = coding.decodeFixed32(raw[size + 1 .. size + 5][0..4]);
-    const expected = crc32c.extend(crc32c.value(raw[0..size]), &[_]u8{compression_type});
+    const stored_masked = coding.decodeFixed32(trailer[1..5]);
+    const expected = crc32c.extend(crc32c.value(contents), &[_]u8{compression_type});
     if (crc32c.unmask(stored_masked) != expected) return error.Corruption;
 
-    return gpa.dupe(u8, raw[0..size]);
+    return gpa.dupe(u8, contents);
 }
 
 // ===========================================================================
