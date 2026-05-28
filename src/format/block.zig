@@ -17,6 +17,7 @@
 const std = @import("std");
 const coding = @import("../util/coding.zig");
 const comparator = @import("../util/comparator.zig");
+const internal_key = @import("internal_key.zig");
 
 pub const Error = error{Corruption};
 
@@ -436,7 +437,7 @@ fn collect(
 const KV = struct { k: []const u8, v: []const u8 };
 
 fn buildBlock(gpa: std.mem.Allocator, restart_interval: usize, pairs: []const KV) ![]const u8 {
-    var b = BlockBuilder.init(gpa, restart_interval);
+    var b = BlockBuilder.init(gpa, comparator.bytewise, restart_interval);
     defer b.deinit();
     for (pairs) |p| try b.add(p.k, p.v);
     const block_bytes = b.finish();
@@ -628,7 +629,7 @@ test "single-entry block" {
 
 test "empty block: finish with no adds, iterate is invalid" {
     const gpa = testing.allocator;
-    var b = BlockBuilder.init(gpa, 2);
+    var b = BlockBuilder.init(gpa, comparator.bytewise, 2);
     defer b.deinit();
     try testing.expect(b.isEmpty());
 
@@ -649,7 +650,7 @@ test "empty block: finish with no adds, iterate is invalid" {
 
 test "BlockBuilder reset reuses the builder" {
     const gpa = testing.allocator;
-    var b = BlockBuilder.init(gpa, 2);
+    var b = BlockBuilder.init(gpa, comparator.bytewise, 2);
     defer b.deinit();
 
     try b.add("x", "1");
@@ -676,7 +677,7 @@ test "BlockBuilder reset reuses the builder" {
 
 test "currentSizeEstimate grows with entries" {
     const gpa = testing.allocator;
-    var b = BlockBuilder.init(gpa, 2);
+    var b = BlockBuilder.init(gpa, comparator.bytewise, 2);
     defer b.deinit();
 
     const empty_est = b.currentSizeEstimate();
@@ -690,7 +691,7 @@ test "Block.init rejects too-small data" {
 
 test "byte-exact: single-entry block golden vector" {
     const gpa = testing.allocator;
-    var b = BlockBuilder.init(gpa, 2);
+    var b = BlockBuilder.init(gpa, comparator.bytewise, 2);
     defer b.deinit();
     try b.add("a", "v");
     const got = b.finish();
@@ -708,7 +709,7 @@ test "byte-exact: single-entry block golden vector" {
 test "byte-exact: prefix-compressed two-entry block golden vector" {
     const gpa = testing.allocator;
     // restart_interval large enough that both entries are in one restart region.
-    var b = BlockBuilder.init(gpa, 10);
+    var b = BlockBuilder.init(gpa, comparator.bytewise, 10);
     defer b.deinit();
     try b.add("ab", "x");
     try b.add("abc", "y"); // shares "ab" with previous
@@ -754,4 +755,72 @@ test "iterate handles empty values and many restarts" {
     try testing.expect(iter.valid());
     try testing.expectEqualStrings("k3", iter.key());
     try testing.expectEqualStrings("value3", iter.value());
+}
+
+/// Encode `user ++ fixed64_LE(packSequenceAndType(seq, .value))` (caller frees).
+fn ikeyValue(gpa: std.mem.Allocator, user: []const u8, seq: u64) ![]u8 {
+    const out = try gpa.alloc(u8, user.len + 8);
+    @memcpy(out[0..user.len], user);
+    coding.encodeFixed64(out[user.len..][0..8], internal_key.packSequenceAndType(seq, .value));
+    return out;
+}
+
+test "InternalKeyComparator: multiple versions of one user key build + iterate" {
+    // This is the case that USED to break: two internal keys sharing the same
+    // user key with DIFFERENT sequences.  In InternalKeyComparator order the
+    // higher-sequence version sorts FIRST, but bytewise the higher-sequence
+    // version is GREATER (its trailer byte is larger), so a bytewise add-order
+    // assertion would trip.  With a comparator-aware BlockBuilder the IKC order
+    // (higher seq first) is non-decreasing and seek/iterate reconstruct it.
+    const gpa = testing.allocator;
+
+    var ikc = internal_key.InternalKeyComparator{ .user = comparator.bytewise };
+    const cmp = ikc.comparatorInterface();
+
+    // user="k" @ seq 5 (newest) then @ seq 3 (older): IKC-non-decreasing order.
+    const k5 = try ikeyValue(gpa, "k", 5);
+    defer gpa.free(k5);
+    const k3 = try ikeyValue(gpa, "k", 3);
+    defer gpa.free(k3);
+
+    var b = BlockBuilder.init(gpa, cmp, 2);
+    defer b.deinit();
+    try b.add(k5, "v5");
+    try b.add(k3, "v3");
+    const data = try gpa.dupe(u8, b.finish());
+    defer gpa.free(data);
+
+    const block = try Block.init(gpa, data);
+    var iter = block.iterator(cmp);
+    defer iter.deinit();
+
+    // Iterate: k@5 then k@3, values intact.
+    iter.seekToFirst();
+    try testing.expect(iter.valid());
+    try testing.expectEqualSlices(u8, k5, iter.key());
+    try testing.expectEqualStrings("v5", iter.value());
+    iter.next();
+    try testing.expect(iter.valid());
+    try testing.expectEqualSlices(u8, k3, iter.key());
+    try testing.expectEqualStrings("v3", iter.value());
+    iter.next();
+    try testing.expect(!iter.valid());
+
+    // Seek to a lookup key "k" @ seq 4: the first entry >= it in IKC order is
+    // k@3 (k@5 has the larger trailer, sorts before the seek key; k@3 is the
+    // newest version with seq <= 4).
+    const seek4 = try ikeyValue(gpa, "k", 4);
+    defer gpa.free(seek4);
+    iter.seek(seek4);
+    try testing.expect(iter.valid());
+    try testing.expectEqualSlices(u8, k3, iter.key());
+    try testing.expectEqualStrings("v3", iter.value());
+
+    // Seek to "k" @ seq 6 lands on the newest version k@5.
+    const seek6 = try ikeyValue(gpa, "k", 6);
+    defer gpa.free(seek6);
+    iter.seek(seek6);
+    try testing.expect(iter.valid());
+    try testing.expectEqualSlices(u8, k5, iter.key());
+    try testing.expectEqualStrings("v5", iter.value());
 }
