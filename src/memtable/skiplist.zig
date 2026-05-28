@@ -256,8 +256,7 @@ pub const SkipList = struct {
         /// invalid when stepping before the first node.
         pub fn prev(self: *Iterator) void {
             std.debug.assert(self.valid());
-            const p = self.list.findLessThan(self.node.?.key);
-            self.node = if (p == self.list.head) null else p;
+            self.setNonHead(self.list.findLessThan(self.node.?.key));
         }
 
         pub fn seekToFirst(self: *Iterator) void {
@@ -265,7 +264,11 @@ pub const SkipList = struct {
         }
 
         pub fn seekToLast(self: *Iterator) void {
-            const p = self.list.findLast();
+            self.setNonHead(self.list.findLast());
+        }
+
+        /// Point at `p`, treating the head sentinel as "invalid" (null).
+        fn setNonHead(self: *Iterator, p: *Node) void {
             self.node = if (p == self.list.head) null else p;
         }
 
