@@ -62,18 +62,45 @@ pub const PrefixExtractor = struct {
 /// exactly like `InternalKeyComparator`.
 pub const FixedPrefixExtractor = struct {
     n: usize,
-    name_buf: [32]u8,
-    name_len: usize,
+    /// Precomputed "rocksdb.FixedPrefix.N" (avoids needing an allocator in
+    /// `name()`).  32 bytes comfortably fits the literal plus a u64 in decimal.
+    name_buf: [32]u8 = undefined,
+    name_len: usize = 0,
 
     pub fn init(n: usize) FixedPrefixExtractor {
-        _ = n;
-        @panic("FixedPrefixExtractor.init unimplemented");
+        var self = FixedPrefixExtractor{ .n = n };
+        const s = std.fmt.bufPrint(&self.name_buf, "rocksdb.FixedPrefix.{d}", .{n}) catch unreachable;
+        self.name_len = s.len;
+        return self;
     }
 
     pub fn extractor(self: *const FixedPrefixExtractor) PrefixExtractor {
-        _ = self;
-        @panic("FixedPrefixExtractor.extractor unimplemented");
+        return .{ .ctx = self, .vtable = &fixed_vtable };
     }
+};
+
+fn fixedTransform(ctx: *const anyopaque, user_key: []const u8) []const u8 {
+    const self: *const FixedPrefixExtractor = @ptrCast(@alignCast(ctx));
+    // inDomain guarantees key.len >= n at call sites that prune; be defensive
+    // here so a stray call returns the whole key rather than slicing OOB.
+    if (user_key.len < self.n) return user_key;
+    return user_key[0..self.n];
+}
+
+fn fixedInDomain(ctx: *const anyopaque, user_key: []const u8) bool {
+    const self: *const FixedPrefixExtractor = @ptrCast(@alignCast(ctx));
+    return user_key.len >= self.n;
+}
+
+fn fixedName(ctx: *const anyopaque) []const u8 {
+    const self: *const FixedPrefixExtractor = @ptrCast(@alignCast(ctx));
+    return self.name_buf[0..self.name_len];
+}
+
+const fixed_vtable = PrefixExtractor.VTable{
+    .transform = fixedTransform,
+    .inDomain = fixedInDomain,
+    .name = fixedName,
 };
 
 // ---------------------------------------------------------------------------
@@ -83,18 +110,41 @@ pub const FixedPrefixExtractor = struct {
 /// A capped-length prefix extractor.  Same lifetime contract as the fixed one.
 pub const CappedPrefixExtractor = struct {
     n: usize,
-    name_buf: [32]u8,
-    name_len: usize,
+    name_buf: [32]u8 = undefined,
+    name_len: usize = 0,
 
     pub fn init(n: usize) CappedPrefixExtractor {
-        _ = n;
-        @panic("CappedPrefixExtractor.init unimplemented");
+        var self = CappedPrefixExtractor{ .n = n };
+        const s = std.fmt.bufPrint(&self.name_buf, "rocksdb.CappedPrefix.{d}", .{n}) catch unreachable;
+        self.name_len = s.len;
+        return self;
     }
 
     pub fn extractor(self: *const CappedPrefixExtractor) PrefixExtractor {
-        _ = self;
-        @panic("CappedPrefixExtractor.extractor unimplemented");
+        return .{ .ctx = self, .vtable = &capped_vtable };
     }
+};
+
+fn cappedTransform(ctx: *const anyopaque, user_key: []const u8) []const u8 {
+    const self: *const CappedPrefixExtractor = @ptrCast(@alignCast(ctx));
+    return user_key[0..@min(user_key.len, self.n)];
+}
+
+fn cappedInDomain(ctx: *const anyopaque, user_key: []const u8) bool {
+    _ = ctx;
+    _ = user_key;
+    return true;
+}
+
+fn cappedName(ctx: *const anyopaque) []const u8 {
+    const self: *const CappedPrefixExtractor = @ptrCast(@alignCast(ctx));
+    return self.name_buf[0..self.name_len];
+}
+
+const capped_vtable = PrefixExtractor.VTable{
+    .transform = cappedTransform,
+    .inDomain = cappedInDomain,
+    .name = cappedName,
 };
 
 // ---------------------------------------------------------------------------

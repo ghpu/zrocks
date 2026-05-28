@@ -19,6 +19,7 @@ const std = @import("std");
 const block = @import("block.zig");
 const filter_block = @import("filter_block.zig");
 const bloom = @import("bloom.zig");
+const internal_key = @import("internal_key.zig");
 const footer_mod = @import("footer.zig");
 const crc32c = @import("../util/crc32c.zig");
 const coding = @import("../util/coding.zig");
@@ -135,8 +136,20 @@ pub const TableBuilder = struct {
             try self.appendIndexEntry();
         }
 
-        // Record the key in the filter.
-        try self.filter.addKey(self.gpa, key);
+        // Record the key in the filter.  M7.2: when a prefix_extractor is
+        // configured, the filter is built over key PREFIXES — extract the user
+        // key from the internal key and, if it is in the extractor's domain, add
+        // its prefix; out-of-domain keys are simply not added (so they cannot be
+        // pruned, and the reader must never prune them either).  Without a prefix
+        // extractor the filter is built over the whole (internal) key as before.
+        if (self.options.prefix_extractor) |pe| {
+            const user_key = internal_key.extractUserKey(key);
+            if (pe.inDomain(user_key)) {
+                try self.filter.addKey(self.gpa, pe.transform(user_key));
+            }
+        } else {
+            try self.filter.addKey(self.gpa, key);
+        }
 
         // Remember last_key = key.
         self.last_key.clearRetainingCapacity();

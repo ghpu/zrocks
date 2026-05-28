@@ -36,6 +36,8 @@ const comparator = @import("../util/comparator.zig");
 const cache_mod = @import("../util/cache.zig");
 const env = @import("../env/env.zig");
 const options_mod = @import("../options.zig");
+const internal_key = @import("internal_key.zig");
+const prefix = @import("../rocks/prefix.zig");
 
 const BlockHandle = footer_mod.BlockHandle;
 const Footer = footer_mod.Footer;
@@ -53,6 +55,11 @@ pub const Table = struct {
     file: env.RandomAccessFile,
     comparator: comparator.Comparator,
     policy: bloom.BloomFilterPolicy,
+    /// Optional prefix extractor (M7.2).  When set, the table's filter block is
+    /// assumed to be built over key PREFIXES, so point lookups prune by prefix
+    /// (computed from the lookup's user key) instead of by whole key.  Mirrors
+    /// `options.prefix_extractor`; null reproduces whole-key bloom behaviour.
+    prefix_extractor: ?prefix.PrefixExtractor,
 
     /// Owned contents of the index block (kept resident for its lifetime).
     index_contents: []u8,
@@ -104,6 +111,7 @@ pub const Table = struct {
             .file = file,
             .comparator = options.comparator,
             .policy = policy,
+            .prefix_extractor = options.prefix_extractor,
             .index_contents = index_contents,
             .index_block = index_block,
             .filter_contents = null,
@@ -172,8 +180,22 @@ pub const Table = struct {
         const handle = try BlockHandle.decodeFrom(&hv);
 
         // Bloom fast-path: if the filter proves the key absent, skip the read.
+        // M7.2: a prefix-keyed filter is probed by the lookup key's PREFIX.  We
+        // compute prefix = transform(extractUserKey(internal_key)) and prune via
+        // prefixMayMatch — but ONLY when the user key is in the extractor's
+        // domain (out-of-domain keys were never added to the filter, so pruning
+        // them would be a false negative).  Without a prefix extractor, fall back
+        // to the whole-key probe.
         if (self.filter_reader) |*fr| {
-            if (!fr.keyMayMatch(handle.offset, key)) return null;
+            if (self.prefix_extractor) |pe| {
+                const user_key = internal_key.extractUserKey(key);
+                if (pe.inDomain(user_key)) {
+                    if (!fr.prefixMayMatch(handle.offset, pe.transform(user_key))) return null;
+                }
+                // out-of-domain: cannot prune; fall through to read the block.
+            } else {
+                if (!fr.keyMayMatch(handle.offset, key)) return null;
+            }
         }
 
         const data_contents = try self.readBlock(handle);
@@ -429,7 +451,6 @@ fn readBlockRaw(gpa: std.mem.Allocator, file: env.RandomAccessFile, handle: Bloc
 const testing = std.testing;
 const table_builder = @import("table_builder.zig");
 const TableBuilder = table_builder.TableBuilder;
-const internal_key = @import("internal_key.zig");
 const prefix_mod = @import("../rocks/prefix.zig");
 
 const KV = struct { k: []const u8, v: []const u8 };

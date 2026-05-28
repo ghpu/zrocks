@@ -21,6 +21,7 @@ const iterator = @import("../iterator/iterator.zig");
 const comparator = @import("../util/comparator.zig");
 const internal_key = @import("../format/internal_key.zig");
 const coding = @import("../util/coding.zig");
+const prefix = @import("../rocks/prefix.zig");
 
 /// User-facing iterator over a single internal iterator at a fixed snapshot.
 pub const DBIterator = struct {
@@ -50,6 +51,17 @@ pub const DBIterator = struct {
     owned_inner: ?*anyopaque = null,
     owned_inner_destroy: ?*const fn (gpa: std.mem.Allocator, ctx: *anyopaque) void = null,
 
+    /// Prefix-bounded scan (M7.2).  When `prefix_same_as_start` is set AND a
+    /// `prefix_extractor` is configured, a `seek(target)` records the seek
+    /// target's prefix into `prefix_bound`; surfaced entries whose user-key
+    /// prefix differs from it make the iterator invalid (the scan stops at the
+    /// prefix boundary).  `seekToFirst` clears the bound (whole-DB scan).
+    prefix_extractor: ?prefix.PrefixExtractor = null,
+    prefix_same_as_start: bool = false,
+    /// The active prefix bound; empty/unset means "no bound".
+    prefix_bound: std.ArrayListUnmanaged(u8) = .empty,
+    prefix_bound_set: bool = false,
+
     pub fn init(
         gpa: std.mem.Allocator,
         inner: iterator.Iterator,
@@ -67,6 +79,7 @@ pub const DBIterator = struct {
     pub fn deinit(self: *DBIterator) void {
         self.saved_key.deinit(self.gpa);
         self.saved_value.deinit(self.gpa);
+        self.prefix_bound.deinit(self.gpa);
         if (self.owned_inner) |ctx| {
             if (self.owned_inner_destroy) |destroy| destroy(self.gpa, ctx);
             self.owned_inner = null;
@@ -94,12 +107,29 @@ pub const DBIterator = struct {
     }
 
     pub fn seekToFirst(self: *DBIterator) void {
+        // A whole-DB scan has no prefix bound.
+        self.prefix_bound_set = false;
+        self.prefix_bound.clearRetainingCapacity();
         self.inner.seekToFirst();
         self.findNextUserEntry(false) catch |e| self.fail(e);
     }
 
     /// Seek to the first user key >= `user_target` (visible at the snapshot).
     pub fn seek(self: *DBIterator, user_target: []const u8) void {
+        // M7.2 prefix-bounded scan: when enabled, record the seek target's
+        // prefix so the scan stops once the surfaced user-key prefix changes.
+        // An out-of-domain target leaves the scan unbounded (RocksDB behaviour).
+        self.prefix_bound_set = false;
+        self.prefix_bound.clearRetainingCapacity();
+        if (self.prefix_same_as_start) {
+            if (self.prefix_extractor) |pe| {
+                if (pe.inDomain(user_target)) {
+                    self.prefix_bound.appendSlice(self.gpa, pe.transform(user_target)) catch |e| return self.fail(e);
+                    self.prefix_bound_set = true;
+                }
+            }
+        }
+
         // Build an internal lookup key: user_target ++ trailer(snapshot, seek).
         // Because internal keys sort by trailer DESCENDING, seeking to this
         // lands at/after the newest version of user_target with seq <= snapshot.
@@ -148,6 +178,14 @@ pub const DBIterator = struct {
                             self.user_cmp.compare(ikey.user_key, self.saved_key.items) != .gt)
                         {
                             // An older version of an already-handled user key.
+                        } else if (self.outsidePrefixBound(ikey.user_key)) {
+                            // M7.2: this entry's prefix differs from the seek
+                            // prefix.  Entries are in ascending user-key order,
+                            // so nothing later can re-enter the prefix — stop.
+                            self.saved_key.clearRetainingCapacity();
+                            self.saved_value.clearRetainingCapacity();
+                            self.is_valid = false;
+                            return;
                         } else {
                             // Surface this entry.
                             try self.saveKey(ikey.user_key);
@@ -167,6 +205,16 @@ pub const DBIterator = struct {
         self.saved_key.clearRetainingCapacity();
         self.saved_value.clearRetainingCapacity();
         self.is_valid = false;
+    }
+
+    /// True when a prefix bound is active and `user_key`'s prefix differs from
+    /// it.  An out-of-domain user key is treated as outside the bound (its
+    /// prefix can never equal the seek prefix).
+    fn outsidePrefixBound(self: *const DBIterator, user_key: []const u8) bool {
+        if (!self.prefix_bound_set) return false;
+        const pe = self.prefix_extractor orelse return false;
+        if (!pe.inDomain(user_key)) return true;
+        return !std.mem.eql(u8, pe.transform(user_key), self.prefix_bound.items);
     }
 
     fn saveKey(self: *DBIterator, user_key: []const u8) !void {

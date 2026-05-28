@@ -445,6 +445,10 @@ pub const DB = struct {
         var dbit = DBIterator.init(gpa, merger.iterator(), self.options.comparator, seq);
         dbit.owned_inner = merger;
         dbit.owned_inner_destroy = destroyMerger;
+        // M7.2: thread the prefix extractor + prefix-bounded scan flag so a
+        // `seek` can bound iteration to the seek target's prefix.
+        dbit.prefix_extractor = self.options.prefix_extractor;
+        dbit.prefix_same_as_start = ropts.prefix_same_as_start;
         return dbit;
     }
 
