@@ -8,8 +8,8 @@
 ///       -Mcoding=src/util/coding.zig \
 ///       -Mcomparator=src/util/comparator.zig
 const std = @import("std");
-const coding = @import("coding");
-const comparator = @import("comparator");
+const coding = @import("../util/coding.zig");
+const comparator = @import("../util/comparator.zig");
 
 // ---------------------------------------------------------------------------
 // ValueType
