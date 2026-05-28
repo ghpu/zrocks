@@ -16,7 +16,14 @@
 /// `fixed32_LE(mask(extend(crc(contents), &[compression_type])))`. A mismatch
 /// is reported as `error.Corruption`.
 ///
-/// No block cache: every block read hits the file (M3.5 will add caching).
+/// Optional block cache (M3.5): when a `*cache_mod.Cache` is supplied to
+/// `open`, each block read first consults the cache keyed by
+/// `cache_id (8 bytes LE) ++ handle.offset (8 bytes LE)`. On a hit the cached
+/// contents are duped and returned (skipping the file read + CRC verify); on a
+/// miss the block is read, verified, a COPY is inserted into the cache, and the
+/// owned contents are returned to the caller. Ownership contracts are
+/// unchanged: the caller still owns and frees the returned block contents.
+/// A null cache reproduces the original always-read-the-file behaviour.
 const std = @import("std");
 
 const footer_mod = @import("footer.zig");
@@ -26,6 +33,7 @@ const bloom = @import("bloom.zig");
 const crc32c = @import("../util/crc32c.zig");
 const coding = @import("../util/coding.zig");
 const comparator = @import("../util/comparator.zig");
+const cache_mod = @import("../util/cache.zig");
 const env = @import("../env/env.zig");
 const options_mod = @import("../options.zig");
 
@@ -54,16 +62,30 @@ pub const Table = struct {
     filter_contents: ?[]u8,
     filter_reader: ?FilterBlockReader,
 
+    /// Optional shared block cache (caller-owned; not freed by `deinit`).
+    block_cache: ?*cache_mod.Cache,
+    /// Per-table id mixed into cache keys so blocks at the same offset in
+    /// different tables do not collide in a shared cache.
+    cache_id: u64,
+
     /// Open a table from a random-access file of `file_size` bytes. Reads and
     /// validates the footer, the index block, and (if present) the filter
     /// block. The caller retains ownership of `file` and must keep it alive for
     /// the lifetime of the returned Table; `deinit` does NOT close it.
+    ///
+    /// `block_cache` is an optional caller-owned block cache shared across
+    /// tables; pass `null` for the original always-read-the-file behaviour.
+    /// `cache_id` is a per-table id (e.g. its file number) mixed into cache
+    /// keys so blocks do not collide across tables; it is ignored when
+    /// `block_cache` is null.
     pub fn open(
         gpa: std.mem.Allocator,
         file: env.RandomAccessFile,
         file_size: u64,
         options: options_mod.Options,
         policy: bloom.BloomFilterPolicy,
+        block_cache: ?*cache_mod.Cache,
+        cache_id: u64,
     ) !Table {
         if (file_size < footer_mod.kEncodedLength) return error.Corruption;
 
@@ -73,7 +95,7 @@ pub const Table = struct {
         const footer = try Footer.decodeFrom(&footer_buf);
 
         // ---- Index block ------------------------------------------------
-        const index_contents = try readBlock(gpa, file, footer.index_handle);
+        const index_contents = try readBlockCached(gpa, file, footer.index_handle, block_cache, cache_id);
         errdefer gpa.free(index_contents);
         const index_block = try Block.init(gpa, index_contents);
 
@@ -86,6 +108,8 @@ pub const Table = struct {
             .index_block = index_block,
             .filter_contents = null,
             .filter_reader = null,
+            .block_cache = block_cache,
+            .cache_id = cache_id,
         };
 
         // ---- Metaindex block -> filter block ----------------------------
@@ -99,11 +123,17 @@ pub const Table = struct {
         self.* = undefined;
     }
 
+    /// Read the block at `handle`, consulting/populating this table's optional
+    /// block cache. Returns OWNED contents the caller frees with `self.gpa`.
+    fn readBlock(self: *Table, handle: BlockHandle) ![]u8 {
+        return readBlockCached(self.gpa, self.file, handle, self.block_cache, self.cache_id);
+    }
+
     /// Read the metaindex block, look for the filter entry, and if present read
     /// the filter block and install a FilterBlockReader. A missing filter entry
     /// leaves the table working without bloom filtering.
     fn readFilter(self: *Table, metaindex_handle: BlockHandle) !void {
-        const meta_contents = try readBlock(self.gpa, self.file, metaindex_handle);
+        const meta_contents = try self.readBlock(metaindex_handle);
         defer self.gpa.free(meta_contents);
         const meta_block = try Block.init(self.gpa, meta_contents);
 
@@ -123,7 +153,7 @@ pub const Table = struct {
 
         var hv: []const u8 = it.value();
         const filter_handle = try BlockHandle.decodeFrom(&hv);
-        const filter_contents = try readBlock(self.gpa, self.file, filter_handle);
+        const filter_contents = try self.readBlock(filter_handle);
         self.filter_contents = filter_contents;
         self.filter_reader = FilterBlockReader.init(self.policy, filter_contents);
     }
@@ -146,7 +176,7 @@ pub const Table = struct {
             if (!fr.keyMayMatch(handle.offset, key)) return null;
         }
 
-        const data_contents = try readBlock(self.gpa, self.file, handle);
+        const data_contents = try self.readBlock(handle);
         defer self.gpa.free(data_contents);
         const data_block = try Block.init(self.gpa, data_contents);
         var it = data_block.iterator(self.comparator);
@@ -222,7 +252,7 @@ pub const Table = struct {
                 self.err = e;
                 return;
             };
-            const contents = readBlock(self.table.gpa, self.table.file, handle) catch |e| {
+            const contents = self.table.readBlock(handle) catch |e| {
                 self.err = e;
                 return;
             };
@@ -322,10 +352,55 @@ fn readFully(file: env.RandomAccessFile, offset: u64, buf: []u8) !void {
     }
 }
 
+/// Build the 16-byte cache key for a block: cache_id ++ offset, both LE.
+fn blockCacheKey(cache_id: u64, offset: u64) [16]u8 {
+    var key: [16]u8 = undefined;
+    coding.encodeFixed64(key[0..8], cache_id);
+    coding.encodeFixed64(key[8..16], offset);
+    return key;
+}
+
 /// Read the block at `handle` (contents + 5-byte trailer), verify the trailer's
 /// compression type and masked crc32c, and return an OWNED copy of the contents
-/// (caller frees with `gpa`).
-fn readBlock(gpa: std.mem.Allocator, file: env.RandomAccessFile, handle: BlockHandle) ![]u8 {
+/// (caller frees with `gpa`). When `block_cache` is set this is the
+/// "copy-on-hit" block cache: a HIT dupes the cached contents (skipping the
+/// file read + CRC verify); a MISS reads+verifies, inserts a COPY into the
+/// cache (charge = contents.len), then returns the owned contents as before.
+//
+// TODO(m3.x): zero-copy pinned-handle block cache to avoid the dup on hit.
+fn readBlockCached(
+    gpa: std.mem.Allocator,
+    file: env.RandomAccessFile,
+    handle: BlockHandle,
+    block_cache: ?*cache_mod.Cache,
+    cache_id: u64,
+) ![]u8 {
+    if (block_cache) |bc| {
+        const key = blockCacheKey(cache_id, handle.offset);
+        if (bc.lookup(&key)) |h| {
+            defer bc.release(h);
+            return gpa.dupe(u8, bc.value(h));
+        }
+    }
+
+    const owned = try readBlockRaw(gpa, file, handle);
+    if (block_cache) |bc| {
+        // Insert a COPY so the cache and the caller own independent buffers.
+        const copy = gpa.dupe(u8, owned) catch return owned; // cache is best-effort
+        const key = blockCacheKey(cache_id, handle.offset);
+        const h = bc.insert(&key, copy, copy.len) catch {
+            gpa.free(copy);
+            return owned;
+        };
+        bc.release(h); // the cache retains its own reference
+    }
+    return owned;
+}
+
+/// Read the block at `handle` (contents + 5-byte trailer), verify the trailer's
+/// compression type and masked crc32c, and return an OWNED copy of the contents
+/// (caller frees with `gpa`). Always hits the file (no cache).
+fn readBlockRaw(gpa: std.mem.Allocator, file: env.RandomAccessFile, handle: BlockHandle) ![]u8 {
     const size: usize = @intCast(handle.size);
 
     // Read the contents plus the 5-byte trailer in one positional read.
@@ -438,7 +513,7 @@ test "table reader: get round-trip for every key, absent keys return null" {
     var raf = try e.newRandomAccessFile(gpa, "rt.sst");
     defer raf.close() catch {};
 
-    var table = try Table.open(gpa, raf, file_size, opts, policy);
+    var table = try Table.open(gpa, raf, file_size, opts, policy, null, 0);
     defer table.deinit();
 
     // Every inserted key round-trips to its exact value.
@@ -479,7 +554,7 @@ test "table reader: full scan yields all entries in sorted order" {
     var raf = try e.newRandomAccessFile(gpa, "scan.sst");
     defer raf.close() catch {};
 
-    var table = try Table.open(gpa, raf, file_size, opts, policy);
+    var table = try Table.open(gpa, raf, file_size, opts, policy, null, 0);
     defer table.deinit();
 
     var it = table.iterator(gpa);
@@ -516,7 +591,7 @@ test "table reader: seek present, between, past end" {
     var raf = try e.newRandomAccessFile(gpa, "seek.sst");
     defer raf.close() catch {};
 
-    var table = try Table.open(gpa, raf, file_size, opts, policy);
+    var table = try Table.open(gpa, raf, file_size, opts, policy, null, 0);
     defer table.deinit();
 
     var it = table.iterator(gpa);
@@ -584,7 +659,7 @@ test "table reader: corruption inside a data block is detected" {
     defer raf.close() catch {};
 
     // Footer/index/filter are intact -> open succeeds.
-    var table = try Table.open(gpa, raf, file_size, opts, policy);
+    var table = try Table.open(gpa, raf, file_size, opts, policy, null, 0);
     defer table.deinit();
 
     // Reading the corrupted first data block must surface error.Corruption,
@@ -624,7 +699,7 @@ test "table reader: single small block round-trips" {
     var raf = try e.newRandomAccessFile(gpa, "one.sst");
     defer raf.close() catch {};
 
-    var table = try Table.open(gpa, raf, file_size, opts, policy);
+    var table = try Table.open(gpa, raf, file_size, opts, policy, null, 0);
     defer table.deinit();
 
     for (pairs) |p| {
@@ -644,4 +719,101 @@ test "table reader: single small block round-trips" {
         idx += 1;
     }
     try testing.expectEqual(pairs.len, idx);
+}
+
+test "table reader: optional block cache yields identical results and hits on reread" {
+    const gpa = testing.allocator;
+
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    const opts = options_mod.Options{ .block_size = 200, .block_restart_interval = 4 };
+    const policy = bloom.BloomFilterPolicy.init(10);
+
+    var entries = try makeSortedEntries(gpa, 50);
+    defer freeEntries(gpa, &entries);
+
+    try buildTable(gpa, e, "cache.sst", opts, policy, entries.items);
+
+    const file_size = try e.getFileSize("cache.sst");
+
+    // ---- Baseline: no-cache reference results (full scan) ----------------
+    var ref: std.ArrayListUnmanaged(KV) = .empty;
+    defer {
+        for (ref.items) |kv| {
+            gpa.free(kv.k);
+            gpa.free(kv.v);
+        }
+        ref.deinit(gpa);
+    }
+    {
+        var raf = try e.newRandomAccessFile(gpa, "cache.sst");
+        defer raf.close() catch {};
+        var table = try Table.open(gpa, raf, file_size, opts, policy, null, 0);
+        defer table.deinit();
+        var it = table.iterator(gpa);
+        defer it.deinit();
+        it.seekToFirst();
+        while (it.valid()) : (it.next()) {
+            try ref.append(gpa, .{
+                .k = try gpa.dupe(u8, it.key()),
+                .v = try gpa.dupe(u8, it.value()),
+            });
+        }
+        try testing.expect(it.status() == null);
+    }
+
+    // ---- Cached: same results, and hits on reread ------------------------
+    var cache = cache_mod.Cache.init(gpa, 1 << 20);
+    defer cache.deinit();
+
+    var raf = try e.newRandomAccessFile(gpa, "cache.sst");
+    defer raf.close() catch {};
+    var table = try Table.open(gpa, raf, file_size, opts, policy, &cache, 7);
+    defer table.deinit();
+
+    // First scan: populates the cache (misses).
+    {
+        var it = table.iterator(gpa);
+        defer it.deinit();
+        var idx: usize = 0;
+        it.seekToFirst();
+        while (it.valid()) : (it.next()) {
+            try testing.expect(idx < ref.items.len);
+            try testing.expectEqualStrings(ref.items[idx].k, it.key());
+            try testing.expectEqualStrings(ref.items[idx].v, it.value());
+            idx += 1;
+        }
+        try testing.expectEqual(ref.items.len, idx);
+        try testing.expect(it.status() == null);
+    }
+    try testing.expect(cache.totalCharge() > 0);
+
+    const hits_before = cache.hits;
+
+    // Second scan: same blocks -> cache hits, identical results.
+    {
+        var it = table.iterator(gpa);
+        defer it.deinit();
+        var idx: usize = 0;
+        it.seekToFirst();
+        while (it.valid()) : (it.next()) {
+            try testing.expectEqualStrings(ref.items[idx].k, it.key());
+            try testing.expectEqualStrings(ref.items[idx].v, it.value());
+            idx += 1;
+        }
+        try testing.expectEqual(ref.items.len, idx);
+    }
+    try testing.expect(cache.hits > hits_before);
+
+    // Point gets from the same blocks also identical + serviced from cache.
+    const hits_before_get = cache.hits;
+    for (entries.items) |kv| {
+        const got = try table.get(gpa, kv.k);
+        try testing.expect(got != null);
+        defer gpa.free(got.?);
+        try testing.expectEqualStrings(kv.v, got.?);
+    }
+    try testing.expect(cache.hits > hits_before_get);
 }
