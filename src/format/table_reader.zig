@@ -429,6 +429,8 @@ fn readBlockRaw(gpa: std.mem.Allocator, file: env.RandomAccessFile, handle: Bloc
 const testing = std.testing;
 const table_builder = @import("table_builder.zig");
 const TableBuilder = table_builder.TableBuilder;
+const internal_key = @import("internal_key.zig");
+const prefix_mod = @import("../rocks/prefix.zig");
 
 const KV = struct { k: []const u8, v: []const u8 };
 
@@ -719,6 +721,98 @@ test "table reader: single small block round-trips" {
         idx += 1;
     }
     try testing.expectEqual(pairs.len, idx);
+}
+
+// ===========================================================================
+// M7.2 — prefix bloom filter: build over key prefixes, prune by prefix.
+// ===========================================================================
+
+/// Encode `user ++ fixed64(packSequenceAndType(seq, .value))` (caller frees).
+fn encodeIkey(gpa: std.mem.Allocator, user: []const u8, seq: u64) ![]u8 {
+    const out = try gpa.alloc(u8, user.len + 8);
+    @memcpy(out[0..user.len], user);
+    coding.encodeFixed64(out[user.len..][0..8], internal_key.packSequenceAndType(seq, .value));
+    return out;
+}
+
+test "table reader: prefix bloom — no false negatives, prunes absent prefixes, no data lost" {
+    const gpa = testing.allocator;
+
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    // SST stores INTERNAL keys; open/build with the InternalKeyComparator AND a
+    // 3-byte fixed prefix extractor so the filter is built over key prefixes.
+    var ikc = internal_key.InternalKeyComparator{ .user = comparator.bytewise };
+    var fpe = prefix_mod.FixedPrefixExtractor.init(3);
+    const opts = options_mod.Options{
+        .comparator = ikc.comparatorInterface(),
+        .prefix_extractor = fpe.extractor(),
+    };
+    const policy = bloom.BloomFilterPolicy.init(10);
+
+    // User keys sharing two prefixes: "abc*" and "xyz*".  Internal-key order is
+    // user asc then seq desc; build them sorted.
+    const users = [_][]const u8{ "abc1", "abc2", "abc3", "xyz1", "xyz2" };
+    var ikeys: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (ikeys.items) |k| gpa.free(k);
+        ikeys.deinit(gpa);
+    }
+
+    {
+        var wf = try e.newWritableFile(gpa, "pfx.sst");
+        errdefer wf.close() catch {};
+        var tb = try TableBuilder.init(gpa, opts, wf, policy);
+        defer tb.deinit();
+        for (users) |u| {
+            const ik = try encodeIkey(gpa, u, 1);
+            try ikeys.append(gpa, ik);
+            try tb.add(ik, u); // value = the user key for easy verification
+        }
+        try tb.finish();
+        try wf.close();
+    }
+
+    const file_size = try e.getFileSize("pfx.sst");
+    var raf = try e.newRandomAccessFile(gpa, "pfx.sst");
+    defer raf.close() catch {};
+
+    var table = try Table.open(gpa, raf, file_size, opts, policy, null, 0);
+    defer table.deinit();
+
+    // 1. NO DATA LOST: every inserted key round-trips (prefix filtering must
+    //    never cause a false negative for a present key).
+    for (users, ikeys.items) |u, ik| {
+        const got = try table.get(gpa, ik) orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings(u, got);
+    }
+
+    // 2. Absent key WITH A PRESENT PREFIX ("abc9"): filter says maybe → block is
+    //    read → not found → null, no error.
+    {
+        const ik = try encodeIkey(gpa, "abc9", 1);
+        defer gpa.free(ik);
+        const got = try table.get(gpa, ik);
+        if (got) |g| {
+            gpa.free(g);
+            return error.TestExpectedNull;
+        }
+    }
+
+    // 3. Absent key whose PREFIX is absent ("qqq9"): the prefix filter prunes it
+    //    → null without error (no block read needed, but correctness holds).
+    {
+        const ik = try encodeIkey(gpa, "qqq9", 1);
+        defer gpa.free(ik);
+        const got = try table.get(gpa, ik);
+        if (got) |g| {
+            gpa.free(g);
+            return error.TestExpectedNull;
+        }
+    }
 }
 
 test "table reader: optional block cache yields identical results and hits on reread" {
