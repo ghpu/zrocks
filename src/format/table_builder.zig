@@ -22,6 +22,7 @@ const bloom = @import("bloom.zig");
 const footer_mod = @import("footer.zig");
 const crc32c = @import("../util/crc32c.zig");
 const coding = @import("../util/coding.zig");
+const comparator = @import("../util/comparator.zig");
 const env = @import("../env/env.zig");
 const options_mod = @import("../options.zig");
 
@@ -86,8 +87,10 @@ pub const TableBuilder = struct {
             .options = options,
             .file = file,
             .policy = policy,
-            .data_block = BlockBuilder.init(gpa, options.block_restart_interval),
-            .index_block = BlockBuilder.init(gpa, kMetaIndexRestartInterval),
+            // Data + index blocks hold keys ordered by the table's comparator
+            // (an InternalKeyComparator for DB SSTs), so build them with it.
+            .data_block = BlockBuilder.init(gpa, options.comparator, options.block_restart_interval),
+            .index_block = BlockBuilder.init(gpa, options.comparator, kMetaIndexRestartInterval),
             .filter = filter,
             .last_key = .empty,
             .offset = 0,
@@ -214,7 +217,9 @@ pub const TableBuilder = struct {
         const filter_handle = try self.writeRawBlock(filter_contents, kNoCompression);
 
         // 2. Metaindex block: single entry "filter."++name -> filter handle.
-        var metaindex_block = BlockBuilder.init(self.gpa, kMetaIndexRestartInterval);
+        //    Its keys are plain bytewise meta keys (NOT internal keys), so it is
+        //    ordered/searched with the bytewise comparator, matching the reader.
+        var metaindex_block = BlockBuilder.init(self.gpa, comparator.bytewise, kMetaIndexRestartInterval);
         defer metaindex_block.deinit();
         {
             var key_buf: std.ArrayListUnmanaged(u8) = .empty;

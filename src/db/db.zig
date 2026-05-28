@@ -45,6 +45,7 @@ const write_path = @import("write_path.zig");
 const db_iter = @import("db_iter.zig");
 const snapshot_mod = @import("snapshot.zig");
 const recovery = @import("recovery.zig");
+const flush = @import("flush.zig");
 
 const Options = options_mod.Options;
 const ReadOptions = options_mod.ReadOptions;
@@ -62,6 +63,11 @@ pub const DB = struct {
     name: []u8,
     ikcmp: internal_key.InternalKeyComparator,
     mem: *MemTable,
+    /// Memtable being flushed (set during a synchronous flush, otherwise null).
+    /// Between writes it is always null (the flush in `write` is synchronous),
+    /// but `get`/`newIterator` consult it so a future background flush stays
+    /// correct.  TODO(perf): background flush thread keeps this set for longer.
+    imm: ?*MemTable = null,
     versions: *version_set.VersionSet,
     /// Opens + caches SST `Table` readers for the current Version's files.  Its
     /// InternalKeyComparator's address is taken into opened tables, so the cache
@@ -104,6 +110,7 @@ pub const DB = struct {
 
         self.mem = try MemTable.init(gpa, options.comparator);
         errdefer self.mem.deinit();
+        self.imm = null;
 
         const vs = try gpa.create(version_set.VersionSet);
         errdefer gpa.destroy(vs);
@@ -180,6 +187,12 @@ pub const DB = struct {
         self.table_cache.deinit();
         self.versions.deinit();
         gpa.destroy(self.versions);
+        // Flush is synchronous, so `imm` is always null between writes; free it
+        // defensively in case a flush ever leaves one pending (e.g. a future
+        // background flush or an error path).  Its data is durable in either the
+        // SST (if the flush finished) or the WAL (if it didn't), so freeing the
+        // RAM copy here loses nothing.
+        if (self.imm) |imm| imm.deinit();
         self.mem.deinit();
         gpa.free(self.name);
         gpa.destroy(self);
@@ -223,6 +236,59 @@ pub const DB = struct {
 
         try write_path.insertBatch(self.mem, batch, first_sequence);
         self.last_sequence += batch.count();
+
+        // If the active memtable is now over budget, rotate it into an immutable
+        // memtable + a fresh WAL and flush it to an L0 SST.
+        try self.maybeFlush();
+    }
+
+    /// If the live memtable has exceeded `write_buffer_size`, rotate it out and
+    /// flush it to an L0 SST.  Synchronous for M6.1 (single-threaded).
+    /// TODO(perf): background flush thread (keep serving reads from `imm`).
+    fn maybeFlush(self: *DB) !void {
+        if (self.imm != null) return; // a flush is already pending.
+        if (self.mem.approximateMemoryUsage() < self.options.write_buffer_size) return;
+
+        // 1. Rotate the WAL: allocate a new log number and open a fresh WAL.
+        const new_log_number = self.versions.newFileNumber();
+        const new_log_path = try filename.logFileName(self.gpa, self.name, new_log_number);
+        defer self.gpa.free(new_log_path);
+
+        var new_wal_file = try self.env.newWritableFile(self.gpa, new_log_path);
+        errdefer new_wal_file.close() catch {};
+
+        // 2. Rotate the memtable: the full one becomes immutable; install a new
+        //    empty one for subsequent writes.
+        const new_mem = try MemTable.init(self.gpa, self.options.comparator);
+        errdefer new_mem.deinit();
+
+        self.imm = self.mem;
+        self.mem = new_mem;
+
+        // Swap in the new WAL (close the old one — its data is going into the
+        // SST and will not be replayed once logAndApply records the new log).
+        const old_wal_file = self.wal_file;
+        self.wal_file = new_wal_file;
+        self.wal = log_writer.Writer.init(self.wal_file);
+        old_wal_file.close() catch {};
+
+        // 3. Flush the immutable memtable to an L0 SST (records the SST + the
+        //    rotated log number in a VersionEdit).
+        try flush.flushMemTable(
+            self.gpa,
+            self.env,
+            self.name,
+            self.options,
+            self.ikcmp.comparatorInterface(),
+            self.versions,
+            self.imm.?,
+            new_log_number,
+            self.last_sequence,
+        );
+
+        // 4. Free the flushed memtable; no pending flush remains.
+        self.imm.?.deinit();
+        self.imm = null;
     }
 
     /// Point lookup visible at the snapshot (`ropts.snapshot` or the latest
@@ -238,6 +304,14 @@ pub const DB = struct {
             .found => |v| return try self.gpa.dupe(u8, v),
             .deleted => return null,
         };
+
+        // 1b. The immutable memtable being flushed (if any) is next-newest.
+        if (self.imm) |imm| {
+            if (imm.get(lookup)) |r| switch (r) {
+                .found => |v| return try self.gpa.dupe(u8, v),
+                .deleted => return null,
+            };
+        }
 
         // 2. Not in the memtable: consult the on-disk SSTs via the current
         //    Version (LSM point lookup with snapshot + tombstone semantics).
@@ -280,6 +354,14 @@ pub const DB = struct {
             errdefer gpa.destroy(adapter);
             adapter.* = .{ .gpa = gpa, .it = MemTable.Iterator.init(self.mem) };
             try children.append(gpa, adapter.genericIterator());
+        }
+
+        // 1b. The immutable memtable being flushed (if any), next in recency.
+        if (self.imm) |imm| {
+            const imm_adapter = try gpa.create(MemIterAdapter);
+            errdefer gpa.destroy(imm_adapter);
+            imm_adapter.* = .{ .gpa = gpa, .it = MemTable.Iterator.init(imm) };
+            try children.append(gpa, imm_adapter.genericIterator());
         }
 
         // 2. One table iterator per file in the current Version.

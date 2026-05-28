@@ -27,6 +27,13 @@ pub const Error = error{Corruption};
 
 pub const BlockBuilder = struct {
     gpa: std.mem.Allocator,
+    /// Comparator the keys are ordered by.  The add-order assertion and the
+    /// reader's binary search must use the SAME comparator the block was built
+    /// with: data/index blocks of a DB SST hold INTERNAL keys ordered by the
+    /// InternalKeyComparator (user asc, trailer DESC), which is NOT bytewise.
+    /// Prefix compression itself stays bytewise (shared-prefix of adjacent keys
+    /// is valid regardless of sort order); only ordering decisions use `cmp`.
+    cmp: comparator.Comparator,
     restart_interval: usize,
     /// Accumulated block bytes (entries; restart array appended on finish()).
     buffer: std.ArrayListUnmanaged(u8),
@@ -39,13 +46,14 @@ pub const BlockBuilder = struct {
     /// The previous key added, kept to compute shared prefixes.
     last_key: std.ArrayListUnmanaged(u8),
 
-    pub fn init(gpa: std.mem.Allocator, restart_interval: usize) BlockBuilder {
+    pub fn init(gpa: std.mem.Allocator, cmp: comparator.Comparator, restart_interval: usize) BlockBuilder {
         std.debug.assert(restart_interval >= 1);
         var restarts: std.ArrayListUnmanaged(u32) = .empty;
         // The first entry is always a restart point at offset 0.
         restarts.append(gpa, 0) catch @panic("OOM appending initial restart");
         return .{
             .gpa = gpa,
+            .cmp = cmp,
             .restart_interval = restart_interval,
             .buffer = .empty,
             .restarts = restarts,
@@ -87,9 +95,10 @@ pub const BlockBuilder = struct {
     pub fn add(self: *BlockBuilder, key: []const u8, value: []const u8) !void {
         std.debug.assert(!self.finished);
         std.debug.assert(self.counter <= self.restart_interval);
-        // Sorted-order invariant: key >= last_key (when not the very first key).
+        // Sorted-order invariant: key >= last_key (when not the very first key),
+        // under the block's comparator (e.g. InternalKeyComparator for SSTs).
         std.debug.assert(self.buffer.items.len == 0 or
-            std.mem.order(u8, self.last_key.items, key) != .gt);
+            self.cmp.compare(self.last_key.items, key) != .gt);
 
         var shared: usize = 0;
         if (self.counter < self.restart_interval) {
