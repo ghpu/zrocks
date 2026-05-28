@@ -65,13 +65,32 @@ pub const Table = struct {
         options: options_mod.Options,
         policy: bloom.BloomFilterPolicy,
     ) !Table {
-        // RED stub.
-        _ = gpa;
-        _ = file;
-        _ = file_size;
-        _ = options;
-        _ = policy;
-        return error.NotImplemented;
+        if (file_size < footer_mod.kEncodedLength) return error.Corruption;
+
+        // ---- Footer (last 53 bytes) -------------------------------------
+        var footer_buf: [footer_mod.kEncodedLength]u8 = undefined;
+        try readFully(file, file_size - footer_mod.kEncodedLength, &footer_buf);
+        const footer = try Footer.decodeFrom(&footer_buf);
+
+        // ---- Index block ------------------------------------------------
+        const index_contents = try readBlock(gpa, file, footer.index_handle);
+        errdefer gpa.free(index_contents);
+        const index_block = try Block.init(gpa, index_contents);
+
+        var self = Table{
+            .gpa = gpa,
+            .file = file,
+            .comparator = options.comparator,
+            .policy = policy,
+            .index_contents = index_contents,
+            .index_block = index_block,
+            .filter_contents = null,
+            .filter_reader = null,
+        };
+
+        // ---- Metaindex block -> filter block ----------------------------
+        try self.readFilter(footer.metaindex_handle);
+        return self;
     }
 
     pub fn deinit(self: *Table) void {
