@@ -3,12 +3,12 @@ project: zrocks
 zig_binary: /home/ghpu/zig/zig
 stdlib: /home/ghpu/zig/lib/std
 target_rocksdb: "9.x line; block-based table format_version 5; legacy WAL/MANIFEST log (see docs/adr/000-target-format.md)"
-active_phase: P5 (not started)
-active_milestone: "next up: M5.0 VersionEdit (Phase 5 persistence/recovery)"
-last_completed: M4.1 In-memory DB (Phase 4 COMPLETE — usable in-memory KV store)
-worktrees: "(none — clean)"
+active_phase: P5
+active_milestone: "M5.1 Version / VersionSet / MANIFEST"
+last_completed: M5.0 VersionEdit
+worktrees: "m5.1-version-set"
 test_command: "/home/ghpu/zig/zig build test"
-test_count: 235
+test_count: 243
 updated: 2026-05-28
 ---
 
@@ -51,9 +51,9 @@ RocksDB reference: https://github.com/facebook/rocksdb/wiki
 - [x] M4.1 In-memory DB (Put/Get/Delete/Write/iter)  (src/db/*.zig)
 
 ### Phase 5 — Persistence: Version/MANIFEST + recovery
-- [ ] M5.0 VersionEdit
-- [ ] M5.1 Version / VersionSet / MANIFEST
-- [ ] M5.2 Recovery (+ RocksDB DB read-interop gate)
+- [x] M5.0 VersionEdit                  (src/version/version_edit.zig)
+- [~] M5.1 Version / VersionSet / MANIFEST  <-- ACTIVE
+- [ ] M5.2 Recovery   (RocksDB real-DB read-interop gate deferred to after Phase 6 SST read path)
 
 ### Phase 6 — Compaction → full embedded KV store
 - [ ] M6.0 Flush (memtable → L0)

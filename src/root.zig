@@ -46,6 +46,9 @@ pub const db_iter = @import("db/db_iter.zig");
 pub const write_path = @import("db/write_path.zig");
 pub const snapshot = @import("db/snapshot.zig");
 
+// Version / MANIFEST (Phase 5).
+pub const version_edit = @import("version/version_edit.zig");
+
 test "version constant" {
     try std.testing.expectEqualStrings("0.0.0", version);
 }
