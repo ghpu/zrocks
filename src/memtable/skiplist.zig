@@ -10,69 +10,268 @@
 //! spliced-in node is guaranteed to also observe that node's fully-written key
 //! and `next` array.  (Tests here are single-threaded; the atomics encode the
 //! design invariant.)
-
-// STUB for the RED phase — intentionally unimplemented so the spec tests fail
-// for the right reason.
+//!
+//! Standalone test note (Zig 0.16): this file uses `../util/...` imports, which
+//! resolve when it is compiled as part of the `src`-rooted `zrocks` module
+//! (`zig build test`).  A bare `zig test src/memtable/skiplist.zig` roots the
+//! module at `src/memtable/`, so `../util/` falls "outside module path" and is
+//! rejected.  To run the suite standalone, root the module at `src/`, e.g.:
+//!   printf 'test { _ = @import("memtable/skiplist.zig"); }' > src/_t.zig \
+//!     && zig test src/_t.zig && rm src/_t.zig
 
 const std = @import("std");
 const arena = @import("../util/arena.zig");
 const comparator = @import("../util/comparator.zig");
 
-pub const SkipList = struct {
-    pub const kMaxHeight = 12;
+/// One next-pointer slot.  `?*Node` (a single pointer / usize) is naturally
+/// lock-free on every target we care about.
+const AtomicLink = std.atomic.Value(?*Node);
 
-    pub fn init(a: *arena.Arena, cmp: comparator.Comparator, seed: u64) SkipList {
-        _ = a;
-        _ = cmp;
-        _ = seed;
-        @panic("unimplemented");
+/// A skiplist node.
+///
+/// # Arena memory layout (single allocation per node)
+/// Each node is one arena allocation laid out as:
+///
+///     [ Node header ][ next[0] ][ next[1] ] … [ next[height-1] ]
+///
+/// i.e. a `Node` struct immediately followed, in the same arena block, by a
+/// `height`-element flexible array of `AtomicLink`.  We size the allocation as
+///   @sizeOf(Node) + height * @sizeOf(AtomicLink)
+/// aligned to `@max(@alignOf(Node), @alignOf(AtomicLink))`, then reach the
+/// inline array via `next_base()` (pointer arithmetic past the header).  The
+/// key bytes are a SEPARATE arena allocation (copied in on insert); the node
+/// stores that owned slice.  Nothing is ever individually freed — the whole
+/// arena is released at once.
+const Node = struct {
+    /// Owned (arena-copied) key bytes.
+    key: []const u8,
+    /// Node height; the inline `next[]` array has exactly this many slots.
+    height: usize,
+
+    /// Pointer to the inline `next[]` array that follows this header.
+    fn nextBase(self: *Node) [*]AtomicLink {
+        const raw: [*]u8 = @ptrCast(self);
+        const off = std.mem.alignForward(usize, @sizeOf(Node), @alignOf(AtomicLink));
+        return @alignCast(@ptrCast(raw + off));
     }
 
+    /// Read `next[level]` with acquire ordering (reader side).
+    fn next(self: *Node, level: usize) ?*Node {
+        std.debug.assert(level < self.height);
+        return self.nextBase()[level].load(.acquire);
+    }
+
+    /// Publish `next[level]` with release ordering (writer side).
+    fn setNext(self: *Node, level: usize, x: ?*Node) void {
+        std.debug.assert(level < self.height);
+        self.nextBase()[level].store(x, .release);
+    }
+
+    /// Non-atomic store used only during node construction, before the node is
+    /// linked into the list and thus before any reader can observe it.
+    fn setNextRaw(self: *Node, level: usize, x: ?*Node) void {
+        std.debug.assert(level < self.height);
+        self.nextBase()[level] = AtomicLink.init(x);
+    }
+};
+
+pub const SkipList = struct {
+    pub const kMaxHeight = 12;
+    /// Branching factor: ~1/kBranching chance to grow one more level.
+    const kBranching = 4;
+
+    arena: *arena.Arena,
+    cmp: comparator.Comparator,
+    head: *Node,
+    /// Current height of the entire list (1..=kMaxHeight); only ever grows.
+    /// Atomic because a reader may read it while the writer raises it.
+    max_height: std.atomic.Value(usize),
+    rnd: std.Random.DefaultPrng,
+
+    pub fn init(a: *arena.Arena, cmp: comparator.Comparator, seed: u64) SkipList {
+        // The head sentinel is a full-height node with an empty key; its key is
+        // never compared (we never call cmp on the head).
+        const head = newNode(a, &.{}, kMaxHeight) catch
+            @panic("skiplist: arena OOM constructing head");
+        return .{
+            .arena = a,
+            .cmp = cmp,
+            .head = head,
+            .max_height = std.atomic.Value(usize).init(1),
+            .rnd = std.Random.DefaultPrng.init(seed),
+        };
+    }
+
+    /// Allocate a node of the given height from the arena, copying nothing for
+    /// the key (caller passes an already-owned slice — empty for the head).
+    /// `next[]` slots are initialised to null (raw, pre-publication).
+    fn newNode(a: *arena.Arena, owned_key: []const u8, height: usize) !*Node {
+        std.debug.assert(height >= 1 and height <= kMaxHeight);
+        const align_ = @max(@alignOf(Node), @alignOf(AtomicLink));
+        const header = std.mem.alignForward(usize, @sizeOf(Node), @alignOf(AtomicLink));
+        const total = header + height * @sizeOf(AtomicLink);
+        const raw = try a.allocAligned(total, align_);
+        const node: *Node = @alignCast(@ptrCast(raw.ptr));
+        node.* = .{ .key = owned_key, .height = height };
+        var l: usize = 0;
+        while (l < height) : (l += 1) node.setNextRaw(l, null);
+        return node;
+    }
+
+    fn currentHeight(self: *const SkipList) usize {
+        return self.max_height.load(.acquire);
+    }
+
+    /// Roll a random height in 1..=kMaxHeight (1/kBranching per extra level).
+    fn randomHeight(self: *SkipList) usize {
+        var height: usize = 1;
+        while (height < kMaxHeight and
+            self.rnd.random().intRangeLessThan(u32, 0, kBranching) == 0) : (height += 1)
+        {}
+        return height;
+    }
+
+    /// key < node.key ?  (node must not be the head sentinel.)
+    fn keyIsAfterNode(self: *const SkipList, key: []const u8, n: ?*Node) bool {
+        // True iff n is non-null and n.key < key.
+        return (n != null) and (self.cmp.compare(n.?.key, key) == .lt);
+    }
+
+    /// Find the first node whose key is >= `key`.  If `prev` is non-null it is
+    /// filled (length kMaxHeight) with, for each level, the last node that
+    /// precedes the returned position — exactly what `insert` needs to splice.
+    fn findGreaterOrEqual(self: *const SkipList, key: []const u8, prev: ?[]*Node) ?*Node {
+        var x: *Node = self.head;
+        var level: usize = self.currentHeight() - 1;
+        while (true) {
+            const nxt = x.next(level);
+            if (self.keyIsAfterNode(key, nxt)) {
+                // key > nxt.key — keep moving right on this level.
+                x = nxt.?;
+            } else {
+                // nxt is null or nxt.key >= key — drop down (or stop).
+                if (prev) |p| p[level] = x;
+                if (level == 0) return nxt;
+                level -= 1;
+            }
+        }
+    }
+
+    /// Find the last node whose key is strictly < `key` (the head if none).
+    fn findLessThan(self: *const SkipList, key: []const u8) *Node {
+        var x: *Node = self.head;
+        var level: usize = self.currentHeight() - 1;
+        while (true) {
+            const nxt = x.next(level);
+            // Advance while nxt exists and nxt.key < key.
+            if (nxt != null and self.cmp.compare(nxt.?.key, key) == .lt) {
+                x = nxt.?;
+            } else {
+                if (level == 0) return x;
+                level -= 1;
+            }
+        }
+    }
+
+    /// Find the last node in the list (the head if the list is empty).
+    fn findLast(self: *const SkipList) *Node {
+        var x: *Node = self.head;
+        var level: usize = self.currentHeight() - 1;
+        while (true) {
+            const nxt = x.next(level);
+            if (nxt) |n| {
+                x = n;
+            } else {
+                if (level == 0) return x;
+                level -= 1;
+            }
+        }
+    }
+
+    /// Insert `key`, copying its bytes into the arena.  Assumes no equal key is
+    /// already present (the MemTable guarantees uniqueness via sequence nums).
     pub fn insert(self: *SkipList, key: []const u8) !void {
-        _ = self;
-        _ = key;
-        @panic("unimplemented");
+        var prev: [kMaxHeight]*Node = undefined;
+        const x = self.findGreaterOrEqual(key, prev[0..]);
+
+        // Debug-only uniqueness check.
+        std.debug.assert(x == null or self.cmp.compare(x.?.key, key) != .eq);
+
+        const height = self.randomHeight();
+        const cur = self.currentHeight();
+        if (height > cur) {
+            // New levels point down from the head.  Safe to publish: a
+            // concurrent reader that observes the raised height will also
+            // observe head.next[level] == this new node (set below); one that
+            // reads the old height simply never visits the new levels.
+            var l = cur;
+            while (l < height) : (l += 1) prev[l] = self.head;
+            self.max_height.store(height, .release);
+        }
+
+        const owned_key = try self.arena.alloc(key.len);
+        @memcpy(owned_key, key);
+        const node = try newNode(self.arena, owned_key, height);
+
+        // Splice in bottom-up.  We set this node's next pointers first (no
+        // reader can see `node` yet), then publish each predecessor's link with
+        // release ordering.
+        var l: usize = 0;
+        while (l < height) : (l += 1) {
+            node.setNextRaw(l, prev[l].next(l));
+            prev[l].setNext(l, node);
+        }
     }
 
     pub fn contains(self: *const SkipList, key: []const u8) bool {
-        _ = self;
-        _ = key;
-        @panic("unimplemented");
+        const x = self.findGreaterOrEqual(key, null);
+        return x != null and self.cmp.compare(x.?.key, key) == .eq;
     }
 
+    /// Forward+backward cursor over the skiplist.  `prev()` is implemented by
+    /// re-search (`findLessThan`), matching LevelDB.
     pub const Iterator = struct {
+        list: *const SkipList,
+        node: ?*Node,
+
         pub fn init(list: *const SkipList) Iterator {
-            _ = list;
-            @panic("unimplemented");
+            return .{ .list = list, .node = null };
         }
+
         pub fn valid(self: *const Iterator) bool {
-            _ = self;
-            @panic("unimplemented");
+            return self.node != null;
         }
+
         pub fn key(self: *const Iterator) []const u8 {
-            _ = self;
-            @panic("unimplemented");
+            std.debug.assert(self.valid());
+            return self.node.?.key;
         }
+
         pub fn next(self: *Iterator) void {
-            _ = self;
-            @panic("unimplemented");
+            std.debug.assert(self.valid());
+            self.node = self.node.?.next(0);
         }
+
+        /// Move to the last node with key < current key (re-search). Becomes
+        /// invalid when stepping before the first node.
         pub fn prev(self: *Iterator) void {
-            _ = self;
-            @panic("unimplemented");
+            std.debug.assert(self.valid());
+            const p = self.list.findLessThan(self.node.?.key);
+            self.node = if (p == self.list.head) null else p;
         }
+
         pub fn seekToFirst(self: *Iterator) void {
-            _ = self;
-            @panic("unimplemented");
+            self.node = self.list.head.next(0);
         }
+
         pub fn seekToLast(self: *Iterator) void {
-            _ = self;
-            @panic("unimplemented");
+            const p = self.list.findLast();
+            self.node = if (p == self.list.head) null else p;
         }
+
+        /// Position at the first node with key >= `target`.
         pub fn seek(self: *Iterator, target: []const u8) void {
-            _ = self;
-            _ = target;
-            @panic("unimplemented");
+            self.node = self.list.findGreaterOrEqual(target, null);
         }
     };
 };
