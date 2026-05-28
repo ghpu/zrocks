@@ -43,6 +43,13 @@ pub const Iterator = struct {
         key: *const fn (ctx: *anyopaque) []const u8,
         value: *const fn (ctx: *anyopaque) []const u8,
         status: *const fn (ctx: *anyopaque) ?anyerror,
+        /// Optional destructor for the backing source.  DEFAULTED to null so
+        /// existing vtable literals (e.g. VectorIterator) keep compiling and
+        /// remain no-op on `deinit`.  Sources whose construction allocates (the
+        /// SST table-iterator adapter, the combinators) set this so a generic
+        /// `Iterator` value can be torn down uniformly — `MergingIterator` and
+        /// `TwoLevelIterator` propagate `deinit` to their child iterators.
+        deinit: ?*const fn (ctx: *anyopaque) void = null,
     };
 
     // Thin method wrappers --------------------------------------------------
@@ -90,6 +97,13 @@ pub const Iterator = struct {
     /// First error encountered while positioning, or null if healthy.
     pub fn status(self: Iterator) ?anyerror {
         return self.vtable.status(self.ctx);
+    }
+
+    /// Release the backing source.  A no-op when the source registered no
+    /// `deinit` (e.g. VectorIterator, whose bytes are caller-owned).  After
+    /// calling this the iterator must not be used again.
+    pub fn deinit(self: Iterator) void {
+        if (self.vtable.deinit) |d| d(self.ctx);
     }
 };
 
@@ -308,4 +322,62 @@ test "VectorIterator: empty" {
     it.seek("anything");
     try testing.expect(!it.valid());
     try testing.expectEqual(@as(?anyerror, null), it.status());
+}
+
+test "Iterator.deinit: no-op when vtable.deinit is null (VectorIterator)" {
+    const entries = [_]VectorIterator.Entry{ e("a", "1") };
+    var vi = VectorIterator.init(&entries);
+    const it = vi.iterator(comparator.bytewise);
+    // VectorIterator registers no deinit; calling it must be a harmless no-op.
+    it.deinit();
+}
+
+// A test source whose `deinit` flips a caller-visible flag, used to assert that
+// destroying a combinator propagates `deinit` to every child.
+const FlagIterator = struct {
+    deinited: *bool,
+
+    fn iterator(self: *FlagIterator) Iterator {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+
+    const vtable = Iterator.VTable{
+        .seekToFirst = noopSelf,
+        .seekToLast = noopSelf,
+        .seek = noopSeek,
+        .next = noopSelf,
+        .prev = noopSelf,
+        .valid = retFalse,
+        .key = retEmpty,
+        .value = retEmpty,
+        .status = retNull,
+        .deinit = doDeinit,
+    };
+
+    fn cast(ctx: *anyopaque) *FlagIterator {
+        return @ptrCast(@alignCast(ctx));
+    }
+    fn noopSelf(_: *anyopaque) void {}
+    fn noopSeek(_: *anyopaque, _: []const u8) void {}
+    fn retFalse(_: *anyopaque) bool {
+        return false;
+    }
+    fn retEmpty(_: *anyopaque) []const u8 {
+        return "";
+    }
+    fn retNull(_: *anyopaque) ?anyerror {
+        return null;
+    }
+    fn doDeinit(ctx: *anyopaque) void {
+        cast(ctx).deinited.* = true;
+    }
+};
+
+test "Iterator.deinit: invokes the registered destructor" {
+    var flag = false;
+    var fi = FlagIterator{ .deinited = &flag };
+    const it = fi.iterator();
+    try testing.expect(!flag);
+    it.deinit();
+    try testing.expect(flag);
 }

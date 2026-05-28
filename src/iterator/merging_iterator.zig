@@ -50,7 +50,12 @@ pub const MergingIterator = struct {
         };
     }
 
+    /// Destroy this merging iterator: tear down every child `Iterator` (so a
+    /// merging iterator built over wrapped table iterators frees them) and free
+    /// the owned children buffer.  A child whose source registered no `deinit`
+    /// is left untouched (the VectorIterator case in tests).
     pub fn deinit(self: *MergingIterator) void {
+        // RED: does not yet propagate deinit to children.
         self.gpa.free(self.children);
         self.* = undefined;
     }
@@ -116,7 +121,20 @@ pub const MergingIterator = struct {
         .key = keyImpl,
         .value = valueImpl,
         .status = statusImpl,
+        .deinit = deinitImpl,
     };
+
+    /// Generic-Iterator destructor: tear down children + free the children
+    /// buffer AND the heap-allocated MergingIterator itself.  This is reached
+    /// only when a MergingIterator is handed out as a generic `Iterator` (e.g.
+    /// nested as a child of another combinator); in that case the struct must
+    /// have been heap-allocated with `self.gpa` so we can destroy it here.
+    fn deinitImpl(ctx: *anyopaque) void {
+        const self = cast(ctx);
+        const gpa = self.gpa;
+        self.deinit();
+        gpa.destroy(self);
+    }
 
     fn seekToFirstImpl(ctx: *anyopaque) void {
         const self = cast(ctx);
@@ -436,6 +454,63 @@ test "MergingIterator: reverse then forward direction switch" {
     try testing.expectEqualStrings("d", it.key());
     it.next();
     try testing.expect(!it.valid());
+}
+
+// A test source whose `deinit` flips a caller-visible flag, used to assert that
+// MergingIterator.deinit propagates `deinit` to every child.
+const FlagIterator = struct {
+    deinited: *bool,
+
+    fn iterator(self: *FlagIterator) Iterator {
+        return .{ .ctx = self, .vtable = &fvtable };
+    }
+
+    const fvtable = Iterator.VTable{
+        .seekToFirst = noopSelf,
+        .seekToLast = noopSelf,
+        .seek = noopSeek,
+        .next = noopSelf,
+        .prev = noopSelf,
+        .valid = retFalse,
+        .key = retEmpty,
+        .value = retEmpty,
+        .status = retNull,
+        .deinit = doDeinit,
+    };
+
+    fn cast(ctx: *anyopaque) *FlagIterator {
+        return @ptrCast(@alignCast(ctx));
+    }
+    fn noopSelf(_: *anyopaque) void {}
+    fn noopSeek(_: *anyopaque, _: []const u8) void {}
+    fn retFalse(_: *anyopaque) bool {
+        return false;
+    }
+    fn retEmpty(_: *anyopaque) []const u8 {
+        return "";
+    }
+    fn retNull(_: *anyopaque) ?anyerror {
+        return null;
+    }
+    fn doDeinit(ctx: *anyopaque) void {
+        cast(ctx).deinited.* = true;
+    }
+};
+
+test "MergingIterator: deinit propagates to every child" {
+    const gpa = testing.allocator;
+    var f0 = false;
+    var f1 = false;
+    var f2 = false;
+    var c0 = FlagIterator{ .deinited = &f0 };
+    var c1 = FlagIterator{ .deinited = &f1 };
+    var c2 = FlagIterator{ .deinited = &f2 };
+    const children = [_]Iterator{ c0.iterator(), c1.iterator(), c2.iterator() };
+    var mi = try MergingIterator.init(gpa, comparator.bytewise, &children);
+    mi.deinit();
+    try testing.expect(f0);
+    try testing.expect(f1);
+    try testing.expect(f2);
 }
 
 test "MergingIterator: forward then reverse direction switch" {
