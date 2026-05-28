@@ -53,6 +53,7 @@ pub const snapshot = @import("db/snapshot.zig");
 pub const checkpoint = @import("rocks/checkpoint.zig");
 pub const prefix = @import("rocks/prefix.zig");
 pub const merge_operator = @import("rocks/merge_operator.zig");
+pub const compaction_filter = @import("rocks/compaction_filter.zig");
 
 // Version / MANIFEST (Phase 5).
 pub const version_edit = @import("version/version_edit.zig");
