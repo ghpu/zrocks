@@ -46,6 +46,7 @@ pub const db_iter = @import("db/db_iter.zig");
 pub const write_path = @import("db/write_path.zig");
 pub const recovery = @import("db/recovery.zig");
 pub const flush = @import("db/flush.zig");
+pub const compaction = @import("db/compaction.zig");
 pub const snapshot = @import("db/snapshot.zig");
 
 // Version / MANIFEST (Phase 5).
