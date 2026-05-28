@@ -139,11 +139,15 @@ pub const BlockBuilder = struct {
 
 pub const Block = struct {
     data: []const u8,
+    /// Allocator used by iterators to grow their reconstructed-key buffer.
+    gpa: std.mem.Allocator,
     /// Byte offset where the restart array begins.
     restart_offset: usize,
     num_restarts: u32,
 
-    pub fn init(data: []const u8) !Block {
+    /// Parse a block from raw bytes. Iterators over this block allocate their
+    /// reconstructed-key buffer from `gpa`.
+    pub fn init(gpa: std.mem.Allocator, data: []const u8) !Block {
         // Minimum block: at least the trailing fixed32 restart count.
         if (data.len < @sizeOf(u32)) return error.Corruption;
         const count_bytes: *const [4]u8 = data[data.len - 4 ..][0..4];
@@ -157,6 +161,7 @@ pub const Block = struct {
         const restart_offset = data.len - (@as(usize, 1) + num_restarts) * @sizeOf(u32);
         return .{
             .data = data,
+            .gpa = gpa,
             .restart_offset = restart_offset,
             .num_restarts = num_restarts,
         };
@@ -181,34 +186,51 @@ pub const Block = struct {
     pub const Iter = struct {
         block: *const Block,
         cmp: comparator.Comparator,
-        /// Offset of the current entry within [0, restart_offset). When
-        /// current == restart_offset the iterator is invalid (past end).
+        gpa: std.mem.Allocator,
+        /// Offset of the CURRENT entry within [0, restart_offset). When
+        /// current >= restart_offset the iterator is invalid (past end).
         current: usize,
-        /// Offset of the entry that opened the restart region we are scanning.
+        /// Offset just past the current entry (where the next entry begins).
+        next_offset: usize,
+        /// Index of the restart point at/below the current entry.
         restart_index: u32,
         /// Reconstructed full key of the current entry.
         key_buf: std.ArrayListUnmanaged(u8),
         /// Value slice of the current entry (points into block.data).
         value_slice: []const u8,
-        /// An allocation/parse error encountered while iterating, if any.
+        /// A parse/allocation error encountered while iterating, if any.
         err: ?Error,
-        gpa: std.mem.Allocator,
+
+        /// Decoded entry header at a given offset.
+        const EntryHeader = struct {
+            shared: u32,
+            non_shared: u32,
+            value_len: u32,
+            /// Offset of the key-delta bytes (immediately after the header).
+            key_delta_offset: usize,
+        };
 
         pub fn init(block: *const Block, cmp: comparator.Comparator) Iter {
             return .{
                 .block = block,
                 .cmp = cmp,
-                .current = block.restart_offset, // invalid until positioned
+                .gpa = block.gpa,
+                .current = invalidOffset(block), // invalid until positioned
+                .next_offset = 0,
                 .restart_index = 0,
                 .key_buf = .empty,
                 .value_slice = &.{},
                 .err = null,
-                .gpa = std.testing.allocator,
             };
         }
 
         pub fn deinit(self: *Iter) void {
             self.key_buf.deinit(self.gpa);
+        }
+
+        /// A sentinel "invalid" offset: anything >= restart_offset.
+        fn invalidOffset(block: *const Block) usize {
+            return block.restart_offset;
         }
 
         pub fn valid(self: *const Iter) bool {
@@ -225,25 +247,171 @@ pub const Block = struct {
             return self.value_slice;
         }
 
+        // -------------------------------------------------------------------
+        // Entry decoding
+        // -------------------------------------------------------------------
+
+        /// Decode the entry header starting at `offset` (must be < restart_offset).
+        fn decodeHeader(self: *Iter, offset: usize) Error!EntryHeader {
+            var input: []const u8 = self.block.data[offset..self.block.restart_offset];
+            const shared = try coding.getVarint32(&input);
+            const non_shared = try coding.getVarint32(&input);
+            const value_len = try coding.getVarint32(&input);
+            // input now points just past the header; compute its absolute offset.
+            const consumed = self.block.restart_offset - offset - input.len;
+            const key_delta_offset = offset + consumed;
+            // Bounds: key delta + value must fit before the restart array.
+            const total = @as(usize, non_shared) + @as(usize, value_len);
+            if (key_delta_offset + total > self.block.restart_offset) {
+                return error.Corruption;
+            }
+            return .{
+                .shared = shared,
+                .non_shared = non_shared,
+                .value_len = value_len,
+                .key_delta_offset = key_delta_offset,
+            };
+        }
+
+        /// Parse the entry at `offset`, reconstruct its full key into key_buf
+        /// (reusing the `shared` prefix already present), and set value_slice.
+        /// Advances next_offset past this entry. On error, sets self.err.
+        fn parseEntryAt(self: *Iter, offset: usize) void {
+            const h = self.decodeHeader(offset) catch |e| {
+                self.err = e;
+                self.current = invalidOffset(self.block);
+                return;
+            };
+            // `shared` must not exceed the previously reconstructed key length.
+            if (h.shared > self.key_buf.items.len) {
+                self.err = error.Corruption;
+                self.current = invalidOffset(self.block);
+                return;
+            }
+            // key = key_buf[0..shared] ++ delta
+            self.key_buf.shrinkRetainingCapacity(h.shared);
+            const delta = self.block.data[h.key_delta_offset..][0..h.non_shared];
+            self.key_buf.appendSlice(self.gpa, delta) catch {
+                self.err = error.Corruption;
+                self.current = invalidOffset(self.block);
+                return;
+            };
+            const val_offset = h.key_delta_offset + h.non_shared;
+            self.value_slice = self.block.data[val_offset..][0..h.value_len];
+            self.current = offset;
+            self.next_offset = val_offset + h.value_len;
+        }
+
+        /// Reset key reconstruction state to the start of restart point `index`
+        /// and parse its first entry.
+        fn seekToRestartPoint(self: *Iter, index: u32) void {
+            self.key_buf.clearRetainingCapacity();
+            self.restart_index = index;
+            const off = self.block.restartPoint(index);
+            self.parseEntryAt(off);
+        }
+
+        // -------------------------------------------------------------------
+        // Positioning
+        // -------------------------------------------------------------------
+
         pub fn seekToFirst(self: *Iter) void {
-            _ = self;
-            @panic("unimplemented");
+            self.err = null;
+            if (self.block.num_restarts == 0 or self.block.restart_offset == 0) {
+                // Empty block: nothing to iterate.
+                self.current = invalidOffset(self.block);
+                return;
+            }
+            self.seekToRestartPoint(0);
         }
 
         pub fn seekToLast(self: *Iter) void {
-            _ = self;
-            @panic("unimplemented");
-        }
-
-        pub fn seek(self: *Iter, target: []const u8) void {
-            _ = self;
-            _ = target;
-            @panic("unimplemented");
+            self.err = null;
+            if (self.block.num_restarts == 0 or self.block.restart_offset == 0) {
+                self.current = invalidOffset(self.block);
+                return;
+            }
+            // Position at the last restart point, then scan to the final entry.
+            self.seekToRestartPoint(self.block.num_restarts - 1);
+            while (self.err == null and self.next_offset < self.block.restart_offset) {
+                self.parseEntryAt(self.next_offset);
+            }
         }
 
         pub fn next(self: *Iter) void {
-            _ = self;
-            @panic("unimplemented");
+            std.debug.assert(self.valid());
+            if (self.next_offset >= self.block.restart_offset) {
+                // Past the last entry.
+                self.current = invalidOffset(self.block);
+                return;
+            }
+            // Advance restart_index if we crossed into the next restart region.
+            const next_off = self.next_offset;
+            while (self.restart_index + 1 < self.block.num_restarts and
+                self.block.restartPoint(self.restart_index + 1) <= next_off)
+            {
+                self.restart_index += 1;
+            }
+            self.parseEntryAt(next_off);
+        }
+
+        /// Binary-search the restart array for the last restart whose first key
+        /// is <= target, then linear-scan forward to the first entry whose key
+        /// is >= target.
+        pub fn seek(self: *Iter, target: []const u8) void {
+            self.err = null;
+            if (self.block.num_restarts == 0 or self.block.restart_offset == 0) {
+                self.current = invalidOffset(self.block);
+                return;
+            }
+
+            // Binary search: find the largest restart index whose first key < target.
+            // Invariant: keys at restart[left].. are all < target after the loop is
+            // resolved; we seek to `left` then linear-scan. Use LevelDB's variant:
+            // find the last restart with key < target.
+            var left: u32 = 0;
+            var right: u32 = self.block.num_restarts - 1;
+            while (left < right) {
+                // Bias the midpoint upward so the loop makes progress.
+                const mid = (left + right + 1) / 2;
+                const region_key = self.firstKeyAtRestart(mid) catch {
+                    // Corrupt: bail out invalid.
+                    self.current = invalidOffset(self.block);
+                    return;
+                };
+                if (self.cmp.compare(region_key, target) == .lt) {
+                    // region_key < target -> answer is in [mid, right].
+                    left = mid;
+                } else {
+                    // region_key >= target -> answer is in [left, mid-1].
+                    right = mid - 1;
+                }
+            }
+
+            // Linear scan from restart point `left`.
+            self.seekToRestartPoint(left);
+            while (self.err == null and self.valid()) {
+                if (self.cmp.compare(self.key_buf.items, target) != .lt) {
+                    // key >= target -> found.
+                    return;
+                }
+                if (self.next_offset >= self.block.restart_offset) {
+                    // Reached the end without finding key >= target.
+                    self.current = invalidOffset(self.block);
+                    return;
+                }
+                self.next();
+            }
+        }
+
+        /// Reconstruct the first (full) key stored at restart point `index`.
+        /// Restart points always store shared=0, so the delta is the full key.
+        fn firstKeyAtRestart(self: *Iter, index: u32) Error![]const u8 {
+            const off = self.block.restartPoint(index);
+            const h = try self.decodeHeader(off);
+            // A restart entry stores the full key (shared == 0).
+            if (h.shared != 0) return error.Corruption;
+            return self.block.data[h.key_delta_offset..][0..h.non_shared];
         }
     };
 };
@@ -292,7 +460,7 @@ test "round-trip: build then iterate reproduces added pairs in order" {
     const data = try buildBlock(gpa, 2, &pairs);
     defer gpa.free(data);
 
-    const block = try Block.init(data);
+    const block = try Block.init(gpa, data);
     var iter = block.iterator(comparator.bytewise);
     defer iter.deinit();
 
@@ -320,7 +488,7 @@ test "shared-prefix reconstruction: keys equal originals" {
     const data = try buildBlock(gpa, 3, &pairs);
     defer gpa.free(data);
 
-    const block = try Block.init(data);
+    const block = try Block.init(gpa, data);
     var iter = block.iterator(comparator.bytewise);
     defer iter.deinit();
 
@@ -352,7 +520,7 @@ test "seek: present key, between key, past end, before first" {
     const data = try buildBlock(gpa, 2, &pairs);
     defer gpa.free(data);
 
-    const block = try Block.init(data);
+    const block = try Block.init(gpa, data);
     var iter = block.iterator(comparator.bytewise);
     defer iter.deinit();
 
@@ -402,7 +570,7 @@ test "seek: binary search lands correctly around restart boundaries" {
     const data = try buildBlock(gpa, 2, &pairs);
     defer gpa.free(data);
 
-    const block = try Block.init(data);
+    const block = try Block.init(gpa, data);
     try testing.expect(block.num_restarts >= 3);
 
     var iter = block.iterator(comparator.bytewise);
@@ -433,7 +601,7 @@ test "seekToLast lands on the final entry" {
     const data = try buildBlock(gpa, 2, &pairs);
     defer gpa.free(data);
 
-    const block = try Block.init(data);
+    const block = try Block.init(gpa, data);
     var iter = block.iterator(comparator.bytewise);
     defer iter.deinit();
 
@@ -449,7 +617,7 @@ test "single-entry block" {
     const data = try buildBlock(gpa, 2, &pairs);
     defer gpa.free(data);
 
-    const block = try Block.init(data);
+    const block = try Block.init(gpa, data);
     var iter = block.iterator(comparator.bytewise);
     defer iter.deinit();
 
@@ -471,7 +639,7 @@ test "empty block: finish with no adds, iterate is invalid" {
     const data = try gpa.dupe(u8, block_bytes);
     defer gpa.free(data);
 
-    const block = try Block.init(data);
+    const block = try Block.init(gpa, data);
     var iter = block.iterator(comparator.bytewise);
     defer iter.deinit();
 
@@ -499,7 +667,7 @@ test "BlockBuilder reset reuses the builder" {
     const data = try gpa.dupe(u8, b.finish());
     defer gpa.free(data);
 
-    const block = try Block.init(data);
+    const block = try Block.init(gpa, data);
     var iter = block.iterator(comparator.bytewise);
     defer iter.deinit();
     iter.seekToFirst();
@@ -520,5 +688,5 @@ test "currentSizeEstimate grows with entries" {
 }
 
 test "Block.init rejects too-small data" {
-    try testing.expectError(error.Corruption, Block.init(&.{ 0x00, 0x01 }));
+    try testing.expectError(error.Corruption, Block.init(std.testing.allocator, &.{ 0x00, 0x01 }));
 }
