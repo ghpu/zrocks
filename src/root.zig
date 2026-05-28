@@ -26,6 +26,12 @@ pub const write_batch = @import("format/write_batch.zig");
 pub const skiplist = @import("memtable/skiplist.zig");
 pub const memtable = @import("memtable/memtable.zig");
 
+// Block-based SST table format (Phase 3).
+pub const block = @import("format/block.zig");
+pub const bloom = @import("format/bloom.zig");
+pub const filter_block = @import("format/filter_block.zig");
+pub const footer = @import("format/footer.zig");
+
 test "version constant" {
     try std.testing.expectEqualStrings("0.0.0", version);
 }

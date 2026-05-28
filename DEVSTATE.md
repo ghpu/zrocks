@@ -4,11 +4,11 @@ zig_binary: /home/ghpu/zig/zig
 stdlib: /home/ghpu/zig/lib/std
 target_rocksdb: "9.x line; block-based table format_version 5; legacy WAL/MANIFEST log (see docs/adr/000-target-format.md)"
 active_phase: P3
-active_milestone: "M3.0 Block, M3.1 Bloom/filter, M3.2 Footer (parallel wave 1)"
-last_completed: M2.1 WriteBatch, M2.4 MemTable (Phase 2 COMPLETE)
-worktrees: "m3.0-block, m3.1-bloom, m3.2-footer (see `git worktree list`)"
+active_milestone: "M3.3 TableBuilder"
+last_completed: M3.0 Block, M3.1 Bloom/filter, M3.2 Footer (Phase 3 wave 1)
+worktrees: "m3.3-table-builder"
 test_command: "/home/ghpu/zig/zig build test"
-test_count: 158
+test_count: 189
 updated: 2026-05-28
 ---
 
@@ -39,10 +39,10 @@ RocksDB reference: https://github.com/facebook/rocksdb/wiki
 - [x] M2.4 MemTable                   (src/memtable/memtable.zig)
 
 ### Phase 3 — Block-based table (SST)
-- [ ] M3.0 Block builder/reader
-- [ ] M3.1 Bloom filter + filter block
-- [ ] M3.2 Footer & BlockHandle
-- [ ] M3.3 TableBuilder
+- [x] M3.0 Block builder/reader        (src/format/block.zig)
+- [x] M3.1 Bloom filter + filter block (src/format/bloom.zig, filter_block.zig)
+- [x] M3.2 Footer & BlockHandle        (src/format/footer.zig)
+- [~] M3.3 TableBuilder  <-- ACTIVE
 - [ ] M3.4 TableReader
 - [ ] M3.5 LRU block cache + table cache
 
@@ -71,18 +71,17 @@ RocksDB reference: https://github.com/facebook/rocksdb/wiki
 - [ ] M7.6 Transactions (optimistic + pessimistic)
 - [ ] M7.7 Checkpoints
 
-## Active: Phase 3 — Block-based SST table (wave 1, parallel)
-- M3.0 Block builder/reader (O) — prefix-compressed entries + restart points + binary search. New: src/format/block.zig. Deps: coding, comparator.
-- M3.1 Bloom filter + filter block (O) — RocksDB-compatible full filter; no false negatives. New: src/format/bloom.zig, filter_block.zig. Deps: coding.
-- M3.2 Footer & BlockHandle (S) — varint BlockHandle + 53-byte footer (format_version 5, magic 0x88e241b785f4cff7). New: src/format/footer.zig. Deps: coding.
-- Independent (distinct files); parallel worktrees, src-rooted verify, root.zig wired at merge.
+## Active: Phase 3 — SST table assembly (sequential: M3.3 → M3.4 → M3.5)
+- M3.3 TableBuilder (O) — needs M3.0 block + M3.1 filter_block + M3.2 footer + crc32c + env. New: src/format/table_builder.zig. Writes data blocks (kNoCompression) + filter block + metaindex + index + footer, each block followed by `[type:u8][crc32c:u32]` trailer (masked CRC32C over block+type byte). Index block: one entry per data block, key = shortest separator, value = BlockHandle. Metaindex: "filter.<policy name>" -> filter BlockHandle.
+- M3.4 TableReader (O) — needs M3.3. Open via footer, read+verify blocks via Env RandomAccessFile.readAt, two-level iterator (index block -> data block), bloom shortcut on get. ROUND-TRIP vs builder is the key gate.
+- M3.5 LRU block cache + table cache (O) — needs M3.4.
+- NOTE (M3.0): Block.init takes (gpa, data); Block.Iter heap-grows a key buffer and needs Iter.deinit — TableReader must manage Iter lifetimes.
 
 ## Next steps (ordered)
-1. Integrate wave 1 {M3.0, M3.1, M3.2} as they land.
-2. M3.3 TableBuilder (O) — needs M3.0+M3.1+M3.2+crc32c+env; writes data/filter/metaindex/index/footer with per-block CRC32C, kNoCompression.
-3. M3.4 TableReader (O) — needs M3.3; footer open, two-level iterator via RandomAccessFile.readAt, bloom shortcut, CRC verify; ROUND-TRIP vs builder.
-4. M3.5 LRU block cache + table cache (O) — needs M3.4.
-5. Phase 3 done → Phase 4 (iterators + in-memory DB).
+1. M3.3 TableBuilder (solo, Opus) → integrate.
+2. M3.4 TableReader (solo, Opus) → integrate (round-trip gate).
+3. M3.5 cache (solo, Opus) → integrate. Phase 3 done.
+4. Phase 4 — iterators + in-memory DB (M4.0 Iterator/merging/two-level, M4.1 in-memory DB Put/Get/Delete/Write/iter over WAL+MemTable).
 
 ## Decision log (ADR pointers)
 - ADR-000: RocksDB format target pinned (format_version 5 SST, legacy WAL/MANIFEST, CRC32C mask). docs/adr/000-target-format.md
