@@ -117,6 +117,7 @@ pub const Env = struct {
 
     pub const VTable = struct {
         newWritableFile: *const fn (ptr: *anyopaque, gpa: std.mem.Allocator, path: []const u8) Error!WritableFile,
+        newAppendableFile: *const fn (ptr: *anyopaque, gpa: std.mem.Allocator, path: []const u8) Error!WritableFile,
         newSequentialFile: *const fn (ptr: *anyopaque, gpa: std.mem.Allocator, path: []const u8) Error!SequentialFile,
         newRandomAccessFile: *const fn (ptr: *anyopaque, gpa: std.mem.Allocator, path: []const u8) Error!RandomAccessFile,
         deleteFile: *const fn (ptr: *anyopaque, path: []const u8) Error!void,
@@ -133,6 +134,13 @@ pub const Env = struct {
     /// Create/truncate `path` for writing/appending.
     pub fn newWritableFile(self: Env, gpa: std.mem.Allocator, path: []const u8) Error!WritableFile {
         return self.vtable.newWritableFile(self.ptr, gpa, path);
+    }
+    /// Open `path` for APPEND: if it exists, subsequent `append` calls extend
+    /// the existing content; if it doesn't exist, behaves like
+    /// `newWritableFile` (create empty).  Used to reuse an existing WAL across
+    /// reopen so committed writes are never orphaned (M5.2 recovery).
+    pub fn newAppendableFile(self: Env, gpa: std.mem.Allocator, path: []const u8) Error!WritableFile {
+        return self.vtable.newAppendableFile(self.ptr, gpa, path);
     }
     /// Open `path` for sequential reading.
     pub fn newSequentialFile(self: Env, gpa: std.mem.Allocator, path: []const u8) Error!SequentialFile {
@@ -241,11 +249,77 @@ fn runEnvContract(env: Env, gpa: std.mem.Allocator) !void {
     try std.testing.expectError(error.NotFound, env.newSequentialFile(gpa, "bar.txt"));
 }
 
+/// `newAppendableFile` round-trip: write "abc", reopen for append + write
+/// "def", read back "abcdef".  Also verifies that appending to a missing file
+/// creates it (behaves like `newWritableFile`).
+fn runAppendableContract(env: Env, gpa: std.mem.Allocator) !void {
+    // Seed an existing file with "abc".
+    {
+        var wf = try env.newWritableFile(gpa, "app.txt");
+        errdefer wf.close() catch {};
+        try wf.append("abc");
+        try wf.close();
+    }
+
+    // Reopen for append and extend with "def".
+    {
+        var wf = try env.newAppendableFile(gpa, "app.txt");
+        errdefer wf.close() catch {};
+        try wf.append("def");
+        try wf.close();
+    }
+
+    try std.testing.expectEqual(@as(u64, 6), try env.getFileSize("app.txt"));
+    {
+        var sf = try env.newSequentialFile(gpa, "app.txt");
+        errdefer sf.close() catch {};
+        var buf: [16]u8 = undefined;
+        var total: usize = 0;
+        while (true) {
+            const n = try sf.read(buf[total..]);
+            if (n == 0) break;
+            total += n;
+        }
+        try std.testing.expectEqualStrings("abcdef", buf[0..total]);
+        try sf.close();
+    }
+
+    // newAppendableFile on a missing path creates it empty (like newWritableFile).
+    {
+        var wf = try env.newAppendableFile(gpa, "fresh.txt");
+        errdefer wf.close() catch {};
+        try wf.append("xyz");
+        try wf.close();
+    }
+    try std.testing.expectEqual(@as(u64, 3), try env.getFileSize("fresh.txt"));
+
+    try env.deleteFile("app.txt");
+    try env.deleteFile("fresh.txt");
+}
+
 test "MemEnv contract" {
     const gpa = std.testing.allocator;
     var me = MemEnv.init(gpa);
     defer me.deinit();
     try runEnvContract(me.env(), gpa);
+}
+
+test "MemEnv appendable round-trip" {
+    const gpa = std.testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    try runAppendableContract(me.env(), gpa);
+}
+
+test "RealEnv appendable round-trip" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var re = RealEnv.init(io, tmp.dir);
+    try runAppendableContract(re.env(), gpa);
 }
 
 test "RealEnv contract" {

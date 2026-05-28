@@ -29,9 +29,15 @@ const write_batch = @import("../format/write_batch.zig");
 const log_writer = @import("../format/log_writer.zig");
 const iterator = @import("../iterator/iterator.zig");
 
+const version_set = @import("../version/version_set.zig");
+const version_edit = @import("../version/version_edit.zig");
+const filename = @import("../version/filename.zig");
+const log_format = @import("../format/log_format.zig");
+
 const write_path = @import("write_path.zig");
 const db_iter = @import("db_iter.zig");
 const snapshot_mod = @import("snapshot.zig");
+const recovery = @import("recovery.zig");
 
 const Options = options_mod.Options;
 const ReadOptions = options_mod.ReadOptions;
@@ -49,17 +55,24 @@ pub const DB = struct {
     name: []u8,
     ikcmp: internal_key.InternalKeyComparator,
     mem: *MemTable,
+    versions: *version_set.VersionSet,
     wal_file: env.WritableFile,
     wal: log_writer.Writer,
     last_sequence: u64,
-    // TODO(concurrency): DB write mutex (single-threaded for M4.1).
+    // TODO(concurrency): DB write mutex (single-threaded for M4.1/M5.2).
 
-    /// Open (create) a DB rooted at directory `name` on `e`.
+    /// Open a DB rooted at directory `name` on `e`, recovering durable state.
     ///
-    /// Creates the directory (ok if it already exists), opens a fresh WAL at
-    /// `<name>/000001.log`, and starts with an empty MemTable.  No recovery /
-    /// WAL replay yet (Phase 5).  Returns a heap-allocated *DB; the caller must
-    /// eventually call `close`.
+    /// If a `CURRENT` file exists, the VersionSet is recovered from the
+    /// MANIFEST and the active WAL is replayed into the MemTable; the SAME log
+    /// is reopened for appending so subsequent writes continue in it (the
+    /// "reuse-logs" design — recovered data lives in the single MemTable kept
+    /// durable by the reused log, since there is no flush layer yet, Phase 6).
+    ///
+    /// Otherwise a fresh DB is created: the directory is made, a MANIFEST +
+    /// CURRENT are written via the VersionSet, and a new empty WAL is opened.
+    ///
+    /// Returns a heap-allocated *DB; the caller must eventually call `close`.
     pub fn open(gpa: std.mem.Allocator, e: env.Env, name: []const u8, options: Options) !*DB {
         const self = try gpa.create(DB);
         errdefer gpa.destroy(self);
@@ -78,23 +91,76 @@ pub const DB = struct {
         // Directory (no-op success if it already exists on MemEnv).
         try e.makeDir(name);
 
-        const wal_path = try std.fmt.allocPrint(gpa, "{s}/000001.log", .{name});
-        defer gpa.free(wal_path);
-
-        self.wal_file = try e.newWritableFile(gpa, wal_path);
-        errdefer self.wal_file.close() catch {};
-
         self.mem = try MemTable.init(gpa, options.comparator);
         errdefer self.mem.deinit();
 
-        self.wal = log_writer.Writer.init(self.wal_file);
+        const vs = try gpa.create(version_set.VersionSet);
+        errdefer gpa.destroy(vs);
+        vs.* = try version_set.VersionSet.init(gpa, e, name, options);
+        errdefer vs.deinit();
+        self.versions = vs;
+
+        const current_path = try filename.currentFileName(gpa, name);
+        defer gpa.free(current_path);
+
+        if (e.fileExists(current_path)) {
+            // ----- recover an existing DB -----------------------------------
+            try vs.recover();
+
+            const log_number = vs.logNumber();
+            const log_path = try filename.logFileName(gpa, name, log_number);
+            defer gpa.free(log_path);
+
+            // Replay the active WAL into the memtable.  Sequences are assigned
+            // from each batch's own header; max_seq is the highest seen.
+            const max_seq = try recovery.replayLog(
+                gpa,
+                e,
+                log_path,
+                self.mem,
+                vs.lastSequence() + 1,
+            );
+            self.last_sequence = @max(vs.lastSequence(), max_seq);
+
+            // Reuse the SAME log: reopen it for appending and resume the writer
+            // mid-block so the next reopen replays everything (reuse-logs).
+            const file_size = e.getFileSize(log_path) catch 0;
+            self.wal_file = try e.newAppendableFile(gpa, log_path);
+            errdefer self.wal_file.close() catch {};
+            self.wal = log_writer.Writer.initWithOffset(
+                self.wal_file,
+                @intCast(file_size % log_format.kBlockSize),
+            );
+        } else {
+            // ----- fresh DB --------------------------------------------------
+            const log_number = vs.newFileNumber();
+
+            var edit = version_edit.VersionEdit.init();
+            defer edit.deinit(gpa);
+            try edit.setComparatorName(gpa, options.comparator.name());
+            edit.setLogNumber(log_number);
+            edit.setNextFileNumber(vs.nextFileNumber());
+            edit.setLastSequence(0);
+            try vs.logAndApply(&edit);
+
+            const log_path = try filename.logFileName(gpa, name, log_number);
+            defer gpa.free(log_path);
+
+            self.wal_file = try e.newWritableFile(gpa, log_path);
+            errdefer self.wal_file.close() catch {};
+            self.wal = log_writer.Writer.init(self.wal_file);
+            self.last_sequence = 0;
+        }
+
         return self;
     }
 
-    /// Flush+close the WAL, deinit the MemTable, free the DB.
+    /// Flush+close the WAL, deinit the VersionSet + MemTable, free the DB.
     pub fn close(self: *DB) void {
         const gpa = self.gpa;
         self.wal_file.close() catch {};
+        self.versions.deinit();
+        gpa.destroy(self.versions);
         self.mem.deinit();
         gpa.free(self.name);
         gpa.destroy(self);
@@ -443,6 +509,229 @@ test "WAL file is non-empty after writes" {
 
     try db.put(.{}, "k", "v");
 
-    const size = try me.env().getFileSize("testdb/000001.log");
+    // The active WAL is named by the VersionSet's log number; on a fresh DB
+    // that is the first file number handed out.
+    const log_path = try filename.logFileName(gpa, "testdb", db.versions.logNumber());
+    defer gpa.free(log_path);
+    const size = try me.env().getFileSize(log_path);
     try testing.expect(size > 0);
+}
+
+// ---------------------------------------------------------------------------
+// M5.2 — durability / recovery
+// ---------------------------------------------------------------------------
+
+test "fresh DB creates CURRENT, MANIFEST, and a log file" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    const db = try DB.open(gpa, e, "freshdb", .{});
+    defer db.close();
+
+    const cur = try filename.currentFileName(gpa, "freshdb");
+    defer gpa.free(cur);
+    try testing.expect(e.fileExists(cur));
+
+    // CURRENT names a MANIFEST that exists.
+    const manifest = try filename.manifestFileName(gpa, "freshdb", db.versions.manifestFileNumber());
+    defer gpa.free(manifest);
+    try testing.expect(e.fileExists(manifest));
+
+    // The active log file exists.
+    const log_path = try filename.logFileName(gpa, "freshdb", db.versions.logNumber());
+    defer gpa.free(log_path);
+    try testing.expect(e.fileExists(log_path));
+}
+
+test "reopen recovers data from the WAL" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    {
+        const db = try DB.open(gpa, e, "recdb", .{});
+        defer db.close();
+        try db.put(.{}, "a", "1");
+        try db.put(.{}, "b", "2");
+        try db.delete(.{}, "a");
+    }
+
+    // Reopen the SAME MemEnv + name.
+    {
+        const db = try DB.open(gpa, e, "recdb", .{});
+        defer db.close();
+
+        try testing.expect((try db.get(.{}, "a")) == null);
+
+        const b = try db.get(.{}, "b") orelse return error.TestExpectedFound;
+        defer gpa.free(b);
+        try testing.expectEqualStrings("2", b);
+    }
+}
+
+test "multi-session append: writes accumulate across reopens" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    {
+        const db = try DB.open(gpa, e, "msdb", .{});
+        defer db.close();
+        try db.put(.{}, "a", "1");
+        try db.put(.{}, "b", "2");
+        try db.delete(.{}, "a");
+    }
+    {
+        const db = try DB.open(gpa, e, "msdb", .{});
+        defer db.close();
+        try db.put(.{}, "c", "3");
+    }
+    {
+        const db = try DB.open(gpa, e, "msdb", .{});
+        defer db.close();
+
+        try testing.expect((try db.get(.{}, "a")) == null);
+
+        const b = try db.get(.{}, "b") orelse return error.TestExpectedFound;
+        defer gpa.free(b);
+        try testing.expectEqualStrings("2", b);
+
+        const c = try db.get(.{}, "c") orelse return error.TestExpectedFound;
+        defer gpa.free(c);
+        try testing.expectEqualStrings("3", c);
+    }
+}
+
+test "sequence continuity: a new put outranks all recovered writes" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    {
+        const db = try DB.open(gpa, e, "seqdb", .{});
+        defer db.close();
+        try db.put(.{}, "x", "old1");
+        try db.put(.{}, "x", "old2");
+        try db.put(.{}, "y", "yv");
+    }
+
+    {
+        const db = try DB.open(gpa, e, "seqdb", .{});
+        defer db.close();
+
+        // Recovered last_sequence covers all 3 prior writes.
+        try testing.expect(db.last_sequence >= 3);
+        const recovered_seq = db.last_sequence;
+
+        // A snapshot taken right after reopen sees the recovered values.
+        const snap = db.getSnapshot();
+        defer db.releaseSnapshot(snap);
+
+        // A new write must get a strictly higher sequence (no regression).
+        try db.put(.{}, "x", "new");
+        try testing.expect(db.last_sequence > recovered_seq);
+
+        // The pre-reopen value of x is still readable at the post-reopen snapshot.
+        const at_snap = try db.get(.{ .snapshot = snap.sequence }, "x") orelse return error.TestExpectedFound;
+        defer gpa.free(at_snap);
+        try testing.expectEqualStrings("old2", at_snap);
+
+        // The latest read sees the new write.
+        const latest = try db.get(.{}, "x") orelse return error.TestExpectedFound;
+        defer gpa.free(latest);
+        try testing.expectEqualStrings("new", latest);
+    }
+}
+
+test "crash recovery: data is present without a clean close" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    // Open, write, but deliberately do NOT close this handle in the usual way.
+    // The WAL is flushed per write, so the bytes are committed to the MemEnv.
+    const db1 = try DB.open(gpa, e, "crashdb", .{});
+    try db1.put(.{}, "k1", "v1");
+    try db1.put(.{}, "k2", "v2");
+
+    // Simulate a crash + restart: open a SECOND handle on the same MemEnv.
+    {
+        const db2 = try DB.open(gpa, e, "crashdb", .{});
+        defer db2.close();
+
+        const v1 = try db2.get(.{}, "k1") orelse return error.TestExpectedFound;
+        defer gpa.free(v1);
+        try testing.expectEqualStrings("v1", v1);
+
+        const v2 = try db2.get(.{}, "k2") orelse return error.TestExpectedFound;
+        defer gpa.free(v2);
+        try testing.expectEqualStrings("v2", v2);
+    }
+
+    // Tidy up the leaked-on-purpose first handle so the test is leak-free.
+    db1.close();
+}
+
+test "corrupt WAL tail: committed prefix is recovered, no error" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    var log_path: []u8 = undefined;
+    {
+        const db = try DB.open(gpa, e, "corruptdb", .{});
+        defer db.close();
+        try db.put(.{}, "a", "1");
+        try db.put(.{}, "b", "2");
+        log_path = try filename.logFileName(gpa, "corruptdb", db.versions.logNumber());
+    }
+    defer gpa.free(log_path);
+
+    // Corrupt the LAST few bytes of the committed WAL in the MemEnv.
+    {
+        const bytes = try readAllBytes(e, gpa, log_path);
+        defer gpa.free(bytes);
+        try testing.expect(bytes.len > 4);
+        // Flip the trailing bytes (the last record's tail).
+        var i: usize = bytes.len - 4;
+        while (i < bytes.len) : (i += 1) bytes[i] ^= 0xff;
+
+        var wf = try e.newWritableFile(gpa, log_path); // truncates + rewrites
+        errdefer wf.close() catch {};
+        try wf.append(bytes);
+        try wf.flush();
+        try wf.close();
+    }
+
+    // Reopen: the committed prefix ("a") must be recovered; no error thrown.
+    {
+        const db = try DB.open(gpa, e, "corruptdb", .{});
+        defer db.close();
+
+        const a = try db.get(.{}, "a") orelse return error.TestExpectedFound;
+        defer gpa.free(a);
+        try testing.expectEqualStrings("1", a);
+    }
+}
+
+/// Read the entire committed contents of `path` (caller frees).
+fn readAllBytes(e: env.Env, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
+    var sf = try e.newSequentialFile(gpa, path);
+    defer sf.close() catch {};
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var chunk: [4096]u8 = undefined;
+    while (true) {
+        const n = try sf.read(&chunk);
+        if (n == 0) break;
+        try out.appendSlice(gpa, chunk[0..n]);
+    }
+    return out.toOwnedSlice(gpa);
 }

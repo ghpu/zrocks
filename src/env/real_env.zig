@@ -115,6 +115,7 @@ pub const RealEnv = struct {
 
     const vtable = Env.VTable{
         .newWritableFile = newWritableFile,
+        .newAppendableFile = newAppendableFile,
         .newSequentialFile = newSequentialFile,
         .newRandomAccessFile = newRandomAccessFile,
         .deleteFile = deleteFile,
@@ -135,6 +136,14 @@ pub const RealEnv = struct {
         };
         h.* = .{ .io = self.io, .gpa = gpa, .file = file, .offset = 0 };
         return .{ .ptr = h, .vtable = &RealWritable.vtable };
+    }
+
+    // RED stub — wired in the GREEN phase.
+    fn newAppendableFile(ptr: *anyopaque, gpa: std.mem.Allocator, path: []const u8) Error!WritableFile {
+        _ = ptr;
+        _ = gpa;
+        _ = path;
+        return error.NotSupported;
     }
 
     fn newSequentialFile(ptr: *anyopaque, gpa: std.mem.Allocator, path: []const u8) Error!SequentialFile {

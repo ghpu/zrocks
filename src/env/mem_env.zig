@@ -77,6 +77,7 @@ pub const MemEnv = struct {
 
     const vtable = Env.VTable{
         .newWritableFile = newWritableFile,
+        .newAppendableFile = newAppendableFile,
         .newSequentialFile = newSequentialFile,
         .newRandomAccessFile = newRandomAccessFile,
         .deleteFile = deleteFile,
@@ -97,6 +98,14 @@ pub const MemEnv = struct {
         const owned_path = try gpa.dupe(u8, path);
         h.* = .{ .me = self, .gpa = gpa, .path = owned_path, .buf = .empty };
         return .{ .ptr = h, .vtable = &MemWritable.vtable };
+    }
+
+    // RED stub — wired in the GREEN phase.
+    fn newAppendableFile(ptr: *anyopaque, gpa: std.mem.Allocator, path: []const u8) Error!WritableFile {
+        _ = ptr;
+        _ = gpa;
+        _ = path;
+        return error.NotSupported;
     }
 
     fn newSequentialFile(ptr: *anyopaque, gpa: std.mem.Allocator, path: []const u8) Error!SequentialFile {
