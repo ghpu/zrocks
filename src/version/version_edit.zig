@@ -28,6 +28,15 @@ const coding = @import("../util/coding.zig");
 pub const Error = error{Corruption} || std.mem.Allocator.Error;
 
 // ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// Dupe `src` into `gpa`-owned memory.  Caller must free on error or when done.
+fn dupSlice(gpa: std.mem.Allocator, src: []const u8) std.mem.Allocator.Error![]u8 {
+    return gpa.dupe(u8, src);
+}
+
+// ---------------------------------------------------------------------------
 // Tag constants
 // ---------------------------------------------------------------------------
 
@@ -107,7 +116,7 @@ pub const VersionEdit = struct {
 
     pub fn setComparatorName(self: *VersionEdit, gpa: std.mem.Allocator, name: []const u8) !void {
         if (self.comparator_name) |old| gpa.free(old);
-        self.comparator_name = try gpa.dupe(u8, name);
+        self.comparator_name = try dupSlice(gpa, name);
     }
 
     pub fn setLogNumber(self: *VersionEdit, v: u64) void {
@@ -137,9 +146,9 @@ pub const VersionEdit = struct {
         smallest: []const u8,
         largest: []const u8,
     ) !void {
-        const s = try gpa.dupe(u8, smallest);
+        const s = try dupSlice(gpa, smallest);
         errdefer gpa.free(s);
-        const l = try gpa.dupe(u8, largest);
+        const l = try dupSlice(gpa, largest);
         errdefer gpa.free(l);
         try self.new_files.append(gpa, .{
             .level = level,
@@ -233,7 +242,7 @@ pub const VersionEdit = struct {
                 Tag.kComparator => {
                     const raw = try coding.getLengthPrefixedSlice(&input);
                     if (edit.comparator_name) |old| gpa.free(old);
-                    edit.comparator_name = try gpa.dupe(u8, raw);
+                    edit.comparator_name = try dupSlice(gpa, raw);
                 },
                 Tag.kLogNumber => {
                     edit.log_number = try coding.getVarint64(&input);
@@ -264,9 +273,9 @@ pub const VersionEdit = struct {
                     const file_size = try coding.getVarint64(&input);
                     const smallest_raw = try coding.getLengthPrefixedSlice(&input);
                     const largest_raw = try coding.getLengthPrefixedSlice(&input);
-                    const smallest = try gpa.dupe(u8, smallest_raw);
+                    const smallest = try dupSlice(gpa, smallest_raw);
                     errdefer gpa.free(smallest);
-                    const largest = try gpa.dupe(u8, largest_raw);
+                    const largest = try dupSlice(gpa, largest_raw);
                     errdefer gpa.free(largest);
                     try edit.new_files.append(gpa, .{
                         .level = level,
