@@ -39,7 +39,7 @@ pub const Comparator = struct {
 };
 
 // ---------------------------------------------------------------------------
-// Bytewise comparator — stubs (RED: fail tests on purpose)
+// Bytewise comparator — singleton
 // ---------------------------------------------------------------------------
 
 const bytewise_vtable = Comparator.VTable{
@@ -56,17 +56,47 @@ pub const bytewise: Comparator = .{
     .vtable = &bytewise_vtable,
 };
 
-fn bytewiseCompare(_: *const anyopaque, _: []const u8, _: []const u8) std.math.Order {
-    return .eq; // STUB: always returns eq — tests will fail
+fn bytewiseCompare(_: *const anyopaque, a: []const u8, b: []const u8) std.math.Order {
+    return std.mem.order(u8, a, b);
 }
 
 fn bytewiseName(_: *const anyopaque) []const u8 {
-    return ""; // STUB
+    return "leveldb.BytewiseComparator";
 }
 
-fn bytewiseFindShortestSeparator(_: *const anyopaque, _: *std.ArrayList(u8), _: []const u8) void {}
+/// LevelDB findShortestSeparator algorithm (byte-exact).
+/// Finds the common prefix length; if one string is a prefix of the other,
+/// leaves `start` unchanged.  Otherwise, at the first differing byte i:
+/// if start[i] != 0xff and start[i]+1 < limit[i], increment and truncate.
+fn bytewiseFindShortestSeparator(_: *const anyopaque, start: *std.ArrayList(u8), limit: []const u8) void {
+    const min_len = @min(start.items.len, limit.len);
+    var diff_index: usize = 0;
+    while (diff_index < min_len and start.items[diff_index] == limit[diff_index]) {
+        diff_index += 1;
+    }
+    // One is a prefix of the other — do nothing.
+    if (diff_index >= min_len) return;
 
-fn bytewiseFindShortSuccessor(_: *const anyopaque, _: *std.ArrayList(u8)) void {}
+    const b = start.items[diff_index];
+    if (b != 0xff and b + 1 < limit[diff_index]) {
+        start.items[diff_index] = b + 1;
+        start.shrinkRetainingCapacity(diff_index + 1);
+    }
+}
+
+/// LevelDB findShortSuccessor algorithm.
+/// Scans for the first non-0xff byte, increments it, and truncates there.
+/// If all bytes are 0xff (or empty), leaves the key unchanged.
+fn bytewiseFindShortSuccessor(_: *const anyopaque, key: *std.ArrayList(u8)) void {
+    for (key.items, 0..) |b, i| {
+        if (b != 0xff) {
+            key.items[i] = b + 1;
+            key.shrinkRetainingCapacity(i + 1);
+            return;
+        }
+    }
+    // All 0xff or empty — leave unchanged.
+}
 
 // ---------------------------------------------------------------------------
 // Reverse bytewise comparator — stubs
@@ -86,12 +116,12 @@ pub const reverse_bytewise: Comparator = .{
     .vtable = &reverse_bytewise_vtable,
 };
 
-fn reverseBytewiseCompare(_: *const anyopaque, _: []const u8, _: []const u8) std.math.Order {
-    return .eq; // STUB
+fn reverseBytewiseCompare(_: *const anyopaque, a: []const u8, b: []const u8) std.math.Order {
+    return std.mem.order(u8, b, a); // swap a and b to reverse the order
 }
 
 fn reverseBytewiseName(_: *const anyopaque) []const u8 {
-    return ""; // STUB
+    return "rocksdb.ReverseBytewiseComparator";
 }
 
 fn reverseBytewiseFindShortestSeparator(_: *const anyopaque, _: *std.ArrayList(u8), _: []const u8) void {}
