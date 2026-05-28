@@ -20,6 +20,7 @@ const std = @import("std");
 const iterator = @import("../iterator/iterator.zig");
 const comparator = @import("../util/comparator.zig");
 const internal_key = @import("../format/internal_key.zig");
+const coding = @import("../util/coding.zig");
 
 /// User-facing iterator over a single internal iterator at a fixed snapshot.
 pub const DBIterator = struct {
@@ -42,6 +43,13 @@ pub const DBIterator = struct {
     /// Stable buffer holding the current surfaced VALUE.
     saved_value: std.ArrayListUnmanaged(u8) = .empty,
 
+    /// Optional ownership hook for the heap-allocated context behind `inner`.
+    /// When set, `deinit` calls `owned_inner_destroy(gpa, owned_inner)` so a
+    /// caller (e.g. `DB.newIterator`) can hand off a heap-allocated adapter and
+    /// have the DBIterator free it.  When null, the caller owns `inner`.
+    owned_inner: ?*anyopaque = null,
+    owned_inner_destroy: ?*const fn (gpa: std.mem.Allocator, ctx: *anyopaque) void = null,
+
     pub fn init(
         gpa: std.mem.Allocator,
         inner: iterator.Iterator,
@@ -59,6 +67,10 @@ pub const DBIterator = struct {
     pub fn deinit(self: *DBIterator) void {
         self.saved_key.deinit(self.gpa);
         self.saved_value.deinit(self.gpa);
+        if (self.owned_inner) |ctx| {
+            if (self.owned_inner_destroy) |destroy| destroy(self.gpa, ctx);
+            self.owned_inner = null;
+        }
     }
 
     pub fn valid(self: *const DBIterator) bool {
@@ -96,7 +108,7 @@ pub const DBIterator = struct {
         lookup.appendSlice(self.gpa, user_target) catch |e| return self.fail(e);
         const trailer = internal_key.packSequenceAndType(self.snapshot, internal_key.kValueTypeForSeek);
         var tbuf: [8]u8 = undefined;
-        @import("../util/coding.zig").encodeFixed64(&tbuf, trailer);
+        coding.encodeFixed64(&tbuf, trailer);
         lookup.appendSlice(self.gpa, &tbuf) catch |e| return self.fail(e);
 
         self.inner.seek(lookup.items);
@@ -232,7 +244,6 @@ pub const DBIterator = struct {
 // ---------------------------------------------------------------------------
 
 const VectorIterator = iterator.VectorIterator;
-const coding = @import("../util/coding.zig");
 
 /// Encode an internal key (user_key ++ fixed64 trailer) into a caller buffer.
 fn ik(buf: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, user_key: []const u8, seq: u64, t: internal_key.ValueType) ![]const u8 {
