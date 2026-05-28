@@ -76,26 +76,13 @@ RocksDB reference: https://github.com/facebook/rocksdb/wiki
 
 Phase 7 parallelization: core files (db.zig, compaction.zig, version_set.zig, memtable.zig) are shared — only run DISJOINT-footprint milestones in parallel. Compaction-modifiers (M7.3/M7.4/M7.5) one at a time; db/memtable-modifiers (M7.0 CF, M7.1 merge, M7.6 txn) one at a time. Wave A = M7.2 (SST-format/read-path) + M7.7 (standalone checkpoint, new file only) — disjoint.
 
-## STATUS: LevelDB-equivalent core COMPLETE (Phases 0–6, 296 tests). Next: Phase 7 (RocksDB extensions).
+## STATUS: LevelDB-equivalent core COMPLETE (Phases 0–6). In Phase 7 (RocksDB extensions).
 
-zrocks is a working, durable, crash-recoverable, leveled-compacting LSM key-value store with byte-compatible on-disk formats and a CLI. `zig build` → `libzrocks.a` + `zrocks` binary. To resume: pick a Phase 7 milestone from the checklist above, create a worktree `../zrocks-wt/<slug>` off main, dispatch a subagent with the standard TDD + capability-style + 0.16-gotchas brief, integrate (merge --no-ff, wire root.zig, `zig build test`, update this file, remove worktree).
+zrocks is a working, durable, crash-recoverable, leveled-compacting LSM key-value store with byte-compatible on-disk formats + a CLI. `zig build` → `libzrocks.a` + `zrocks` binary.
 
-## (historical) Active: Phase 6 — Compaction → full LSM (4 milestones)
+**Capabilities on main (Phases 0–6 + checkpoint + prefix):** Foundation (slice/status/coding/comparator/arena/crc32c/options) · Env over std.Io (+MemEnv, append) · WAL · Skiplist · MemTable (snapshot+tombstone) · WriteBatch · block-based SST (TableBuilder↔Reader, bloom, footer, CRC, IKC-aware) · LRU block cache · Iterator/Merging/TwoLevel (with deinit) · VersionEdit/VersionSet/MANIFEST · durable DB open/put/get/delete/write/newIterator/snapshot with flush(memtable→L0)+leveled compaction+full SnapshotList · Checkpoints (M7.7) · Prefix extractor + prefix bloom/seek (M7.2).
 
-### Phase 6 plan
-- M6.0 SST read path (O) — needs version_set + table_reader + cache + iterator. New: src/version/table_cache.zig; modify db.zig read path + add Version.get / Version.newIterators. FIRST add an optional `deinit: ?*const fn(ctx)void` to the `iterator.Iterator` vtable and have Merging/TwoLevel call children's deinit (the gap noted below). table_cache opens/caches Table handles by file number (filename.tableFileName). DB.get: check memtable, then current Version's files (L0 newest-first by file number, then levels 1.. by key range); DB.newIterator merges memtable iter + per-file table iters. Tested by building SSTs via TableBuilder, registering them with a VersionEdit, reading through DB.
-- M6.1 Flush (O) — needs M6.0. Immutable-memtable switch when active memtable exceeds write_buffer_size; build an L0 SST (TableBuilder) from the immutable memtable; logAndApply a VersionEdit adding the file + new log_number; open a fresh WAL + memtable. Background or synchronous trigger (synchronous is fine first; behind Env). Reopen then recovers via SSTs (manifest) + remaining WAL.
-- M6.2 Leveled compaction (O) — needs M6.1. Size/level picker; compaction job merges input SSTs (MergingIterator over table iters) into output level; drop tombstones/overwritten keys below the oldest snapshot; grandparent-overlap output splitting; install edits. Gate: randomized op-log vs reference AutoHashMap after compactions + reopen.
-- M6.3 Snapshots (O) — full SnapshotList pinning sequences; compaction respects the oldest live snapshot.
-- GATE: add main.zig CLI (put/get/scan/bench) + tests/integration_db_test.zig.
-
-## Next steps (ordered)
-1. Phase 6: M6.0 read path → M6.1 flush → M6.2 leveled compaction → M6.3 snapshots → CLI + integration gate = "LevelDB-equivalent core complete".
-2. Then revisit the RocksDB real-DB read-interop gate (now feasible with the SST read path).
-3. Phase 7 — RocksDB extensions (column families, merge operator, prefix seek, universal/FIFO compaction, compaction filter, DeleteRange, transactions, checkpoints).
-
-## Engine capabilities so far (on main, 264 tests, Phases 0–5 COMPLETE)
-Foundation · Env capability over std.Io (+MemEnv, append) · WAL (byte-compat) · Skiplist · MemTable (snapshot+tombstone get) · WriteBatch · full block-based SST (byte-compat, CRC-verified, round-trips) · sharded LRU block cache · generic Iterator/Merging/TwoLevel · VersionEdit + VersionSet/MANIFEST (write→recover) · **durable DB: open/put/get/delete/write/newIterator/snapshot over MemTable+WAL, recovers across reopen (reuse-logs)**. Not yet: data is single-memtable + WAL only (no SST flush/compaction; reads don't consult SSTs yet).
+**To resume:** pick the next Phase 7 milestone from the checklist above (run sequentially — db.zig/compaction.zig are contended), create a worktree `../zrocks-wt/<slug>` off main, dispatch a subagent with the standard TDD + capability-style + 0.16-gotchas brief, then integrate (merge --no-ff → wire root.zig → `zig build test` → update this file → remove worktree). Subagent verify for `../`-importing files: `printf 'test { _ = @import("path/from/src.zig"); }' > src/_verify.zig && zig test src/_verify.zig && rm src/_verify.zig`.
 
 ## Decision log (ADR pointers)
 - ADR-000: RocksDB format target pinned (format_version 5 SST, legacy WAL/MANIFEST, CRC32C mask). docs/adr/000-target-format.md
