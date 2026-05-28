@@ -409,6 +409,35 @@ test "MergingIterator: reverse scan yields reverse-sorted order" {
     for (want, got.items) |w, g| try testing.expectEqualStrings(w, g);
 }
 
+test "MergingIterator: reverse then forward direction switch" {
+    const gpa = testing.allocator;
+    const a = [_]VectorIterator.Entry{ e("a", "1"), e("d", "4") };
+    const b = [_]VectorIterator.Entry{ e("b", "2"), e("c", "3") };
+    var va = VectorIterator.init(&a);
+    var vb = VectorIterator.init(&b);
+    const children = [_]Iterator{
+        va.iterator(comparator.bytewise),
+        vb.iterator(comparator.bytewise),
+    };
+    var mi = try MergingIterator.init(gpa, comparator.bytewise, &children);
+    defer mi.deinit();
+    const it = mi.iterator();
+
+    it.seekToLast();
+    try testing.expectEqualStrings("d", it.key()); // d
+    it.prev();
+    try testing.expectEqualStrings("c", it.key()); // c
+    it.prev();
+    try testing.expectEqualStrings("b", it.key()); // b
+    // Switch direction forward: next should yield c, then d.
+    it.next();
+    try testing.expectEqualStrings("c", it.key());
+    it.next();
+    try testing.expectEqualStrings("d", it.key());
+    it.next();
+    try testing.expect(!it.valid());
+}
+
 test "MergingIterator: forward then reverse direction switch" {
     const gpa = testing.allocator;
     const a = [_]VectorIterator.Entry{ e("a", "1"), e("d", "4") };

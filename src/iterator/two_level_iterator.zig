@@ -303,6 +303,39 @@ test "TwoLevelIterator: seek across block boundaries" {
     try testing.expect(!it.valid());
 }
 
+fn collectReverse(gpa: std.mem.Allocator, it: Iterator) !std.ArrayList([]u8) {
+    var out: std.ArrayList([]u8) = .empty;
+    it.seekToLast();
+    while (it.valid()) : (it.prev()) {
+        const s = try std.fmt.allocPrint(gpa, "{s}={s}", .{ it.key(), it.value() });
+        try out.append(gpa, s);
+    }
+    return out;
+}
+
+test "TwoLevelIterator: reverse scan yields all entries in reverse order" {
+    const gpa = testing.allocator;
+    const b0 = [_]VectorIterator.Entry{ e("a", "1"), e("b", "2") };
+    const b1 = [_]VectorIterator.Entry{ e("c", "3"), e("d", "4") };
+    const b2 = [_]VectorIterator.Entry{ e("e", "5"), e("f", "6") };
+    var blocks = Blocks{ .block0 = &b0, .block1 = &b1, .block2 = &b2 };
+    const index = [_]VectorIterator.Entry{ e("b", "0"), e("d", "1"), e("f", "2") };
+    var index_vi = VectorIterator.init(&index);
+
+    var tli = TwoLevelIterator.init(
+        index_vi.iterator(comparator.bytewise),
+        &blocks,
+        Blocks.make,
+    );
+    const it = tli.iterator();
+
+    var got = try collectReverse(gpa, it);
+    defer freeList(gpa, &got);
+    const want = [_][]const u8{ "f=6", "e=5", "d=4", "c=3", "b=2", "a=1" };
+    try testing.expectEqual(want.len, got.items.len);
+    for (want, got.items) |w, g| try testing.expectEqualStrings(w, g);
+}
+
 test "TwoLevelIterator: empty middle block skipped" {
     const gpa = testing.allocator;
     const b0 = [_]VectorIterator.Entry{ e("a", "1"), e("b", "2") };
