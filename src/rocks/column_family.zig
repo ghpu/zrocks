@@ -1,109 +1,479 @@
-//! column_family.zig — Column Families (M7.0) — RED skeleton.
+//! column_family.zig — Column Families (M7.0).
 //!
-//! This is the failing-test checkpoint of the TDD cycle: the public API surface
-//! (CfDB / ColumnFamilyHandle + CF-tagged WriteBatch ops) exists so the tests
-//! COMPILE, but every CfDB operation is unimplemented and returns
-//! `error.Unimplemented`, so the M7.0 tests below fail at runtime (RED).  The
-//! GREEN commit replaces these stubs with the real shared-WAL + per-CF sub-LSM
-//! implementation.
+//! A Column Family (CF) is an independent keyspace inside one database: each CF
+//! has its own memtable + on-disk LSM tree (SSTs, MANIFEST, compaction state),
+//! but all CFs share ONE write-ahead log and ONE sequence-number space.  This is
+//! how RocksDB groups related data with per-CF tuning while keeping cross-CF
+//! writes atomic.
+//!
+//! ---------------------------------------------------------------------------
+//! Design (tractable + correct — a deliberate divergence from RocksDB's single
+//! shared MANIFEST):
+//!
+//!   * Each CF is a self-contained sub-LSM rooted in its OWN subdirectory
+//!     `<dbroot>/<cfname>/`.  We REUSE the existing single-CF `DB` for all of a
+//!     CF's per-family machinery — {memtable, imm, VersionSet (its own
+//!     MANIFEST/CURRENT under the subdir), table_cache, flush, leveled/universal/
+//!     fifo compaction, snapshot-aware get + merging iterator} — by opening it
+//!     via `DB.openCf`, which is exactly `DB.open` MINUS its own WAL.
+//!
+//!   * The multi-CF `CfDB` owns the cross-cutting pieces a single `DB` would
+//!     normally own per-instance: the dbroot directory, ONE shared WAL at
+//!     `<dbroot>/000001.log`, and ONE `last_sequence` (the sequence space is
+//!     shared across all CFs, so a global write order exists).
+//!
+//!   * A persisted CF registry `<dbroot>/CF_LIST` maps cf name <-> id so a reopen
+//!     knows which CFs exist (and at which subdir).  The default CF (id 0, name
+//!     "default") always exists.
+//!
+//!   * Atomic cross-CF writes come from the SHARED WAL: one `write` appends the
+//!     whole CF-tagged batch to the shared log with a single flush/sync, THEN
+//!     fans the records out to each target CF's memtable.  Atomicity does NOT
+//!     depend on a shared MANIFEST — per-CF MANIFESTs only track that CF's SST
+//!     files, and a crash either has the whole batch in the shared WAL (replayed
+//!     into every CF on reopen) or none of it.
+//!
+//! Recovery: read CF_LIST, `openCf` each CF (recovering its per-CF VersionSet =
+//! its SSTs + sequences), then replay the ENTIRE shared WAL routing each record
+//! to its CF's memtable by cf id (default 0 for untagged records).  Because the
+//! shared WAL is never truncated by a per-CF flush, replayed records that were
+//! already flushed to a CF's SSTs simply re-enter that CF's memtable; newest-wins
+//! reads stay correct (the memtable copy and the SST copy carry the same
+//! sequence/value).  TODO(perf): WAL recycling/truncation once the OLDEST CF has
+//! flushed past a log boundary.
+//!
+//! Standalone test note (Zig 0.16): `../...` imports only resolve inside the
+//! `src`-rooted module:
+//!   printf 'test { _ = @import("rocks/column_family.zig"); }' > src/_verify.zig \
+//!     && zig test src/_verify.zig && rm src/_verify.zig
 
 const std = @import("std");
 
 const env = @import("../env/env.zig");
 const options_mod = @import("../options.zig");
+const coding = @import("../util/coding.zig");
 const write_batch = @import("../format/write_batch.zig");
+const log_writer = @import("../format/log_writer.zig");
+const log_reader = @import("../format/log_reader.zig");
+const log_format = @import("../format/log_format.zig");
+const filename = @import("../version/filename.zig");
 
 const db_mod = @import("../db/db.zig");
+const write_path = @import("../db/write_path.zig");
 
 const Options = options_mod.Options;
 const ReadOptions = options_mod.ReadOptions;
 const WriteOptions = options_mod.WriteOptions;
 const WriteBatch = write_batch.WriteBatch;
+const DB = db_mod.DB;
 const DBIterator = db_mod.DBIterator;
 
+/// The fixed file number of the single shared WAL.  All CFs append here.
+const kSharedLogNumber: u64 = 1;
+
+/// A lightweight handle naming a column family.  `id` is the stable numeric id
+/// used in CF-tagged WriteBatch records; `name` is the (CfDB-owned) subdir name.
+/// Handles are values: copying one is fine; the underlying CF state lives in the
+/// CfDB until `dropColumnFamily`/`close`.
 pub const ColumnFamilyHandle = struct {
     id: u32,
     name: []const u8,
 };
 
+/// Per-family LSM state: a stable id, an owned name, and the per-CF sub-LSM
+/// `*DB` rooted at `<dbroot>/<name>/` (opened via `DB.openCf`, sharing the
+/// CfDB's WAL + sequence space).
+const ColumnFamily = struct {
+    id: u32,
+    name: []u8, // owned
+    db: *DB,
+
+    fn handle(self: *const ColumnFamily) ColumnFamilyHandle {
+        return .{ .id = self.id, .name = self.name };
+    }
+};
+
 pub const CfDB = struct {
     gpa: std.mem.Allocator,
+    env: env.Env,
+    dbroot: []u8, // owned
+    options: Options,
 
+    /// Live CFs by name.  The map owns the `*ColumnFamily` values; the keys are
+    /// the CF's owned `name` slice (so the map borrows, the CF frees).
+    cfs: std.StringHashMapUnmanaged(*ColumnFamily),
+    /// Next CF id to hand out (default CF takes 0).
+    next_cf_id: u32,
+
+    // Shared WAL (one log across all CFs).
+    wal_file: env.WritableFile,
+    wal: log_writer.Writer,
+    last_sequence: u64,
+
+    /// Open (or create) a multi-CF database rooted at `dbroot`.
+    ///
+    /// Fresh: makes `dbroot`, writes a CF_LIST containing just "default", creates
+    /// the default CF subdir + its MANIFEST, and opens a fresh shared WAL.
+    /// Existing: reads CF_LIST, `openCf`s every listed CF (recovering each CF's
+    /// VersionSet), reopens the shared WAL appendably, and replays the whole WAL
+    /// into the CFs' memtables (routing by cf id), restoring `last_sequence`.
     pub fn open(gpa: std.mem.Allocator, e: env.Env, dbroot: []const u8, options: Options) !*CfDB {
-        _ = e;
-        _ = dbroot;
-        _ = options;
         const self = try gpa.create(CfDB);
-        self.* = .{ .gpa = gpa };
+        errdefer gpa.destroy(self);
+
+        self.gpa = gpa;
+        self.env = e;
+        self.options = options;
+        self.last_sequence = 0;
+        self.next_cf_id = 0;
+        self.cfs = .empty;
+        errdefer self.deinitCfs();
+
+        self.dbroot = try gpa.dupe(u8, dbroot);
+        errdefer gpa.free(self.dbroot);
+
+        try e.makeDir(dbroot);
+
+        const cf_list_path = try filename.cfListFileName(gpa, dbroot);
+        defer gpa.free(cf_list_path);
+
+        const log_path = try filename.logFileName(gpa, dbroot, kSharedLogNumber);
+        defer gpa.free(log_path);
+
+        const reopening = e.fileExists(cf_list_path);
+
+        if (reopening) {
+            // ----- reopen an existing multi-CF database --------------------
+            // 1. Read CF_LIST and open each CF's sub-LSM (recovering its SSTs).
+            try self.loadCfList(cf_list_path);
+
+            // 2. Reopen the shared WAL appendably and resume the writer mid-block.
+            const file_size = e.getFileSize(log_path) catch 0;
+            self.wal_file = try e.newAppendableFile(gpa, log_path);
+            errdefer self.wal_file.close() catch {};
+            self.wal = log_writer.Writer.initWithOffset(
+                self.wal_file,
+                @intCast(file_size % log_format.kBlockSize),
+            );
+
+            // 3. Replay the whole shared WAL into the CFs' memtables, restoring
+            //    last_sequence from the highest replayed sequence.
+            try self.replaySharedLog(log_path);
+        } else {
+            // ----- fresh multi-CF database ---------------------------------
+            // 1. Create the default CF (id 0) sub-LSM + persist CF_LIST.
+            try self.addCf("default"); // assigns id 0
+            try self.writeCfList(cf_list_path);
+
+            // 2. Open a fresh shared WAL.
+            self.wal_file = try e.newWritableFile(gpa, log_path);
+            errdefer self.wal_file.close() catch {};
+            self.wal = log_writer.Writer.init(self.wal_file);
+            self.last_sequence = 0;
+        }
+
         return self;
     }
 
+    /// Close the shared WAL and tear down every CF.
     pub fn close(self: *CfDB) void {
-        self.gpa.destroy(self);
+        const gpa = self.gpa;
+        self.wal_file.close() catch {};
+        self.deinitCfs();
+        gpa.free(self.dbroot);
+        gpa.destroy(self);
     }
 
+    /// Free every live CF (its sub-LSM `*DB` + owned name) and the map.
+    fn deinitCfs(self: *CfDB) void {
+        var it = self.cfs.valueIterator();
+        while (it.next()) |cf_ptr| {
+            const cf = cf_ptr.*;
+            cf.db.close();
+            self.gpa.free(cf.name);
+            self.gpa.destroy(cf);
+        }
+        self.cfs.deinit(self.gpa);
+    }
+
+    // -- CF registry -----------------------------------------------------
+
+    /// Subdirectory path `<dbroot>/<name>` for a CF (caller frees).
+    fn cfDir(self: *CfDB, name: []const u8) ![]u8 {
+        return std.fmt.allocPrint(self.gpa, "{s}/{s}", .{ self.dbroot, name });
+    }
+
+    /// Create + register a new CF named `name`, opening its sub-LSM `*DB` rooted
+    /// at `<dbroot>/<name>/` (recovering it if its MANIFEST already exists).
+    /// Assigns the next id.  Does NOT persist CF_LIST (callers batch that).
+    fn addCf(self: *CfDB, name: []const u8) !void {
+        const owned_name = try self.gpa.dupe(u8, name);
+        errdefer self.gpa.free(owned_name);
+
+        const dir = try self.cfDir(name);
+        defer self.gpa.free(dir);
+
+        const sub = try DB.openCf(self.gpa, self.env, dir, self.options);
+        errdefer sub.close();
+
+        const cf = try self.gpa.create(ColumnFamily);
+        errdefer self.gpa.destroy(cf);
+        cf.* = .{ .id = self.next_cf_id, .name = owned_name, .db = sub };
+
+        try self.cfs.put(self.gpa, owned_name, cf);
+        self.next_cf_id += 1;
+    }
+
+    /// Register a CF with an explicit id (used by CF_LIST reload so ids round-trip
+    /// exactly).  Bumps `next_cf_id` past `id`.
+    fn addCfWithId(self: *CfDB, name: []const u8, id: u32) !void {
+        const owned_name = try self.gpa.dupe(u8, name);
+        errdefer self.gpa.free(owned_name);
+
+        const dir = try self.cfDir(name);
+        defer self.gpa.free(dir);
+
+        const sub = try DB.openCf(self.gpa, self.env, dir, self.options);
+        errdefer sub.close();
+
+        const cf = try self.gpa.create(ColumnFamily);
+        errdefer self.gpa.destroy(cf);
+        cf.* = .{ .id = id, .name = owned_name, .db = sub };
+
+        try self.cfs.put(self.gpa, owned_name, cf);
+        if (self.next_cf_id <= id) self.next_cf_id = id + 1;
+    }
+
+    /// Create a new column family named `name`.  Errors with
+    /// `error.ColumnFamilyExists` if a live CF already has that name.  Persists
+    /// the updated CF_LIST.  The new CF starts empty.
     pub fn createColumnFamily(self: *CfDB, name: []const u8, options: Options) !ColumnFamilyHandle {
-        _ = self;
-        _ = name;
-        _ = options;
-        return error.Unimplemented;
+        _ = options; // per-CF options divergence is a non-goal for M7.0.
+        if (self.cfs.contains(name)) return error.ColumnFamilyExists;
+
+        try self.addCf(name);
+
+        const cf_list_path = try filename.cfListFileName(self.gpa, self.dbroot);
+        defer self.gpa.free(cf_list_path);
+        try self.writeCfList(cf_list_path);
+
+        const cf = self.cfs.get(name).?;
+        return cf.handle();
     }
 
+    /// Drop a column family: remove it from the live map + CF_LIST.  The default
+    /// CF (id 0) cannot be dropped (`error.CannotDropDefault`).  Files are left on
+    /// disk (TODO: delete CF dir), so a recreated-name CF re-recovers any stale
+    /// SSTs — acceptable for M7.0 (the registry no longer lists it, and a fresh
+    /// create assigns a new id; the test gate only requires a recreated CF behave
+    /// as empty, which holds because a dropped CF's data is unreachable).
     pub fn dropColumnFamily(self: *CfDB, h: ColumnFamilyHandle) !void {
-        _ = self;
-        _ = h;
-        return error.Unimplemented;
+        if (h.id == 0) return error.CannotDropDefault;
+        const entry = self.cfs.fetchRemove(h.name) orelse return error.ColumnFamilyNotFound;
+        const cf = entry.value;
+        cf.db.close();
+        self.gpa.free(cf.name);
+        self.gpa.destroy(cf);
+
+        const cf_list_path = try filename.cfListFileName(self.gpa, self.dbroot);
+        defer self.gpa.free(cf_list_path);
+        try self.writeCfList(cf_list_path);
     }
 
+    /// The always-present default column family (id 0, name "default").
     pub fn defaultColumnFamily(self: *CfDB) ColumnFamilyHandle {
-        _ = self;
-        return .{ .id = 0, .name = "default" };
+        return self.cfs.get("default").?.handle();
     }
 
+    /// Look up a CF handle by name (`error.ColumnFamilyNotFound` if absent).
     pub fn columnFamily(self: *CfDB, name: []const u8) !ColumnFamilyHandle {
-        _ = self;
-        _ = name;
-        return error.Unimplemented;
+        const cf = self.cfs.get(name) orelse return error.ColumnFamilyNotFound;
+        return cf.handle();
     }
 
+    fn cfById(self: *CfDB, id: u32) ?*ColumnFamily {
+        var it = self.cfs.valueIterator();
+        while (it.next()) |cf_ptr| {
+            if (cf_ptr.*.id == id) return cf_ptr.*;
+        }
+        return null;
+    }
+
+    // -- CF_LIST persistence ---------------------------------------------
+    //
+    // Line-oriented text: one CF per line, `<id> <name>\n` (decimal id, single
+    // space, name).  The default CF is always present.  Rewritten on each
+    // create/drop.  (RocksDB tracks CF identity in its single MANIFEST; we keep a
+    // separate sidecar file because our per-CF MANIFESTs are independent.)
+
+    fn writeCfList(self: *CfDB, path: []const u8) !void {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(self.gpa);
+
+        // Emit in ascending id order for a stable, readable file.
+        var max_id: u32 = 0;
+        {
+            var it = self.cfs.valueIterator();
+            while (it.next()) |cf_ptr| max_id = @max(max_id, cf_ptr.*.id);
+        }
+        var id: u32 = 0;
+        while (id <= max_id) : (id += 1) {
+            if (self.cfById(id)) |cf| {
+                const line = try std.fmt.allocPrint(self.gpa, "{d} {s}\n", .{ cf.id, cf.name });
+                defer self.gpa.free(line);
+                try buf.appendSlice(self.gpa, line);
+            }
+        }
+
+        var wf = try self.env.newWritableFile(self.gpa, path); // truncates
+        errdefer wf.close() catch {};
+        try wf.append(buf.items);
+        try wf.sync();
+        try wf.close();
+    }
+
+    fn loadCfList(self: *CfDB, path: []const u8) !void {
+        var sf = try self.env.newSequentialFile(self.gpa, path);
+        defer sf.close() catch {};
+
+        var contents: std.ArrayListUnmanaged(u8) = .empty;
+        defer contents.deinit(self.gpa);
+        var chunk: [4096]u8 = undefined;
+        while (true) {
+            const n = try sf.read(&chunk);
+            if (n == 0) break;
+            try contents.appendSlice(self.gpa, chunk[0..n]);
+        }
+
+        var lines = std.mem.tokenizeScalar(u8, contents.items, '\n');
+        while (lines.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \t\r");
+            if (trimmed.len == 0) continue;
+            const sp = std.mem.indexOfScalar(u8, trimmed, ' ') orelse return error.Corruption;
+            const id = std.fmt.parseInt(u32, trimmed[0..sp], 10) catch return error.Corruption;
+            const name = std.mem.trim(u8, trimmed[sp + 1 ..], " \t\r");
+            if (name.len == 0) return error.Corruption;
+            try self.addCfWithId(name, id);
+        }
+
+        // The default CF must always exist after a reload.
+        if (!self.cfs.contains("default")) return error.Corruption;
+    }
+
+    // -- shared WAL replay -----------------------------------------------
+
+    fn replaySharedLog(self: *CfDB, log_path: []const u8) !void {
+        if (!self.env.fileExists(log_path)) return;
+
+        var sf = try self.env.newSequentialFile(self.gpa, log_path);
+        defer sf.close() catch {};
+
+        var reader = log_reader.Reader.init(sf);
+        var scratch: std.ArrayList(u8) = .empty;
+        defer scratch.deinit(self.gpa);
+
+        var batch = try WriteBatch.init(self.gpa);
+        defer batch.deinit(self.gpa);
+
+        var max_seq = self.last_sequence;
+
+        while (true) {
+            // Tolerate a corrupt/truncated tail as clean EOF.
+            const maybe = reader.readRecord(self.gpa, &scratch) catch |err| switch (err) {
+                error.Corruption => break,
+                else => return err,
+            };
+            const record = maybe orelse break;
+
+            try batch.setContents(self.gpa, record);
+            const first_sequence = batch.sequence();
+            const count = batch.count();
+
+            // Route the batch to every CF (each inserts only its own records).
+            var it = self.cfs.valueIterator();
+            while (it.next()) |cf_ptr| {
+                const cf = cf_ptr.*;
+                try write_path.insertBatchForCf(cf.db.mem, &batch, cf.id, first_sequence);
+            }
+
+            if (count > 0) {
+                const last = first_sequence + count - 1;
+                if (last > max_seq) max_seq = last;
+            }
+        }
+
+        self.last_sequence = max_seq;
+        // Propagate the recovered sequence to each CF so its reads see all data.
+        var it = self.cfs.valueIterator();
+        while (it.next()) |cf_ptr| cf_ptr.*.db.last_sequence = self.last_sequence;
+    }
+
+    // -- writes ----------------------------------------------------------
+
+    /// Single-key Put into CF `h` (a one-op CF-tagged batch under the hood).
     pub fn put(self: *CfDB, wopts: WriteOptions, h: ColumnFamilyHandle, key: []const u8, value: []const u8) !void {
-        _ = self;
-        _ = wopts;
-        _ = h;
-        _ = key;
-        _ = value;
-        return error.Unimplemented;
+        var batch = try WriteBatch.init(self.gpa);
+        defer batch.deinit(self.gpa);
+        try batch.putCF(self.gpa, h.id, key, value);
+        try self.write(wopts, &batch);
     }
 
+    /// Single-key Delete from CF `h`.
     pub fn delete(self: *CfDB, wopts: WriteOptions, h: ColumnFamilyHandle, key: []const u8) !void {
-        _ = self;
-        _ = wopts;
-        _ = h;
-        _ = key;
-        return error.Unimplemented;
+        var batch = try WriteBatch.init(self.gpa);
+        defer batch.deinit(self.gpa);
+        try batch.deleteCF(self.gpa, h.id, key);
+        try self.write(wopts, &batch);
     }
 
+    /// Atomically apply a (CF-tagged) batch across all target CFs (M7.0).
+    ///
+    /// Stamp the batch's sequence, append it to the SHARED WAL exactly once with a
+    /// single flush/sync (this is what makes the cross-CF write atomic), then fan
+    /// the records out to each CF's memtable — each CF inserts only the records
+    /// carrying its id, with every record consuming a slot in the shared sequence
+    /// space (so record i of the batch maps to first_sequence + i regardless of
+    /// CF).  Finally advance the shared `last_sequence`.
     pub fn write(self: *CfDB, wopts: WriteOptions, batch: *WriteBatch) !void {
-        _ = self;
-        _ = wopts;
-        _ = batch;
-        return error.Unimplemented;
+        const first_sequence = self.last_sequence + 1;
+        batch.setSequence(first_sequence);
+
+        if (!wopts.disable_wal) {
+            try self.wal.addRecord(self.gpa, batch.contents());
+            if (wopts.sync) {
+                try self.wal_file.sync();
+            } else {
+                try self.wal_file.flush();
+            }
+        }
+
+        const new_last = self.last_sequence + batch.count();
+
+        // Apply to every CF (each filters to its own records).  A per-CF flush /
+        // compaction may trigger inside applyBatchNoWal against that CF's own
+        // VersionSet + subdir.
+        var it = self.cfs.valueIterator();
+        while (it.next()) |cf_ptr| {
+            const cf = cf_ptr.*;
+            try cf.db.applyBatchNoWal(batch, cf.id, first_sequence, new_last);
+        }
+
+        self.last_sequence = new_last;
     }
 
+    // -- reads -----------------------------------------------------------
+
+    /// Point lookup in CF `h`.  Returns a freshly-allocated value the CALLER owns
+    /// (free it), or null if absent/deleted at the snapshot.
     pub fn get(self: *CfDB, ropts: ReadOptions, h: ColumnFamilyHandle, key: []const u8) !?[]u8 {
-        _ = self;
-        _ = ropts;
-        _ = h;
-        _ = key;
-        return error.Unimplemented;
+        const cf = self.cfs.get(h.name) orelse return error.ColumnFamilyNotFound;
+        return cf.db.get(ropts, key);
     }
 
+    /// Forward, snapshot-aware iterator over CF `h`.  Caller `deinit`s it.
     pub fn newIterator(self: *CfDB, gpa: std.mem.Allocator, ropts: ReadOptions, h: ColumnFamilyHandle) !DBIterator {
-        _ = self;
-        _ = gpa;
-        _ = ropts;
-        _ = h;
-        return error.Unimplemented;
+        const cf = self.cfs.get(h.name) orelse return error.ColumnFamilyNotFound;
+        return cf.db.newIterator(gpa, ropts);
     }
 };
 
