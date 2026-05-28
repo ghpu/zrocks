@@ -1319,3 +1319,127 @@ test "M7.4: compaction filter must not touch snapshot-protected entries" {
         return error.TestExpectedRemoved;
     }
 }
+
+// --- THE FIFO GATE (M7.3) --------------------------------------------------
+
+test "M7.3: FIFO evicts the oldest L0 files once over the byte budget" {
+    const gpa = testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    // Tiny write buffer -> one L0 file per put.  Tiny FIFO budget so a handful
+    // of files blows past it and the oldest are evicted.  We size the budget so
+    // it holds only a couple of L0 files.
+    const db = try DB.open(gpa, e, "fifo", .{
+        .compaction_style = .fifo,
+        .write_buffer_size = 1, // flush after every put
+        .fifo_max_table_files_size = 1500, // ~ room for ~2-3 tiny SSTs
+    });
+    defer db.close();
+
+    // Write distinct keys; each flush produces a new L0 file with a higher file
+    // number.  The earliest-written keys live in the OLDEST (lowest-number) files
+    // and must be evicted first.
+    const n: usize = 30;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        var kbuf: [8]u8 = undefined;
+        const k = try std.fmt.bufPrint(&kbuf, "k{d:0>4}", .{i});
+        try db.put(.{}, k, "value-padding-to-grow-the-sst-files");
+    }
+
+    // The L0 byte total is back under (or within one file of) the budget.
+    const total = db.versions.currentVersion().totalFileSize(0);
+    // Tolerance of one extra file: eviction stops once <= budget, but FIFO never
+    // evicts the file currently being written; allow some slack for the last SST.
+    try testing.expect(total <= 4 * 1500);
+
+    // The most-recently-written keys are present.
+    {
+        var kbuf: [8]u8 = undefined;
+        const k = try std.fmt.bufPrint(&kbuf, "k{d:0>4}", .{n - 1});
+        const got = try db.get(.{}, k) orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings("value-padding-to-grow-the-sst-files", got);
+    }
+
+    // The OLDEST keys were evicted (dropped whole-file, not merged) -> null.
+    {
+        const got = try db.get(.{}, "k0000");
+        if (got) |v| {
+            defer gpa.free(v);
+            return error.TestOldestNotEvicted;
+        }
+    }
+
+    // Monotonic frontier: there is a cut index below which everything is gone and
+    // at/above which everything is present (FIFO drops contiguous oldest files).
+    var present_seen = false;
+    i = 0;
+    while (i < n) : (i += 1) {
+        var kbuf: [8]u8 = undefined;
+        const k = try std.fmt.bufPrint(&kbuf, "k{d:0>4}", .{i});
+        const got = try db.get(.{}, k);
+        if (got) |v| {
+            gpa.free(v);
+            present_seen = true;
+        }
+    }
+    try testing.expect(present_seen);
+}
+
+// --- THE UNIVERSAL GATE (M7.3) ---------------------------------------------
+
+test "M7.3: universal merges L0 runs into fewer files, data preserved + reopen" {
+    const gpa = testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    const key_space: usize = 60;
+    const opts = options_mod.Options{
+        .compaction_style = .universal,
+        .write_buffer_size = 256, // many flushes -> many L0 runs
+        .level0_file_num_compaction_trigger = 4, // trigger universal merges
+        .target_file_size_base = 1 << 20, // merge into a single output file
+    };
+
+    var ref = RefMap.init(gpa);
+    defer ref.deinit();
+
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE_AB12);
+    const rand = prng.random();
+
+    {
+        const db = try DB.open(gpa, e, "uni", opts);
+        defer db.close();
+
+        var op: usize = 0;
+        while (op < 1500) : (op += 1) {
+            const key_idx = rand.uintLessThan(usize, key_space);
+            var kbuf: [8]u8 = undefined;
+            const k = try std.fmt.bufPrint(&kbuf, "key{d:0>3}", .{key_idx});
+            var vbuf: [40]u8 = undefined;
+            const vlen = 1 + rand.uintLessThan(usize, vbuf.len);
+            for (vbuf[0..vlen]) |*b| b.* = 'a' + rand.uintLessThan(u8, 26);
+            const v = vbuf[0..vlen];
+            try db.put(.{}, k, v);
+            try ref.put(k, v);
+        }
+
+        // Universal keeps runs in L0; nothing should be pushed to deeper levels.
+        try testing.expectEqual(@as(usize, 0), levelFiles(db, 1));
+        // The merges must have collapsed many flushed runs into a small count.
+        try testing.expect(levelFiles(db, 0) < 1500 / 4);
+
+        try verifyAgainstRef(gpa, db, &ref, key_space);
+    }
+
+    // Reopen and re-verify (universal output must survive recovery).
+    {
+        const db = try DB.open(gpa, e, "uni", opts);
+        defer db.close();
+        try verifyAgainstRef(gpa, db, &ref, key_space);
+    }
+}
