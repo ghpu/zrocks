@@ -283,8 +283,13 @@ pub const DB = struct {
     /// thread.
     fn maybeScheduleCompaction(self: *DB) !void {
         // Pin compaction to the oldest live snapshot so it cannot discard a
-        // version (or a tombstone) that a snapshot read could still need.
-        const smallest_snapshot = self.snapshots.oldest() orelse self.last_sequence;
+        // version (or a tombstone) that a snapshot read could still need.  When no
+        // snapshot is live we fall back to the latest sequence; `has_live_snapshot`
+        // records which case we are in so the M7.4 compaction filter never
+        // modifies an entry a live snapshot can still read.
+        const oldest_snapshot = self.snapshots.oldest();
+        const has_live_snapshot = oldest_snapshot != null;
+        const smallest_snapshot = oldest_snapshot orelse self.last_sequence;
         // Guard against a pathological loop: each compaction must make progress
         // (it reduces a level's score by moving files down), so bound the number
         // of iterations generously by the current file count.
@@ -313,6 +318,7 @@ pub const DB = struct {
                 self.versions,
                 &c,
                 smallest_snapshot,
+                has_live_snapshot,
             );
         }
     }
