@@ -1,21 +1,26 @@
 //! db.zig — the embedded key/value store (M4.1 store + M5.2 durability +
-//! M6.0 SST read path).
+//! M6.0 SST read path + M6.1 flush).
 //!
 //! Ties the building blocks into a usable DB: a MemTable behind a write-ahead
 //! log plus the on-disk SSTs of the current Version, with snapshot-aware point
 //! lookups and a tombstone-hiding forward iterator.  `open` recovers durable
 //! state: a VersionSet reconstructs the MANIFEST/CURRENT and the active WAL is
 //! replayed into the MemTable, then that SAME log is reused for new appends so
-//! committed writes survive reopen (the "reuse-logs" design).  No flush to SST
-//! / immutable memtable / compaction yet — SSTs are injected via VersionEdit
-//! until M6.1 adds flush.
+//! committed writes survive reopen (the "reuse-logs" design).
 //!
-//! Reads consult the MemTable FIRST (newest writes) and fall through to the
-//! current Version's SSTs via a `TableCache` (M6.0).  `get` returns the newest
-//! value visible at the snapshot, or null on a tombstone/absence.
-//! `newIterator` merges the memtable iterator with one iterator per SST file
-//! into a `MergingIterator` (ordered by the InternalKeyComparator) and wraps it
-//! in a `DBIterator` for user-facing snapshot/tombstone semantics.
+//! Flush (M6.1): when the live MemTable exceeds `write_buffer_size`, `write`
+//! rotates it into an immutable MemTable + a fresh WAL and synchronously writes
+//! it to a new L0 SSTable (see flush.zig), recording the file + rotated log in
+//! the MANIFEST.  No leveled compaction yet (M6.2) — flush only ever produces
+//! L0 files; the flush is synchronous (TODO: background flush thread).
+//!
+//! Reads consult the live MemTable FIRST (newest writes), then the immutable
+//! MemTable being flushed (if any), then the current Version's SSTs via a
+//! `TableCache`.  `get` returns the newest value visible at the snapshot, or
+//! null on a tombstone/absence.  `newIterator` merges the memtable iterator(s)
+//! with one iterator per SST file into a `MergingIterator` (ordered by the
+//! InternalKeyComparator) and wraps it in a `DBIterator` for user-facing
+//! snapshot/tombstone semantics.
 //!
 //! Standalone test note (Zig 0.16): this file uses `../...` imports that only
 //! resolve when compiled as part of the `src`-rooted module.  To run the suite:
@@ -45,6 +50,7 @@ const write_path = @import("write_path.zig");
 const db_iter = @import("db_iter.zig");
 const snapshot_mod = @import("snapshot.zig");
 const recovery = @import("recovery.zig");
+const flush = @import("flush.zig");
 
 const Options = options_mod.Options;
 const ReadOptions = options_mod.ReadOptions;
@@ -62,6 +68,11 @@ pub const DB = struct {
     name: []u8,
     ikcmp: internal_key.InternalKeyComparator,
     mem: *MemTable,
+    /// Memtable being flushed (set during a synchronous flush, otherwise null).
+    /// Between writes it is always null (the flush in `write` is synchronous),
+    /// but `get`/`newIterator` consult it so a future background flush stays
+    /// correct.  TODO(perf): background flush thread keeps this set for longer.
+    imm: ?*MemTable = null,
     versions: *version_set.VersionSet,
     /// Opens + caches SST `Table` readers for the current Version's files.  Its
     /// InternalKeyComparator's address is taken into opened tables, so the cache
@@ -104,6 +115,7 @@ pub const DB = struct {
 
         self.mem = try MemTable.init(gpa, options.comparator);
         errdefer self.mem.deinit();
+        self.imm = null;
 
         const vs = try gpa.create(version_set.VersionSet);
         errdefer gpa.destroy(vs);
@@ -180,6 +192,12 @@ pub const DB = struct {
         self.table_cache.deinit();
         self.versions.deinit();
         gpa.destroy(self.versions);
+        // Flush is synchronous, so `imm` is always null between writes; free it
+        // defensively in case a flush ever leaves one pending (e.g. a future
+        // background flush or an error path).  Its data is durable in either the
+        // SST (if the flush finished) or the WAL (if it didn't), so freeing the
+        // RAM copy here loses nothing.
+        if (self.imm) |imm| imm.deinit();
         self.mem.deinit();
         gpa.free(self.name);
         gpa.destroy(self);
@@ -223,6 +241,59 @@ pub const DB = struct {
 
         try write_path.insertBatch(self.mem, batch, first_sequence);
         self.last_sequence += batch.count();
+
+        // If the active memtable is now over budget, rotate it into an immutable
+        // memtable + a fresh WAL and flush it to an L0 SST.
+        try self.maybeFlush();
+    }
+
+    /// If the live memtable has exceeded `write_buffer_size`, rotate it out and
+    /// flush it to an L0 SST.  Synchronous for M6.1 (single-threaded).
+    /// TODO(perf): background flush thread (keep serving reads from `imm`).
+    fn maybeFlush(self: *DB) !void {
+        if (self.imm != null) return; // a flush is already pending.
+        if (self.mem.approximateMemoryUsage() < self.options.write_buffer_size) return;
+
+        // 1. Rotate the WAL: allocate a new log number and open a fresh WAL.
+        const new_log_number = self.versions.newFileNumber();
+        const new_log_path = try filename.logFileName(self.gpa, self.name, new_log_number);
+        defer self.gpa.free(new_log_path);
+
+        var new_wal_file = try self.env.newWritableFile(self.gpa, new_log_path);
+        errdefer new_wal_file.close() catch {};
+
+        // 2. Rotate the memtable: the full one becomes immutable; install a new
+        //    empty one for subsequent writes.
+        const new_mem = try MemTable.init(self.gpa, self.options.comparator);
+        errdefer new_mem.deinit();
+
+        self.imm = self.mem;
+        self.mem = new_mem;
+
+        // Swap in the new WAL (close the old one — its data is going into the
+        // SST and will not be replayed once logAndApply records the new log).
+        const old_wal_file = self.wal_file;
+        self.wal_file = new_wal_file;
+        self.wal = log_writer.Writer.init(self.wal_file);
+        old_wal_file.close() catch {};
+
+        // 3. Flush the immutable memtable to an L0 SST (records the SST + the
+        //    rotated log number in a VersionEdit).
+        try flush.flushMemTable(
+            self.gpa,
+            self.env,
+            self.name,
+            self.options,
+            self.ikcmp.comparatorInterface(),
+            self.versions,
+            self.imm.?,
+            new_log_number,
+            self.last_sequence,
+        );
+
+        // 4. Free the flushed memtable; no pending flush remains.
+        self.imm.?.deinit();
+        self.imm = null;
     }
 
     /// Point lookup visible at the snapshot (`ropts.snapshot` or the latest
@@ -238,6 +309,14 @@ pub const DB = struct {
             .found => |v| return try self.gpa.dupe(u8, v),
             .deleted => return null,
         };
+
+        // 1b. The immutable memtable being flushed (if any) is next-newest.
+        if (self.imm) |imm| {
+            if (imm.get(lookup)) |r| switch (r) {
+                .found => |v| return try self.gpa.dupe(u8, v),
+                .deleted => return null,
+            };
+        }
 
         // 2. Not in the memtable: consult the on-disk SSTs via the current
         //    Version (LSM point lookup with snapshot + tombstone semantics).
@@ -280,6 +359,14 @@ pub const DB = struct {
             errdefer gpa.destroy(adapter);
             adapter.* = .{ .gpa = gpa, .it = MemTable.Iterator.init(self.mem) };
             try children.append(gpa, adapter.genericIterator());
+        }
+
+        // 1b. The immutable memtable being flushed (if any), next in recency.
+        if (self.imm) |imm| {
+            const imm_adapter = try gpa.create(MemIterAdapter);
+            errdefer gpa.destroy(imm_adapter);
+            imm_adapter.* = .{ .gpa = gpa, .it = MemTable.Iterator.init(imm) };
+            try children.append(gpa, imm_adapter.genericIterator());
         }
 
         // 2. One table iterator per file in the current Version.
@@ -989,5 +1076,200 @@ test "M6.0: SST tombstone hides an older memtable value at the right snapshot" {
         const got = try db.get(.{ .snapshot = 5 }, "k") orelse return error.TestExpectedFound;
         defer gpa.free(got);
         try testing.expectEqualStrings("kept", got);
+    }
+}
+
+// ===========================================================================
+// M6.1 — flush (memtable -> L0 SST): the durability-through-SST gate.
+// ===========================================================================
+
+/// Total number of SST files across every level of the current Version.
+fn totalSSTFiles(db: *DB) usize {
+    var n: usize = 0;
+    const v = db.versions.currentVersion();
+    for (&v.files) |level| n += level.items.len;
+    return n;
+}
+
+test "M6.1 flush: small write_buffer triggers an L0 SST that serves reads" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    // A tiny write buffer so a handful of puts overflows it and forces a flush.
+    const db = try DB.open(gpa, e, "flushdb", .{ .write_buffer_size = 1024 });
+    defer db.close();
+
+    // Write enough distinct keys to exceed ~1KB of memtable arena.
+    const n: usize = 64;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        var kbuf: [16]u8 = undefined;
+        var vbuf: [32]u8 = undefined;
+        const k = try std.fmt.bufPrint(&kbuf, "key{d:0>5}", .{i});
+        const v = try std.fmt.bufPrint(&vbuf, "value-{d:0>5}-payload", .{i});
+        try db.put(.{}, k, v);
+    }
+
+    // A flush must have produced at least one L0 SST file on "disk".
+    try testing.expect(totalSSTFiles(db) >= 1);
+    {
+        // Whatever the first SST's number is, its file must exist.
+        const l0 = db.versions.currentVersion().files[0].items;
+        try testing.expect(l0.len >= 1);
+        const sst_path = try filename.tableFileName(gpa, "flushdb", l0[0].number);
+        defer gpa.free(sst_path);
+        try testing.expect(e.fileExists(sst_path));
+    }
+
+    // Every key remains readable (served from the SST and/or the live memtable).
+    i = 0;
+    while (i < n) : (i += 1) {
+        var kbuf: [16]u8 = undefined;
+        var vbuf: [32]u8 = undefined;
+        const k = try std.fmt.bufPrint(&kbuf, "key{d:0>5}", .{i});
+        const want = try std.fmt.bufPrint(&vbuf, "value-{d:0>5}-payload", .{i});
+        const got = try db.get(.{}, k) orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings(want, got);
+    }
+
+    // A full forward scan returns all keys in order.
+    {
+        var it = try db.newIterator(gpa, .{});
+        defer it.deinit();
+        var seen: usize = 0;
+        it.seekToFirst();
+        while (it.valid()) : (it.next()) {
+            var kbuf: [16]u8 = undefined;
+            const want = try std.fmt.bufPrint(&kbuf, "key{d:0>5}", .{seen});
+            try testing.expectEqualStrings(want, it.key());
+            seen += 1;
+        }
+        try testing.expectEqual(n, seen);
+        try testing.expect(it.status() == null);
+    }
+}
+
+test "M6.1 flush: overwrite + delete across flushes with snapshot semantics" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    // Force a flush on essentially every put (buffer near zero).
+    const db = try DB.open(gpa, e, "flushmv", .{ .write_buffer_size = 1 });
+    defer db.close();
+
+    try db.put(.{}, "k", "v1"); // -> flushed to an L0 SST
+    const snap_after_v1 = db.getSnapshot(); // sees v1
+    defer db.releaseSnapshot(snap_after_v1);
+
+    try db.put(.{}, "k", "v2"); // -> flushed to a second L0 SST (newer)
+
+    // Latest read sees v2 (newer L0 file shadows the older one).
+    {
+        const got = try db.get(.{}, "k") orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings("v2", got);
+    }
+
+    // At the snapshot taken after v1 (before v2), the value is still v1 — this
+    // exercises multiple versions of one user key living in distinct SSTs and
+    // read back with snapshot semantics (the IKC block-builder fix).
+    {
+        const got = try db.get(.{ .snapshot = snap_after_v1.sequence }, "k") orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings("v1", got);
+    }
+
+    // Delete + flush: the tombstone in the newest L0 hides all older versions.
+    try db.delete(.{}, "k");
+    try testing.expect((try db.get(.{}, "k")) == null);
+
+    // Several SST files must now exist (v1, v2, tombstone).
+    try testing.expect(totalSSTFiles(db) >= 3);
+}
+
+test "M6.1 flush: reopen recovers SST data + unflushed WAL data" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    {
+        // Small buffer -> early keys flush to SSTs; the very last writes stay in
+        // the active memtable / WAL (not yet flushed).
+        const db = try DB.open(gpa, e, "reopendb", .{ .write_buffer_size = 512 });
+        defer db.close();
+
+        var i: usize = 0;
+        while (i < 40) : (i += 1) {
+            var kbuf: [16]u8 = undefined;
+            var vbuf: [16]u8 = undefined;
+            const k = try std.fmt.bufPrint(&kbuf, "k{d:0>4}", .{i});
+            const v = try std.fmt.bufPrint(&vbuf, "v{d:0>4}", .{i});
+            try db.put(.{}, k, v);
+        }
+        // Some flush must have happened (SST present) and the memtable still
+        // holds the most recent writes (only-in-WAL keys).
+        try testing.expect(totalSSTFiles(db) >= 1);
+    }
+
+    // Reopen: SST data (via MANIFEST) + WAL replay must reconstruct everything.
+    {
+        const db = try DB.open(gpa, e, "reopendb", .{ .write_buffer_size = 512 });
+        defer db.close();
+
+        var i: usize = 0;
+        while (i < 40) : (i += 1) {
+            var kbuf: [16]u8 = undefined;
+            var vbuf: [16]u8 = undefined;
+            const k = try std.fmt.bufPrint(&kbuf, "k{d:0>4}", .{i});
+            const want = try std.fmt.bufPrint(&vbuf, "v{d:0>4}", .{i});
+            const got = try db.get(.{}, k) orelse return error.TestExpectedFound;
+            defer gpa.free(got);
+            try testing.expectEqualStrings(want, got);
+        }
+    }
+}
+
+test "M6.1 flush: multiple L0 files merge newest-first" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    const db = try DB.open(gpa, e, "l0merge", .{ .write_buffer_size = 1 });
+    defer db.close();
+
+    // Three flushes, each overwriting "k" and adding a fresh key.
+    try db.put(.{}, "k", "first");
+    try db.put(.{}, "a", "av"); // forces flush of {k=first}
+    try db.put(.{}, "k", "second");
+    try db.put(.{}, "b", "bv"); // forces flush of {k=second, a=av}
+    try db.put(.{}, "k", "third");
+    try db.put(.{}, "c", "cv"); // forces flush of {k=third, b=bv}
+
+    // Multiple L0 files exist.
+    try testing.expect(db.versions.currentVersion().files[0].items.len >= 2);
+
+    // The newest version of "k" wins across the L0 files.
+    {
+        const got = try db.get(.{}, "k") orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings("third", got);
+    }
+
+    // Distinct keys from different flushes are all present.
+    for ([_]struct { k: []const u8, v: []const u8 }{
+        .{ .k = "a", .v = "av" },
+        .{ .k = "b", .v = "bv" },
+        .{ .k = "c", .v = "cv" },
+    }) |kv| {
+        const got = try db.get(.{}, kv.k) orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings(kv.v, got);
     }
 }
