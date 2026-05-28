@@ -138,12 +138,24 @@ pub const RealEnv = struct {
         return .{ .ptr = h, .vtable = &RealWritable.vtable };
     }
 
-    // RED stub — wired in the GREEN phase.
     fn newAppendableFile(ptr: *anyopaque, gpa: std.mem.Allocator, path: []const u8) Error!WritableFile {
-        _ = ptr;
-        _ = gpa;
-        _ = path;
-        return error.NotSupported;
+        const self: *RealEnv = @ptrCast(@alignCast(ptr));
+        // Open-or-create WITHOUT truncating, then position the positional-write
+        // cursor at the current end of file so appends extend existing content.
+        const file = self.root.createFile(self.io, path, .{ .truncate = false }) catch |e| return mapOpenErr(e);
+        const start: u64 = blk: {
+            const st = file.stat(self.io) catch |e| {
+                file.close(self.io);
+                return mapStatErr(e);
+            };
+            break :blk st.size;
+        };
+        const h = gpa.create(RealWritable) catch |e| {
+            file.close(self.io);
+            return e;
+        };
+        h.* = .{ .io = self.io, .gpa = gpa, .file = file, .offset = start };
+        return .{ .ptr = h, .vtable = &RealWritable.vtable };
     }
 
     fn newSequentialFile(ptr: *anyopaque, gpa: std.mem.Allocator, path: []const u8) Error!SequentialFile {

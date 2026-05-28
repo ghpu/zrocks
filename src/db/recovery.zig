@@ -39,10 +39,45 @@ pub fn replayLog(
     memtable: *MemTable,
     start_sequence: u64,
 ) !u64 {
-    _ = gpa;
-    _ = e;
-    _ = log_path;
-    _ = memtable;
-    _ = start_sequence;
-    @panic("TODO(m5.2): replayLog");
+    // A missing log (never created, or no writes since the MANIFEST) is a
+    // no-op: nothing to replay, sequence unchanged.
+    if (!e.fileExists(log_path)) return start_sequence;
+
+    var sf = try e.newSequentialFile(gpa, log_path);
+    defer sf.close() catch {};
+
+    var reader = log_reader.Reader.init(sf);
+
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(gpa);
+
+    // A reusable batch wrapping each record's contents.  We rewrap per record
+    // via setContents so the rep buffer is reused across the whole replay.
+    var batch = try WriteBatch.init(gpa);
+    defer batch.deinit(gpa);
+
+    var max_seq = start_sequence;
+
+    while (true) {
+        // Tolerate a corrupt/truncated tail as clean EOF: recover the committed
+        // prefix and stop without propagating a tail-corruption error.
+        const maybe_record = reader.readRecord(gpa, &scratch) catch |err| switch (err) {
+            error.Corruption => break,
+            else => return err,
+        };
+        const record = maybe_record orelse break;
+
+        try batch.setContents(gpa, record);
+
+        const first_sequence = batch.sequence();
+        const count = batch.count();
+        try write_path.insertBatch(memtable, &batch, first_sequence);
+
+        if (count > 0) {
+            const last = first_sequence + count - 1;
+            if (last > max_seq) max_seq = last;
+        }
+    }
+
+    return max_seq;
 }

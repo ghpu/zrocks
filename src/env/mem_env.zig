@@ -100,12 +100,29 @@ pub const MemEnv = struct {
         return .{ .ptr = h, .vtable = &MemWritable.vtable };
     }
 
-    // RED stub — wired in the GREEN phase.
     fn newAppendableFile(ptr: *anyopaque, gpa: std.mem.Allocator, path: []const u8) Error!WritableFile {
-        _ = ptr;
-        _ = gpa;
-        _ = path;
-        return error.NotSupported;
+        const self: *MemEnv = @ptrCast(@alignCast(ptr));
+        // Append semantics: the writable's buffer is seeded with the existing
+        // committed bytes (if any) so flush/close (which replace the file with
+        // `buf.items`) extend rather than truncate.  If the path doesn't exist,
+        // create it empty (like newWritableFile).
+        const existing = self.get(path);
+        if (existing == null) try self.store(path, "");
+
+        const h = try gpa.create(MemWritable);
+        errdefer gpa.destroy(h);
+        const owned_path = try gpa.dupe(u8, path);
+        errdefer gpa.free(owned_path);
+
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        if (existing) |bytes| {
+            buf.appendSlice(gpa, bytes) catch |err| {
+                buf.deinit(gpa);
+                return err;
+            };
+        }
+        h.* = .{ .me = self, .gpa = gpa, .path = owned_path, .buf = buf };
+        return .{ .ptr = h, .vtable = &MemWritable.vtable };
     }
 
     fn newSequentialFile(ptr: *anyopaque, gpa: std.mem.Allocator, path: []const u8) Error!SequentialFile {
