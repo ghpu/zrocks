@@ -1,21 +1,26 @@
 //! db.zig — the embedded key/value store (M4.1 store + M5.2 durability +
-//! M6.0 SST read path).
+//! M6.0 SST read path + M6.1 flush).
 //!
 //! Ties the building blocks into a usable DB: a MemTable behind a write-ahead
 //! log plus the on-disk SSTs of the current Version, with snapshot-aware point
 //! lookups and a tombstone-hiding forward iterator.  `open` recovers durable
 //! state: a VersionSet reconstructs the MANIFEST/CURRENT and the active WAL is
 //! replayed into the MemTable, then that SAME log is reused for new appends so
-//! committed writes survive reopen (the "reuse-logs" design).  No flush to SST
-//! / immutable memtable / compaction yet — SSTs are injected via VersionEdit
-//! until M6.1 adds flush.
+//! committed writes survive reopen (the "reuse-logs" design).
 //!
-//! Reads consult the MemTable FIRST (newest writes) and fall through to the
-//! current Version's SSTs via a `TableCache` (M6.0).  `get` returns the newest
-//! value visible at the snapshot, or null on a tombstone/absence.
-//! `newIterator` merges the memtable iterator with one iterator per SST file
-//! into a `MergingIterator` (ordered by the InternalKeyComparator) and wraps it
-//! in a `DBIterator` for user-facing snapshot/tombstone semantics.
+//! Flush (M6.1): when the live MemTable exceeds `write_buffer_size`, `write`
+//! rotates it into an immutable MemTable + a fresh WAL and synchronously writes
+//! it to a new L0 SSTable (see flush.zig), recording the file + rotated log in
+//! the MANIFEST.  No leveled compaction yet (M6.2) — flush only ever produces
+//! L0 files; the flush is synchronous (TODO: background flush thread).
+//!
+//! Reads consult the live MemTable FIRST (newest writes), then the immutable
+//! MemTable being flushed (if any), then the current Version's SSTs via a
+//! `TableCache`.  `get` returns the newest value visible at the snapshot, or
+//! null on a tombstone/absence.  `newIterator` merges the memtable iterator(s)
+//! with one iterator per SST file into a `MergingIterator` (ordered by the
+//! InternalKeyComparator) and wraps it in a `DBIterator` for user-facing
+//! snapshot/tombstone semantics.
 //!
 //! Standalone test note (Zig 0.16): this file uses `../...` imports that only
 //! resolve when compiled as part of the `src`-rooted module.  To run the suite:

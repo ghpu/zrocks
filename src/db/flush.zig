@@ -111,23 +111,19 @@ pub fn flushMemTable(
         try wf.close();
     }
 
-    // An empty memtable produces no L0 file; just delete the (empty) table and
-    // rotate the log via the edit below.  In practice flush is only triggered
-    // when the memtable is non-empty, but stay defensive.
-    if (num_entries == 0) {
-        e.deleteFile(path) catch {};
-        var edit = version_edit.VersionEdit.init();
-        defer edit.deinit(gpa);
-        edit.setLogNumber(new_log_number);
-        edit.setLastSequence(last_sequence);
-        try versions.logAndApply(&edit);
-        return;
-    }
-
     var edit = version_edit.VersionEdit.init();
     defer edit.deinit(gpa);
-    // addFile dupes the key bytes into edit-owned memory.
-    try edit.addFile(gpa, 0, file_number, file_size, smallest.?, largest.?);
+
+    if (num_entries == 0) {
+        // An empty memtable produces no L0 file; drop the (empty) table.  In
+        // practice flush is only triggered when the memtable is non-empty, but
+        // stay defensive so the log rotation below still happens.
+        e.deleteFile(path) catch {};
+    } else {
+        // addFile dupes the key bytes into edit-owned memory.
+        try edit.addFile(gpa, 0, file_number, file_size, smallest.?, largest.?);
+    }
+
     // Rotate to the new active log and advance the last sequence so a later
     // recovery replays only the new (active) WAL — the old log's data is now in
     // this SST.
