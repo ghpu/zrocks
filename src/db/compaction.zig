@@ -1123,3 +1123,123 @@ test "M7.1: randomized merge gate vs counter reference (flush + compaction + reo
         try verifyCounterRef(gpa, db, &ref, key_space);
     }
 }
+
+// --- THE COMPACTION-FILTER GATE (M7.4) -------------------------------------
+
+const compaction_filter_mod = @import("../rocks/compaction_filter.zig");
+
+test "M7.4: compaction filter removes keys whose value has the configured prefix" {
+    const gpa = testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    var f = compaction_filter_mod.RemoveByValuePrefixFilter{ .prefix = "DEL" };
+    const db = try DB.open(gpa, e, "cf-remove", .{
+        .compaction_filter = f.filter(),
+        .write_buffer_size = 1, // tiny buffer -> flush per put
+        .level0_file_num_compaction_trigger = 2, // fire a compaction quickly
+    });
+    defer db.close();
+
+    // A mix of "DEL..."-valued keys (to be removed) and normal keys (kept).
+    try db.put(.{}, "a", "DELme");
+    try db.put(.{}, "b", "keep-b");
+    try db.put(.{}, "c", "DELme-too");
+    try db.put(.{}, "d", "keep-d");
+    try db.put(.{}, "e", "keep-e"); // extra writes force flushes + compaction
+
+    // Data has been pushed to L1 by compaction.
+    try testing.expect(levelFiles(db, 1) >= 1);
+
+    // The "DEL"-valued keys are gone; the normal keys remain with their values.
+    try testing.expect((try db.get(.{}, "a")) == null);
+    try testing.expect((try db.get(.{}, "c")) == null);
+    for ([_]struct { k: []const u8, v: []const u8 }{
+        .{ .k = "b", .v = "keep-b" },
+        .{ .k = "d", .v = "keep-d" },
+        .{ .k = "e", .v = "keep-e" },
+    }) |kv| {
+        const got = try db.get(.{}, kv.k) orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings(kv.v, got);
+    }
+}
+
+test "M7.4: compaction filter rewrites surviving values (change decision)" {
+    const gpa = testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    var f = compaction_filter_mod.AppendSuffixFilter{ .suffix = "!" };
+    const db = try DB.open(gpa, e, "cf-change", .{
+        .compaction_filter = f.filter(),
+        .write_buffer_size = 1,
+        .level0_file_num_compaction_trigger = 2,
+    });
+    defer db.close();
+
+    try db.put(.{}, "a", "av");
+    try db.put(.{}, "b", "bv");
+    try db.put(.{}, "c", "cv");
+    try db.put(.{}, "d", "dv");
+
+    try testing.expect(levelFiles(db, 1) >= 1);
+
+    // Every surviving value has the suffix appended by the filter.
+    for ([_]struct { k: []const u8, v: []const u8 }{
+        .{ .k = "a", .v = "av!" },
+        .{ .k = "b", .v = "bv!" },
+        .{ .k = "c", .v = "cv!" },
+        .{ .k = "d", .v = "dv!" },
+    }) |kv| {
+        const got = try db.get(.{}, kv.k) orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings(kv.v, got);
+    }
+}
+
+test "M7.4: compaction filter must not touch snapshot-protected entries" {
+    const gpa = testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    var f = compaction_filter_mod.RemoveByValuePrefixFilter{ .prefix = "DEL" };
+    const db = try DB.open(gpa, e, "cf-snap", .{
+        .compaction_filter = f.filter(),
+        .write_buffer_size = 1,
+        .level0_file_num_compaction_trigger = 2,
+    });
+    defer db.close();
+
+    // Write the value the filter would remove, then PIN it with a snapshot so a
+    // compaction must not drop it.
+    try db.put(.{}, "k", "DELme");
+    const snap = try db.getSnapshot();
+
+    // More writes to force flushes + a compaction while the snapshot is held.
+    try db.put(.{}, "a", "av");
+    try db.put(.{}, "b", "bv");
+    try db.put(.{}, "c", "cv");
+
+    // The snapshot read still sees the original value (filter left it alone
+    // because "k" is protected by the snapshot — its sequence > smallest_snapshot).
+    {
+        const got = try db.get(.{ .snapshot = snap.sequence }, "k") orelse
+            return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings("DELme", got);
+    }
+
+    // Release the snapshot, then force another compaction; now "k" is eligible
+    // and the filter removes it.
+    db.releaseSnapshot(snap);
+    try db.put(.{}, "d", "dv");
+    try db.put(.{}, "f", "fv");
+    try db.put(.{}, "g", "gv");
+    try db.put(.{}, "h", "hv");
+
+    try testing.expect((try db.get(.{}, "k")) == null);
+}

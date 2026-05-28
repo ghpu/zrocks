@@ -2,11 +2,15 @@ const std = @import("std");
 const comparator = @import("util/comparator.zig");
 const prefix = @import("rocks/prefix.zig");
 const merge_operator = @import("rocks/merge_operator.zig");
+const compaction_filter = @import("rocks/compaction_filter.zig");
 
 // Re-export so callers can write `options_mod.PrefixExtractor`.
 pub const PrefixExtractor = prefix.PrefixExtractor;
 // Re-export so callers can write `options_mod.MergeOperator` (M7.1).
 pub const MergeOperator = merge_operator.MergeOperator;
+// Re-export so callers can write `options_mod.CompactionFilter` / `.Decision` (M7.4).
+pub const CompactionFilter = compaction_filter.CompactionFilter;
+pub const Decision = compaction_filter.Decision;
 
 // ---------------------------------------------------------------------------
 // CompressionType — RocksDB-compatible byte values
@@ -63,6 +67,14 @@ pub const Options = struct {
     /// null, `DB.merge` is a usage error and any merge entry encountered on read
     /// is treated as not-found.
     merge_operator: ?merge_operator.MergeOperator = null,
+
+    /// Optional compaction filter (M7.4).  When set, each SURVIVING, newest
+    /// `.value` entry whose sequence is at-or-below the oldest live snapshot is
+    /// passed to the filter during compaction, which may keep it, drop it
+    /// (`.remove`), or rewrite its value (`.change`).  Entries protected by a
+    /// snapshot, merge operands, deletions, and older (hidden) versions are NOT
+    /// filtered.  Default null leaves compaction behaviour unchanged.
+    compaction_filter: ?compaction_filter.CompactionFilter = null,
 };
 
 // ---------------------------------------------------------------------------
