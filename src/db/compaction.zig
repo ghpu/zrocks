@@ -86,12 +86,10 @@ pub fn pickCompaction(
     // --- inputs[0]: file(s) from `level` -----------------------------------
     if (level == 0) {
         // Pick the first L0 file, then expand to every L0 file overlapping the
-        // accumulated range (L0 files overlap arbitrarily).
+        // accumulated range (L0 files overlap arbitrarily).  overlappingInputs
+        // returns a fresh deep-owned list, so take it directly.
         const first = v.files[0].items[0];
-        var expanded = try v.overlappingInputs(gpa, 0, first.smallest, first.largest, user_cmp);
-        // `expanded` already deep-owns its bytes; move it into inputs[0].
-        c.inputs[0] = expanded;
-        expanded = .empty;
+        c.inputs[0] = try v.overlappingInputs(gpa, 0, first.smallest, first.largest, user_cmp);
     } else {
         // Pick the first file at this level (TODO: round-robin compact pointer).
         const first = v.files[level].items[0];
@@ -107,9 +105,7 @@ pub fn pickCompaction(
     const range = keyRange(c.inputs[0].items, user_cmp);
 
     // --- inputs[1]: overlapping files at level+1 ---------------------------
-    var lvl1 = try v.overlappingInputs(gpa, level + 1, range.smallest, range.largest, user_cmp);
-    c.inputs[1] = lvl1;
-    lvl1 = .empty;
+    c.inputs[1] = try v.overlappingInputs(gpa, level + 1, range.smallest, range.largest, user_cmp);
 
     return c;
 }
