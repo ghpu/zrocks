@@ -14,11 +14,24 @@
 /// Every block (data/filter/metaindex/index) is written via writeRawBlock:
 /// the block contents, then a 5-byte trailer = [compression_type] ++
 /// fixed32_LE(mask(extend(value(contents), &[compression_type]))).
+///
+/// M7.2 prefix filter (mode): when `options.prefix_extractor` is set, the
+/// SST's filter block is built over key PREFIXES rather than whole keys — for
+/// each added internal key we extract the user key and, if it is in the
+/// extractor's domain, add `transform(user_key)` to the filter; out-of-domain
+/// keys are not added.  When no prefix extractor is set we keep the original
+/// whole-(internal-)key filter.  This is a single-mode choice (prefix XOR
+/// whole-key) rather than RocksDB's combined `whole_key_filtering` + prefix
+/// filter; the reader's pruning matches whichever mode the table was built in
+/// (driven by the same `options.prefix_extractor`).
+/// TODO(m7.x): RocksDB's exact prefix-filter on-block layout differs; this is
+/// our own clean prefix filter over the existing block-based layout.
 const std = @import("std");
 
 const block = @import("block.zig");
 const filter_block = @import("filter_block.zig");
 const bloom = @import("bloom.zig");
+const internal_key = @import("internal_key.zig");
 const footer_mod = @import("footer.zig");
 const crc32c = @import("../util/crc32c.zig");
 const coding = @import("../util/coding.zig");
@@ -135,8 +148,20 @@ pub const TableBuilder = struct {
             try self.appendIndexEntry();
         }
 
-        // Record the key in the filter.
-        try self.filter.addKey(self.gpa, key);
+        // Record the key in the filter.  M7.2: when a prefix_extractor is
+        // configured, the filter is built over key PREFIXES — extract the user
+        // key from the internal key and, if it is in the extractor's domain, add
+        // its prefix; out-of-domain keys are simply not added (so they cannot be
+        // pruned, and the reader must never prune them either).  Without a prefix
+        // extractor the filter is built over the whole (internal) key as before.
+        if (self.options.prefix_extractor) |pe| {
+            const user_key = internal_key.extractUserKey(key);
+            if (pe.inDomain(user_key)) {
+                try self.filter.addKey(self.gpa, pe.transform(user_key));
+            }
+        } else {
+            try self.filter.addKey(self.gpa, key);
+        }
 
         // Remember last_key = key.
         self.last_key.clearRetainingCapacity();

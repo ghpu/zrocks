@@ -1,5 +1,9 @@
 const std = @import("std");
 const comparator = @import("util/comparator.zig");
+const prefix = @import("rocks/prefix.zig");
+
+// Re-export so callers can write `options_mod.PrefixExtractor`.
+pub const PrefixExtractor = prefix.PrefixExtractor;
 
 // ---------------------------------------------------------------------------
 // CompressionType — RocksDB-compatible byte values
@@ -41,6 +45,13 @@ pub const Options = struct {
     /// Target size of a single compaction-output SSTable; the compaction rolls
     /// over to a fresh output file once the current one reaches this size.
     target_file_size_base: u64 = 2 * 1024 * 1024,
+
+    /// Optional prefix extractor (M7.2).  When set, SST filter blocks are built
+    /// over key PREFIXES (instead of whole user keys) so point lookups can prune
+    /// files/blocks whose prefix isn't present, and prefix-bounded iteration
+    /// becomes available (see `ReadOptions.prefix_same_as_start`).  Default null
+    /// keeps the original whole-key bloom behaviour.
+    prefix_extractor: ?prefix.PrefixExtractor = null,
 };
 
 // ---------------------------------------------------------------------------
@@ -53,6 +64,12 @@ pub const ReadOptions = struct {
     /// Sequence-number placeholder for snapshot reads.
     // TODO: typed Snapshot in M6
     snapshot: ?u64 = null,
+    /// Prefix-bounded scan (M7.2).  When true AND a `prefix_extractor` is
+    /// configured, a `DBIterator` positioned with `seek(target)` iterates only
+    /// entries whose user-key prefix equals the seek target's prefix; `valid()`
+    /// becomes false once the prefix changes.  Has no effect without a prefix
+    /// extractor or when scanning via `seekToFirst`.
+    prefix_same_as_start: bool = false,
 };
 
 // ---------------------------------------------------------------------------

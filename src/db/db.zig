@@ -445,6 +445,10 @@ pub const DB = struct {
         var dbit = DBIterator.init(gpa, merger.iterator(), self.options.comparator, seq);
         dbit.owned_inner = merger;
         dbit.owned_inner_destroy = destroyMerger;
+        // M7.2: thread the prefix extractor + prefix-bounded scan flag so a
+        // `seek` can bound iteration to the seek target's prefix.
+        dbit.prefix_extractor = self.options.prefix_extractor;
+        dbit.prefix_same_as_start = ropts.prefix_same_as_start;
         return dbit;
     }
 
@@ -1136,6 +1140,53 @@ test "M6.0: SST tombstone hides an older memtable value at the right snapshot" {
         defer gpa.free(got);
         try testing.expectEqualStrings("kept", got);
     }
+}
+
+// ===========================================================================
+// M7.2 — prefix-bounded iteration.
+// ===========================================================================
+
+const prefix_mod = @import("../rocks/prefix.zig");
+
+test "M7.2: prefix_same_as_start scan stops at the prefix boundary" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    // A 2-byte fixed prefix extractor.  It must live for the DB's lifetime
+    // (the Options copy holds a PrefixExtractor whose ctx points into it).
+    var fpe = prefix_mod.FixedPrefixExtractor.init(2);
+    const db = try DB.open(gpa, e, "pfxscan", .{ .prefix_extractor = fpe.extractor() });
+    defer db.close();
+
+    try db.put(.{}, "aa1", "1");
+    try db.put(.{}, "aa2", "2");
+    try db.put(.{}, "bb1", "3");
+
+    // Prefix-bounded scan from "aa": only "aa1","aa2", then invalid (does NOT
+    // continue into "bb1" whose prefix differs).
+    var it = try db.newIterator(gpa, .{ .prefix_same_as_start = true });
+    defer it.deinit();
+
+    const exp_k = [_][]const u8{ "aa1", "aa2" };
+    var i: usize = 0;
+    it.seek("aa");
+    while (it.valid()) : (it.next()) {
+        try testing.expect(i < exp_k.len);
+        try testing.expectEqualStrings(exp_k[i], it.key());
+        i += 1;
+    }
+    try testing.expectEqual(exp_k.len, i);
+    try testing.expect(it.status() == null);
+
+    // Sanity: WITHOUT prefix_same_as_start, the scan crosses into "bb1".
+    var it2 = try db.newIterator(gpa, .{});
+    defer it2.deinit();
+    var seen: usize = 0;
+    it2.seek("aa");
+    while (it2.valid()) : (it2.next()) seen += 1;
+    try testing.expectEqual(@as(usize, 3), seen);
 }
 
 // ===========================================================================

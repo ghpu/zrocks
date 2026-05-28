@@ -146,6 +146,16 @@ pub const FilterBlockReader = struct {
         return reader;
     }
 
+    /// Prefix-filter probe (M7.2).  The filter block is content-agnostic — it
+    /// hashes raw bytes — so a prefix-keyed filter is consulted exactly like a
+    /// whole-key one; this is a named alias of `keyMayMatch` documenting that
+    /// `prefix` is a key prefix (from a PrefixExtractor) rather than a full key.
+    /// Returns false ONLY when the filter proves the prefix absent in the range;
+    /// a conservative true (no/empty filter, malformed) is always safe.
+    pub fn prefixMayMatch(self: *const FilterBlockReader, block_offset: u64, prefix: []const u8) bool {
+        return self.keyMayMatch(block_offset, prefix);
+    }
+
     pub fn keyMayMatch(self: *const FilterBlockReader, block_offset: u64, key: []const u8) bool {
         const index: u64 = block_offset >> self.base_lg;
         if (index >= self.num) {
@@ -225,6 +235,33 @@ test "empty filter range returns conservative match" {
     // A very large offset maps to a filter index with no keys (empty range).
     // LevelDB returns true (no information => potential match).
     try std.testing.expect(reader.keyMayMatch(9_000_000, "anything"));
+}
+
+test "prefix filter: no false negatives for present prefixes, prunes absent" {
+    // M7.2: a filter built over key PREFIXES is probed via `prefixMayMatch`.
+    // Keys "abc1","abc2","xyz1" with a 3-byte fixed prefix → prefixes
+    // {"abc","xyz"}.  Every present prefix must report may-match (no false
+    // negatives); an absent prefix ("qqq") must be pruned (no match).
+    const gpa = std.testing.allocator;
+    const policy = bloom.BloomFilterPolicy.init(10);
+
+    var builder = FilterBlockBuilder.init(gpa, policy);
+    defer builder.deinit(gpa);
+
+    try builder.startBlock(gpa, 0);
+    // Add prefixes (simulating TableBuilder prefix mode).
+    try builder.addKey(gpa, "abc");
+    try builder.addKey(gpa, "abc");
+    try builder.addKey(gpa, "xyz");
+
+    const contents = try builder.finish(gpa);
+    var reader = FilterBlockReader.init(policy, contents);
+
+    // Present prefixes → may-match (NEVER a false negative).
+    try std.testing.expect(reader.prefixMayMatch(0, "abc"));
+    try std.testing.expect(reader.prefixMayMatch(0, "xyz"));
+    // Absent prefix → pruned.
+    try std.testing.expect(!reader.prefixMayMatch(0, "qqq"));
 }
 
 test "builder finish with no keys is well-formed" {
