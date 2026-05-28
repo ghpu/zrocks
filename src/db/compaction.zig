@@ -665,3 +665,187 @@ test "M6.2: randomized 2000-op gate vs reference map (get + scan + reopen)" {
         try verifyAgainstRef(gpa, db, &ref, key_space);
     }
 }
+
+// --- THE MERGE GATE (M7.1) -------------------------------------------------
+
+const merge_operator_mod = @import("../rocks/merge_operator.zig");
+const Uint64AddOperator = merge_operator_mod.Uint64AddOperator;
+
+/// Reference model for u64-counter merge semantics: put=set, merge=add,
+/// delete=remove.  A merge on an absent key starts the accumulation from 0.
+const CounterRef = struct {
+    map: std.StringHashMapUnmanaged(u64) = .empty,
+    gpa: std.mem.Allocator,
+
+    fn init(gpa: std.mem.Allocator) CounterRef {
+        return .{ .gpa = gpa };
+    }
+    fn deinit(self: *CounterRef) void {
+        var it = self.map.iterator();
+        while (it.next()) |entry| self.gpa.free(entry.key_ptr.*);
+        self.map.deinit(self.gpa);
+    }
+    fn put(self: *CounterRef, key: []const u8, value: u64) !void {
+        const gop = try self.map.getOrPut(self.gpa, key);
+        if (!gop.found_existing) gop.key_ptr.* = try self.gpa.dupe(u8, key);
+        gop.value_ptr.* = value;
+    }
+    fn merge(self: *CounterRef, key: []const u8, operand: u64) !void {
+        const gop = try self.map.getOrPut(self.gpa, key);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try self.gpa.dupe(u8, key);
+            gop.value_ptr.* = 0;
+        }
+        gop.value_ptr.* +%= operand;
+    }
+    fn delete(self: *CounterRef, key: []const u8) void {
+        if (self.map.fetchRemove(key)) |kv| self.gpa.free(kv.key);
+    }
+    fn get(self: *CounterRef, key: []const u8) ?u64 {
+        return self.map.get(key);
+    }
+};
+
+fn u64le(buf: *[8]u8, v: u64) []const u8 {
+    std.mem.writeInt(u64, buf, v, .little);
+    return buf[0..];
+}
+
+fn decU64(bytes: []const u8) !u64 {
+    if (bytes.len != 8) return error.TestBadValueLen;
+    return std.mem.readInt(u64, bytes[0..8], .little);
+}
+
+/// Assert DB.get matches the counter reference for every key, and a full scan
+/// equals the sorted live entries (with merged values).
+fn verifyCounterRef(gpa: std.mem.Allocator, db: *DB, ref: *CounterRef, key_space: usize) !void {
+    var i: usize = 0;
+    while (i < key_space) : (i += 1) {
+        var kbuf: [8]u8 = undefined;
+        const k = try std.fmt.bufPrint(&kbuf, "key{d:0>3}", .{i});
+        const want = ref.get(k);
+        const got = try db.get(.{}, k);
+        if (want) |w| {
+            const g = got orelse {
+                std.debug.print("missing key {s}: ref={d} db=null\n", .{ k, w });
+                return error.TestKeyMissing;
+            };
+            defer gpa.free(g);
+            const gv = try decU64(g);
+            if (gv != w) {
+                std.debug.print("mismatch key {s}: ref={d} db={d}\n", .{ k, w, gv });
+                return error.TestValueMismatch;
+            }
+        } else {
+            if (got) |g| {
+                defer gpa.free(g);
+                std.debug.print("unexpected key {s}: db={d}\n", .{ k, try decU64(g) });
+                return error.TestUnexpectedKey;
+            }
+        }
+    }
+
+    // Full scan == sorted live reference entries.
+    var sorted_keys: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer sorted_keys.deinit(gpa);
+    var it_ref = ref.map.iterator();
+    while (it_ref.next()) |entry| try sorted_keys.append(gpa, entry.key_ptr.*);
+    std.mem.sort([]const u8, sorted_keys.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lt);
+
+    var it = try db.newIterator(gpa, .{});
+    defer it.deinit();
+    var idx: usize = 0;
+    it.seekToFirst();
+    while (it.valid()) : (it.next()) {
+        if (idx >= sorted_keys.items.len) {
+            std.debug.print("scan has extra key {s}\n", .{it.key()});
+            return error.TestScanTooLong;
+        }
+        const want_k = sorted_keys.items[idx];
+        const want_v = ref.get(want_k).?;
+        if (!std.mem.eql(u8, want_k, it.key())) {
+            std.debug.print("scan key mismatch at {d}: ref={s} db={s}\n", .{ idx, want_k, it.key() });
+            return error.TestScanKeyMismatch;
+        }
+        const got_v = try decU64(it.value());
+        if (got_v != want_v) {
+            std.debug.print("scan value mismatch at key {s}: ref={d} db={d}\n", .{ want_k, want_v, got_v });
+            return error.TestScanValueMismatch;
+        }
+        idx += 1;
+    }
+    if (idx != sorted_keys.items.len) {
+        std.debug.print("scan too short: got {d} want {d}\n", .{ idx, sorted_keys.items.len });
+        return error.TestScanTooShort;
+    }
+    try testing.expect(it.status() == null);
+}
+
+test "M7.1: randomized merge gate vs counter reference (flush + compaction + reopen)" {
+    const gpa = testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    var add = Uint64AddOperator{};
+    const key_space: usize = 40; // small key space -> heavy operand stacking
+    const opts = options_mod.Options{
+        .merge_operator = add.operator(),
+        .write_buffer_size = 256, // many flushes
+        .level0_file_num_compaction_trigger = 2, // many compactions
+        .max_bytes_for_level_base = 4096, // small levels -> deep compaction
+        .target_file_size_base = 2048, // small output files
+    };
+
+    var ref = CounterRef.init(gpa);
+    defer ref.deinit();
+
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE_5EED);
+    const rand = prng.random();
+
+    {
+        const db = try DB.open(gpa, e, "mergefuzz", opts);
+        defer db.close();
+
+        var op: usize = 0;
+        while (op < 3000) : (op += 1) {
+            const key_idx = rand.uintLessThan(usize, key_space);
+            var kbuf: [8]u8 = undefined;
+            const k = try std.fmt.bufPrint(&kbuf, "key{d:0>3}", .{key_idx});
+
+            const roll = rand.uintLessThan(u32, 100);
+            var vbuf: [8]u8 = undefined;
+            if (roll < 60) {
+                // 60% merge (add a small operand).
+                const operand = rand.uintLessThan(u64, 100);
+                try db.merge(.{}, k, u64le(&vbuf, operand));
+                try ref.merge(k, operand);
+            } else if (roll < 85) {
+                // 25% put (set a base).
+                const value = rand.uintLessThan(u64, 1000);
+                try db.put(.{}, k, u64le(&vbuf, value));
+                try ref.put(k, value);
+            } else {
+                // 15% delete.
+                try db.delete(.{}, k);
+                ref.delete(k);
+            }
+
+            if (op % 300 == 299) {
+                try verifyCounterRef(gpa, db, &ref, key_space);
+            }
+        }
+        try verifyCounterRef(gpa, db, &ref, key_space);
+    }
+
+    // Reopen: merges must survive compaction + recovery.
+    {
+        const db = try DB.open(gpa, e, "mergefuzz", opts);
+        defer db.close();
+        try verifyCounterRef(gpa, db, &ref, key_space);
+    }
+}

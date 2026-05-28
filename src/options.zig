@@ -1,9 +1,12 @@
 const std = @import("std");
 const comparator = @import("util/comparator.zig");
 const prefix = @import("rocks/prefix.zig");
+const merge_operator = @import("rocks/merge_operator.zig");
 
 // Re-export so callers can write `options_mod.PrefixExtractor`.
 pub const PrefixExtractor = prefix.PrefixExtractor;
+// Re-export so callers can write `options_mod.MergeOperator` (M7.1).
+pub const MergeOperator = merge_operator.MergeOperator;
 
 // ---------------------------------------------------------------------------
 // CompressionType — RocksDB-compatible byte values
@@ -52,6 +55,14 @@ pub const Options = struct {
     /// becomes available (see `ReadOptions.prefix_same_as_start`).  Default null
     /// keeps the original whole-key bloom behaviour.
     prefix_extractor: ?prefix.PrefixExtractor = null,
+
+    /// Optional merge operator (M7.1).  When set, `DB.merge(key, operand)`
+    /// records a read-modify-write operand that is combined lazily — on read,
+    /// via the iterator, and during compaction — with the existing value and
+    /// any other pending operands for the key (e.g. an additive counter).  When
+    /// null, `DB.merge` is a usage error and any merge entry encountered on read
+    /// is treated as not-found.
+    merge_operator: ?merge_operator.MergeOperator = null,
 };
 
 // ---------------------------------------------------------------------------

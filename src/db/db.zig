@@ -1190,6 +1190,220 @@ test "M7.2: prefix_same_as_start scan stops at the prefix boundary" {
 }
 
 // ===========================================================================
+// M7.1 — MergeOperator: lazy read-modify-write operands.
+// ===========================================================================
+
+const merge_operator_mod = @import("../rocks/merge_operator.zig");
+const Uint64AddOperator = merge_operator_mod.Uint64AddOperator;
+
+/// Build an 8-byte LE u64 in a caller buffer (merge-operand helper for tests).
+fn u64le(buf: *[8]u8, v: u64) []const u8 {
+    std.mem.writeInt(u64, buf, v, .little);
+    return buf[0..];
+}
+
+/// Decode an 8-byte LE u64 (test helper).
+fn decU64(bytes: []const u8) u64 {
+    try testing.expectEqual(@as(usize, 8), bytes.len);
+    return std.mem.readInt(u64, bytes[0..8], .little);
+}
+
+test "M7.1 merge: merge on empty key sums from 0" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+
+    var add = Uint64AddOperator{};
+    const db = try DB.open(gpa, me.env(), "mergebasic", .{ .merge_operator = add.operator() });
+    defer db.close();
+
+    var b: [8]u8 = undefined;
+    try db.merge(.{}, "c", u64le(&b, 5));
+    {
+        const got = try db.get(.{}, "c") orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqual(@as(u64, 5), decU64(got));
+    }
+
+    try db.merge(.{}, "c", u64le(&b, 3));
+    {
+        const got = try db.get(.{}, "c") orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqual(@as(u64, 8), decU64(got));
+    }
+}
+
+test "M7.1 merge: put base then merge operand combines" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+
+    var add = Uint64AddOperator{};
+    const db = try DB.open(gpa, me.env(), "mergebase", .{ .merge_operator = add.operator() });
+    defer db.close();
+
+    var b: [8]u8 = undefined;
+    try db.put(.{}, "c", u64le(&b, 100));
+    try db.merge(.{}, "c", u64le(&b, 1));
+
+    const got = try db.get(.{}, "c") orelse return error.TestExpectedFound;
+    defer gpa.free(got);
+    try testing.expectEqual(@as(u64, 101), decU64(got));
+}
+
+test "M7.1 merge: delete then merge starts a fresh accumulation" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+
+    var add = Uint64AddOperator{};
+    const db = try DB.open(gpa, me.env(), "mergedel", .{ .merge_operator = add.operator() });
+    defer db.close();
+
+    var b: [8]u8 = undefined;
+    try db.put(.{}, "c", u64le(&b, 100));
+    try db.delete(.{}, "c");
+    try db.merge(.{}, "c", u64le(&b, 7));
+
+    const got = try db.get(.{}, "c") orelse return error.TestExpectedFound;
+    defer gpa.free(got);
+    // Delete stops the merge — operand merges with no base → 7.
+    try testing.expectEqual(@as(u64, 7), decU64(got));
+}
+
+test "M7.1 merge: many operands accumulate" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+
+    var add = Uint64AddOperator{};
+    const db = try DB.open(gpa, me.env(), "mergemany", .{ .merge_operator = add.operator() });
+    defer db.close();
+
+    var b: [8]u8 = undefined;
+    var expected: u64 = 0;
+    var i: u64 = 1;
+    while (i <= 50) : (i += 1) {
+        try db.merge(.{}, "c", u64le(&b, i));
+        expected += i;
+    }
+    const got = try db.get(.{}, "c") orelse return error.TestExpectedFound;
+    defer gpa.free(got);
+    try testing.expectEqual(expected, decU64(got));
+}
+
+test "M7.1 merge: null operator -> merge entry treated as not-found on get" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+
+    // No merge_operator configured.
+    const db = try DB.open(gpa, me.env(), "mergenull", .{});
+    defer db.close();
+
+    // DB.merge with no operator is a usage error.
+    var b: [8]u8 = undefined;
+    try testing.expectError(error.MergeOperatorNotConfigured, db.merge(.{}, "c", u64le(&b, 1)));
+}
+
+test "M7.1 merge: get reads merge across a flush boundary" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+
+    var add = Uint64AddOperator{};
+    // Tiny write buffer so operands spread across SSTs + the live memtable.
+    const db = try DB.open(gpa, me.env(), "mergeflush", .{
+        .merge_operator = add.operator(),
+        .write_buffer_size = 1,
+    });
+    defer db.close();
+
+    var b: [8]u8 = undefined;
+    try db.put(.{}, "c", u64le(&b, 10)); // base -> flush
+    try db.merge(.{}, "c", u64le(&b, 1)); // operand -> flush
+    try db.merge(.{}, "c", u64le(&b, 2)); // operand -> flush
+    try db.merge(.{}, "c", u64le(&b, 3)); // operand (live memtable)
+
+    const got = try db.get(.{}, "c") orelse return error.TestExpectedFound;
+    defer gpa.free(got);
+    try testing.expectEqual(@as(u64, 16), decU64(got));
+}
+
+test "M7.1 merge: iterator scan surfaces merged values" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+
+    var add = Uint64AddOperator{};
+    const db = try DB.open(gpa, me.env(), "mergeiter", .{ .merge_operator = add.operator() });
+    defer db.close();
+
+    var b: [8]u8 = undefined;
+    // a: base 10 + 1 + 2 = 13
+    try db.put(.{}, "a", u64le(&b, 10));
+    try db.merge(.{}, "a", u64le(&b, 1));
+    try db.merge(.{}, "a", u64le(&b, 2));
+    // b: pure merges 5 + 5 = 10
+    try db.merge(.{}, "b", u64le(&b, 5));
+    try db.merge(.{}, "b", u64le(&b, 5));
+    // d: plain put = 42
+    try db.put(.{}, "d", u64le(&b, 42));
+
+    var it = try db.newIterator(gpa, .{});
+    defer it.deinit();
+
+    const exp_k = [_][]const u8{ "a", "b", "d" };
+    const exp_v = [_]u64{ 13, 10, 42 };
+    var i: usize = 0;
+    it.seekToFirst();
+    while (it.valid()) : (it.next()) {
+        try testing.expect(i < exp_k.len);
+        try testing.expectEqualStrings(exp_k[i], it.key());
+        try testing.expectEqual(exp_v[i], decU64(it.value()));
+        i += 1;
+    }
+    try testing.expectEqual(exp_k.len, i);
+    try testing.expect(it.status() == null);
+}
+
+test "M7.1 merge: iterator scan surfaces merged values across a flush" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+
+    var add = Uint64AddOperator{};
+    const db = try DB.open(gpa, me.env(), "mergeiterflush", .{
+        .merge_operator = add.operator(),
+        .write_buffer_size = 1,
+    });
+    defer db.close();
+
+    var b: [8]u8 = undefined;
+    try db.put(.{}, "a", u64le(&b, 10)); // flush
+    try db.merge(.{}, "a", u64le(&b, 1)); // flush
+    try db.merge(.{}, "a", u64le(&b, 2)); // flush
+    try db.merge(.{}, "b", u64le(&b, 5)); // flush
+    try db.merge(.{}, "b", u64le(&b, 5)); // live
+
+    var it = try db.newIterator(gpa, .{});
+    defer it.deinit();
+
+    const exp_k = [_][]const u8{ "a", "b" };
+    const exp_v = [_]u64{ 13, 10 };
+    var i: usize = 0;
+    it.seekToFirst();
+    while (it.valid()) : (it.next()) {
+        try testing.expect(i < exp_k.len);
+        try testing.expectEqualStrings(exp_k[i], it.key());
+        try testing.expectEqual(exp_v[i], decU64(it.value()));
+        i += 1;
+    }
+    try testing.expectEqual(exp_k.len, i);
+    try testing.expect(it.status() == null);
+}
+
+// ===========================================================================
 // M6.1 — flush (memtable -> L0 SST): the durability-through-SST gate.
 // ===========================================================================
 
