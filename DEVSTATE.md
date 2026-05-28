@@ -4,11 +4,12 @@ zig_binary: /home/ghpu/zig/zig
 stdlib: /home/ghpu/zig/lib/std
 target_rocksdb: "9.x line; block-based table format_version 5; legacy WAL/MANIFEST log (see docs/adr/000-target-format.md)"
 active_phase: P0
-active_milestone: M0.0
-last_completed: bootstrap (repo skeleton on main)
-branch: milestone/m0.0-harness
-worktree: /home/ghpu/projets/zig/zrocks-wt/m0.0-harness
+active_milestone: M0.5
+last_completed: M0.0, M0.1, M0.2, M0.3, M0.4, M0.6 (Phase 0 foundation minus Options)
+branch: milestone/m0.5-options
+worktree: /home/ghpu/projets/zig/zrocks-wt/m0.5-options
 test_command: "/home/ghpu/zig/zig build test"
+test_count: 88
 updated: 2026-05-28
 ---
 
@@ -20,13 +21,13 @@ RocksDB reference: https://github.com/facebook/rocksdb/wiki
 ## Roadmap progress   [ ] todo   [~] active   [x] merged
 
 ### Phase 0 — Foundation
-- [~] M0.0 Build & harness  <-- ACTIVE
-- [ ] M0.1 Slice & Status
-- [ ] M0.2 Coding (varint + fixed)
-- [ ] M0.3 Comparator
-- [ ] M0.4 Arena
-- [ ] M0.5 Options
-- [ ] M0.6 CRC32C
+- [x] M0.0 Build & harness            (merged d17befc)
+- [x] M0.1 Slice & Status             (merged f4f605f)
+- [x] M0.2 Coding (varint + fixed)    (merged 9eaa0b0)
+- [x] M0.3 Comparator                 (merged 60bdb88)
+- [x] M0.4 Arena                      (merged 1abcd38)
+- [~] M0.5 Options  <-- ACTIVE
+- [x] M0.6 CRC32C                     (merged 352d647)
 
 ### Phase 1 — Environment
 - [ ] M1.0 Env over std.Io (+ MemEnv)
@@ -71,22 +72,24 @@ RocksDB reference: https://github.com/facebook/rocksdb/wiki
 - [ ] M7.6 Transactions (optimistic + pessimistic)
 - [ ] M7.7 Checkpoints
 
-## Active milestone: M0.0 — Build & test harness
+## Active milestone: M0.5 — Options
 - TDD state: not started
-- Files in flight: build.zig, build.zig.zon, src/root.zig, src/main.zig
+- Files in flight: src/options.zig
+- Depends on: M0.3 Comparator (Options.comparator holds a `comparator.Comparator`).
 - Acceptance checklist:
-  - [ ] `zig build` produces the static library artifact
-  - [ ] `zig build test` discovers & runs a trivial passing test (via refAllDecls in root.zig)
-  - [ ] module-first wiring; per-phase test steps stubbed (test, test:util, ...)
-  - [ ] zero leaks under std.testing.allocator
+  - [ ] Options / ReadOptions / WriteOptions with sane no-compression defaults
+  - [ ] default comparator = comparator.bytewise
+  - [ ] instantiable as plain value types; zig build test green, zero leaks
 
 ## Next steps (ordered)
-1. Dispatch M0.0 subagent into worktree milestone/m0.0-harness.
-2. Review → `zig build test` green → merge --no-ff to main → update this file → remove worktree.
-3. Proceed through Phase 0 (M0.1–M0.6), running independent milestones in parallel worktrees where safe.
+1. Dispatch M0.5 (Options) subagent into worktree milestone/m0.5-options.
+2. Merge → wire src/options.zig into root.zig → `zig build test` green → update this file → remove worktree.
+3. Phase 0 complete after M0.5. Then Phase 1: M1.0 Env over std.Io (+ MemEnv) — the first I/O milestone (Opus); isolates all the 0.16 Io threading.
 
 ## Decision log (ADR pointers)
 - ADR-000: RocksDB format target pinned (format_version 5 SST, legacy WAL/MANIFEST, CRC32C mask). docs/adr/000-target-format.md
+- Interface convention (from M0.3): runtime vtable = `struct { ctx: *const anyopaque, vtable: *const VTable }` with thin method wrappers calling `self.vtable.fn(self.ctx, ...)`. Reuse this for all runtime-swappable capabilities (comparator, filter policy, env files, iterators). See src/util/comparator.zig.
+- Parallel-batch workflow validated: independent foundation milestones built in 5 concurrent worktrees, each adding only its own file (verified standalone via `zig test <file>`), root.zig wiring done once at integration. Branches merged without conflict.
 
 ## 0.16 API gotchas (do not regress)
 1. No std.fs.File/Dir/cwd — use std.Io.Dir/std.Io.File; every call takes `io` (from std.Io.Threaded.io()).
