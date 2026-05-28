@@ -4,11 +4,11 @@ zig_binary: /home/ghpu/zig/zig
 stdlib: /home/ghpu/zig/lib/std
 target_rocksdb: "9.x line; block-based table format_version 5; legacy WAL/MANIFEST log (see docs/adr/000-target-format.md)"
 active_phase: P6
-active_milestone: "M6.1 Flush (memtable → L0 SST)"
-last_completed: M6.0 SST read path
-worktrees: "m6.1-flush"
+active_milestone: "M6.2 Leveled compaction"
+last_completed: M6.1 Flush (memtable→L0 SST; block/table now IKC-comparator-aware)
+worktrees: "m6.2-compaction"
 test_command: "/home/ghpu/zig/zig build test"
-test_count: 276
+test_count: 281
 updated: 2026-05-28
 ---
 
@@ -57,8 +57,8 @@ RocksDB reference: https://github.com/facebook/rocksdb/wiki
 
 ### Phase 6 — Compaction → full embedded KV store
 - [x] M6.0 SST read path (src/version/table_cache.zig + Iterator.deinit + Version.get/iters; DB reads memtable+SSTs)
-- [~] M6.1 Flush (immutable memtable → L0 SST + VersionEdit + log switch + write_buffer trigger)  <-- ACTIVE
-- [ ] M6.2 Leveled compaction (picker + job + tombstone drop below oldest snapshot)
+- [x] M6.1 Flush (immutable memtable → L0 SST + VersionEdit + log switch + write_buffer trigger)  (src/db/flush.zig)
+- [~] M6.2 Leveled compaction (picker + job + tombstone drop below oldest snapshot)  <-- ACTIVE
 - [ ] M6.3 Snapshots (full SnapshotList; compaction respects oldest)
 - [ ] GATE: LevelDB-equivalent core complete (+ CLI in main.zig, randomized integration test)
 
