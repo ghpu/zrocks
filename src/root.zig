@@ -12,6 +12,7 @@ pub const coding = @import("util/coding.zig");
 pub const comparator = @import("util/comparator.zig");
 pub const arena = @import("util/arena.zig");
 pub const crc32c = @import("util/crc32c.zig");
+pub const cache = @import("util/cache.zig");
 pub const options = @import("options.zig");
 
 // Environment / filesystem capability (Phase 1).

@@ -3,12 +3,12 @@ project: zrocks
 zig_binary: /home/ghpu/zig/zig
 stdlib: /home/ghpu/zig/lib/std
 target_rocksdb: "9.x line; block-based table format_version 5; legacy WAL/MANIFEST log (see docs/adr/000-target-format.md)"
-active_phase: P3
-active_milestone: "M3.5 LRU block cache + reader integration"
-last_completed: M3.4 TableReader
-worktrees: "m3.5-cache"
+active_phase: P4
+active_milestone: "M4.0 Iterator interface + merging + two-level"
+last_completed: M3.5 LRU block cache (Phase 3 COMPLETE)
+worktrees: "m4.0-iterators"
 test_command: "/home/ghpu/zig/zig build test"
-test_count: 196
+test_count: 204
 updated: 2026-05-28
 ---
 
@@ -44,7 +44,7 @@ RocksDB reference: https://github.com/facebook/rocksdb/wiki
 - [x] M3.2 Footer & BlockHandle        (src/format/footer.zig)
 - [x] M3.3 TableBuilder                (src/format/table_builder.zig)
 - [x] M3.4 TableReader                 (src/format/table_reader.zig)
-- [~] M3.5 LRU block cache + table cache  <-- ACTIVE
+- [x] M3.5 LRU block cache             (src/util/cache.zig + table_reader integration; file-handle/table cache deferred to M5.1)
 
 ### Phase 4 — Iterators & in-memory DB
 - [ ] M4.0 Iterator interface + merging/two-level
@@ -71,17 +71,18 @@ RocksDB reference: https://github.com/facebook/rocksdb/wiki
 - [ ] M7.6 Transactions (optimistic + pessimistic)
 - [ ] M7.7 Checkpoints
 
-## Active: Phase 3 — SST table assembly (sequential: M3.3 → M3.4 → M3.5)
-- M3.3 TableBuilder (O) — needs M3.0 block + M3.1 filter_block + M3.2 footer + crc32c + env. New: src/format/table_builder.zig. Writes data blocks (kNoCompression) + filter block + metaindex + index + footer, each block followed by `[type:u8][crc32c:u32]` trailer (masked CRC32C over block+type byte). Index block: one entry per data block, key = shortest separator, value = BlockHandle. Metaindex: "filter.<policy name>" -> filter BlockHandle.
-- M3.4 TableReader (O) — needs M3.3. Open via footer, read+verify blocks via Env RandomAccessFile.readAt, two-level iterator (index block -> data block), bloom shortcut on get. ROUND-TRIP vs builder is the key gate.
-- M3.5 LRU block cache + table cache (O) — needs M3.4.
-- NOTE (M3.0): Block.init takes (gpa, data); Block.Iter heap-grows a key buffer and needs Iter.deinit — TableReader must manage Iter lifetimes.
+## Active: Phase 4 — iterators + in-memory DB (sequential: M4.0 → M4.1)
+- M4.0 Iterator framework (O) — generic Iterator vtable interface (seekToFirst/seek/next/valid/key/value/status; reverse best-effort) + MergingIterator (merge N children by comparator) + generic TwoLevelIterator + a VectorIterator test helper. New: src/iterator/{iterator,merging_iterator,two_level_iterator}.zig. Deps: comparator only (tests use VectorIterator; adapters for memtable/table live in M4.1).
+- M4.1 In-memory DB (O) — needs M4.0 + memtable + WAL (log_writer) + write_batch + internal_key. New: src/db/{db,write_path,db_iter,snapshot}.zig. Put/Get/Delete/Write(batch) over a single memtable, WAL append on write, sequence assignment, DBIterator (snapshot + tombstone skipping over a merging iterator wrapping the memtable). Persistence/recovery deferred to Phase 5.
 
 ## Next steps (ordered)
-1. M3.3 TableBuilder (solo, Opus) → integrate.
-2. M3.4 TableReader (solo, Opus) → integrate (round-trip gate).
-3. M3.5 cache (solo, Opus) → integrate. Phase 3 done.
-4. Phase 4 — iterators + in-memory DB (M4.0 Iterator/merging/two-level, M4.1 in-memory DB Put/Get/Delete/Write/iter over WAL+MemTable).
+1. M4.0 iterator framework (solo, Opus) → integrate.
+2. M4.1 in-memory DB (solo, Opus) → integrate. Phase 4 done — first usable embedded KV (no persistence yet).
+3. Phase 5 — Version/MANIFEST + recovery (M5.0 VersionEdit, M5.1 VersionSet/MANIFEST, M5.2 recovery + RocksDB-DB read interop gate).
+4. Phase 6 — flush + leveled compaction + snapshots → LevelDB-equivalent core complete.
+
+## Engine capabilities so far (on main, 204 tests)
+Foundation (slice/status/coding/comparator/arena/crc32c/options) · Env capability over std.Io (+MemEnv) · WAL (byte-compat) · Skiplist · MemTable (snapshot+tombstone get) · WriteBatch · full block-based SST (block/bloom/filter/footer/TableBuilder/TableReader, byte-compat, CRC-verified, round-trips) · sharded LRU block cache.
 
 ## Decision log (ADR pointers)
 - ADR-000: RocksDB format target pinned (format_version 5 SST, legacy WAL/MANIFEST, CRC32C mask). docs/adr/000-target-format.md
