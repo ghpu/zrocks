@@ -16,51 +16,159 @@ const bloom = @import("bloom.zig");
 pub const kFilterBaseLg: u6 = 11;
 pub const kFilterBase: u64 = 1 << kFilterBaseLg;
 
-// RED: stub types — implemented in the GREEN phase.
-
+/// Builds a block-based filter block: one bloom filter per `kFilterBase`
+/// (2KB) range of the data-block region, mirroring LevelDB's
+/// `FilterBlockBuilder`.
 pub const FilterBlockBuilder = struct {
+    policy: bloom.BloomFilterPolicy,
+
+    /// Flattened concatenation of all keys added since the last filter emit.
+    keys: std.ArrayList(u8) = .empty,
+    /// Start offsets of each key within `keys` (plus a sentinel end offset).
+    start: std.ArrayList(usize) = .empty,
+    /// Accumulated filter result bytes (one bloom filter per range).
+    result: std.ArrayList(u8) = .empty,
+    /// Offset of each emitted filter within `result`.
+    filter_offsets: std.ArrayList(u32) = .empty,
+    /// Scratch slice list reused by generateFilter.
+    tmp_keys: std.ArrayList([]const u8) = .empty,
+
     pub fn init(gpa: std.mem.Allocator, policy: bloom.BloomFilterPolicy) FilterBlockBuilder {
         _ = gpa;
-        _ = policy;
-        return .{};
+        return .{ .policy = policy };
     }
 
     pub fn deinit(self: *FilterBlockBuilder, gpa: std.mem.Allocator) void {
-        _ = self;
-        _ = gpa;
+        self.keys.deinit(gpa);
+        self.start.deinit(gpa);
+        self.result.deinit(gpa);
+        self.filter_offsets.deinit(gpa);
+        self.tmp_keys.deinit(gpa);
     }
 
     pub fn startBlock(self: *FilterBlockBuilder, gpa: std.mem.Allocator, block_offset: u64) !void {
-        _ = self;
-        _ = gpa;
-        _ = block_offset;
+        const filter_index: u64 = block_offset / kFilterBase;
+        std.debug.assert(filter_index >= self.filter_offsets.items.len);
+        while (filter_index > self.filter_offsets.items.len) {
+            try self.generateFilter(gpa);
+        }
     }
 
     pub fn addKey(self: *FilterBlockBuilder, gpa: std.mem.Allocator, key: []const u8) !void {
-        _ = self;
-        _ = gpa;
-        _ = key;
+        try self.start.append(gpa, self.keys.items.len);
+        try self.keys.appendSlice(gpa, key);
     }
 
     pub fn finish(self: *FilterBlockBuilder, gpa: std.mem.Allocator) ![]const u8 {
-        _ = self;
-        _ = gpa;
-        return &.{};
+        // Flush any pending keys into a final filter.
+        if (self.start.items.len != 0) {
+            try self.generateFilter(gpa);
+        }
+
+        // Append array of per-filter offsets.
+        const array_offset: u32 = @intCast(self.result.items.len);
+        for (self.filter_offsets.items) |off| {
+            try coding.putFixed32(&self.result, gpa, off);
+        }
+        // Offset where the offset-array begins.
+        try coding.putFixed32(&self.result, gpa, array_offset);
+        // Save the base-lg in the final byte.
+        try self.result.append(gpa, kFilterBaseLg);
+
+        return self.result.items;
+    }
+
+    /// Generate a single bloom filter covering all currently pending keys and
+    /// record its starting offset, then clear the pending-key buffers.
+    fn generateFilter(self: *FilterBlockBuilder, gpa: std.mem.Allocator) !void {
+        const num_keys = self.start.items.len;
+        if (num_keys == 0) {
+            // No keys for this range: reuse the previous filter offset (empty
+            // filter), matching LevelDB.
+            try self.filter_offsets.append(gpa, @intCast(self.result.items.len));
+            return;
+        }
+
+        // Materialize pointers to each pending key as a slice-of-slices.
+        // Sentinel end offset so the last key's length is computable.
+        try self.start.append(gpa, self.keys.items.len);
+        self.tmp_keys.clearRetainingCapacity();
+        try self.tmp_keys.ensureTotalCapacity(gpa, num_keys);
+        var i: usize = 0;
+        while (i < num_keys) : (i += 1) {
+            const base = self.start.items[i];
+            const length = self.start.items[i + 1] - base;
+            self.tmp_keys.appendAssumeCapacity(self.keys.items[base..][0..length]);
+        }
+
+        // Record offset and generate the filter for this range of keys.
+        try self.filter_offsets.append(gpa, @intCast(self.result.items.len));
+        try self.policy.createFilter(gpa, self.tmp_keys.items, &self.result);
+
+        // Reset pending-key state for the next range.
+        self.tmp_keys.clearRetainingCapacity();
+        self.keys.clearRetainingCapacity();
+        self.start.clearRetainingCapacity();
     }
 };
 
+/// Reads a block-based filter block produced by `FilterBlockBuilder`,
+/// mirroring LevelDB's `FilterBlockReader`.
 pub const FilterBlockReader = struct {
+    policy: bloom.BloomFilterPolicy,
+    /// Full filter-block contents (not owned).
+    data: []const u8,
+    /// Pointer to the start of the offset array within `data`.
+    offset_array: usize,
+    /// Number of filters (length of the offset array).
+    num: usize,
+    /// log2 of the per-filter range; recovered from the trailing byte.
+    base_lg: u6,
+
     pub fn init(policy: bloom.BloomFilterPolicy, contents: []const u8) FilterBlockReader {
-        _ = policy;
-        _ = contents;
-        return .{};
+        var reader = FilterBlockReader{
+            .policy = policy,
+            .data = contents,
+            .offset_array = 0,
+            .num = 0,
+            .base_lg = kFilterBaseLg,
+        };
+
+        const n = contents.len;
+        // Need at least the 1-byte base-lg and the 4-byte array offset.
+        if (n < 5) return reader;
+
+        reader.base_lg = @intCast(contents[n - 1]);
+        const last_word = coding.decodeFixed32(contents[n - 5 ..][0..4]);
+        if (last_word > n - 5) return reader; // malformed
+        reader.offset_array = last_word;
+        reader.num = (n - 5 - last_word) / 4;
+        return reader;
     }
 
     pub fn keyMayMatch(self: *const FilterBlockReader, block_offset: u64, key: []const u8) bool {
-        _ = self;
-        _ = block_offset;
-        _ = key;
-        return false;
+        const index: u64 = block_offset >> self.base_lg;
+        if (index >= self.num) {
+            // No filter for this range -> conservative match.
+            return true;
+        }
+
+        const off_pos = self.offset_array + index * 4;
+        const start = coding.decodeFixed32(self.data[off_pos..][0..4]);
+        const limit = coding.decodeFixed32(self.data[off_pos + 4 ..][0..4]);
+        if (start <= limit and limit <= self.offset_array) {
+            const filter = self.data[start..limit];
+            if (filter.len == 0) {
+                // Empty filter range -> conservative match.
+                return true;
+            }
+            return self.policy.keyMayMatch(key, filter);
+        } else if (start == limit) {
+            // Empty filter range.
+            return true;
+        }
+        // Errors are treated as potential matches.
+        return true;
     }
 };
 

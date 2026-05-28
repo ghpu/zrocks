@@ -9,20 +9,47 @@
 /// format with a different in-block layout; that is intentionally out of scope
 /// here and will be added when wiring up SST-table interop.
 const std = @import("std");
-
-// RED: stub types — implemented in the GREEN phase.
+const coding = @import("../util/coding.zig");
 
 /// LevelDB hash: a stable, byte-deterministic 32-bit hash (util/hash.cc).
+///
+/// Faithful port using wrapping 32-bit arithmetic. The tail handling uses the
+/// same switch fallthrough as the C++ original: bytes 3->2->1 accumulate, and
+/// the final `h *%= m; h ^= h >> r` only runs in the 1-byte path.
 pub fn hash(data: []const u8, seed: u32) u32 {
-    _ = data;
-    _ = seed;
-    return 0;
+    const m: u32 = 0xc6a4a793;
+    const r: u5 = 24;
+
+    var h: u32 = seed ^ (@as(u32, @truncate(data.len)) *% m);
+
+    // Consume four bytes at a time.
+    var i: usize = 0;
+    while (i + 4 <= data.len) : (i += 4) {
+        const w = coding.decodeFixed32(data[i..][0..4]);
+        h +%= w;
+        h *%= m;
+        h ^= h >> 16;
+    }
+
+    // Pick up the remaining tail bytes (LevelDB switch fallthrough).
+    const rem = data.len - i;
+    if (rem == 3) {
+        h +%= @as(u32, data[i + 2]) << 16;
+    }
+    if (rem >= 2) {
+        h +%= @as(u32, data[i + 1]) << 8;
+    }
+    if (rem >= 1) {
+        h +%= @as(u32, data[i + 0]);
+        h *%= m;
+        h ^= h >> r;
+    }
+    return h;
 }
 
 /// Bloom hash with the LevelDB-fixed seed 0xbc9f1d34.
 pub fn bloomHash(key: []const u8) u32 {
-    _ = key;
-    return 0;
+    return hash(key, 0xbc9f1d34);
 }
 
 pub const BloomFilterPolicy = struct {
@@ -30,13 +57,15 @@ pub const BloomFilterPolicy = struct {
     k: u32,
 
     pub fn init(bits_per_key: usize) BloomFilterPolicy {
-        _ = bits_per_key;
-        return .{ .bits_per_key = 0, .k = 0 };
+        // k = round(bits_per_key * 0.69 ≈ ln(2)), clamped to [1, 30].
+        const raw: usize = @intFromFloat(@as(f64, @floatFromInt(bits_per_key)) * 0.69);
+        const k: u32 = @intCast(@max(@as(usize, 1), @min(@as(usize, 30), raw)));
+        return .{ .bits_per_key = bits_per_key, .k = k };
     }
 
     pub fn name(self: BloomFilterPolicy) []const u8 {
         _ = self;
-        return "";
+        return "leveldb.BuiltinBloomFilter2";
     }
 
     pub fn createFilter(
@@ -45,17 +74,59 @@ pub const BloomFilterPolicy = struct {
         keys: []const []const u8,
         dst: *std.ArrayList(u8),
     ) !void {
-        _ = self;
-        _ = gpa;
-        _ = keys;
-        _ = dst;
+        const n = keys.len;
+
+        // Compute bloom filter size in bits, then round to bytes. Floor the
+        // total at 64 bits to keep the false-positive rate sane for tiny sets.
+        var bits: usize = n * self.bits_per_key;
+        if (bits < 64) bits = 64;
+        const bytes = (bits + 7) / 8;
+        bits = bytes * 8;
+
+        const init_len = dst.items.len;
+        try dst.appendNTimes(gpa, 0, bytes);
+        // Append the number of probes at the end so the reader can recover it.
+        try dst.append(gpa, @intCast(self.k));
+
+        const array = dst.items[init_len..][0..bytes];
+        for (keys) |key| {
+            // Use double-hashing to derive k probes from a single hash.
+            var h = bloomHash(key);
+            const delta = (h >> 17) | (h << 15); // rotate right 17 bits
+            var j: u32 = 0;
+            while (j < self.k) : (j += 1) {
+                const bitpos = h % @as(u32, @intCast(bits));
+                array[bitpos / 8] |= @as(u8, 1) << @intCast(bitpos % 8);
+                h +%= delta;
+            }
+        }
     }
 
     pub fn keyMayMatch(self: BloomFilterPolicy, key: []const u8, filter: []const u8) bool {
         _ = self;
-        _ = key;
-        _ = filter;
-        return false;
+        const len = filter.len;
+        if (len < 2) return false; // malformed; conservatively no match
+
+        const bits = (len - 1) * 8;
+
+        // Recover the number of probes from the final byte.
+        const k = filter[len - 1];
+        if (k > 30) {
+            // Reserved for potentially new encodings; treat as a match.
+            return true;
+        }
+
+        var h = bloomHash(key);
+        const delta = (h >> 17) | (h << 15); // rotate right 17 bits
+        var j: u32 = 0;
+        while (j < k) : (j += 1) {
+            const bitpos = h % @as(u32, @intCast(bits));
+            if ((filter[bitpos / 8] & (@as(u8, 1) << @intCast(bitpos % 8))) == 0) {
+                return false;
+            }
+            h +%= delta;
+        }
+        return true;
     }
 };
 
