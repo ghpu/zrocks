@@ -3,12 +3,12 @@ project: zrocks
 zig_binary: /home/ghpu/zig/zig
 stdlib: /home/ghpu/zig/lib/std
 target_rocksdb: "9.x line; block-based table format_version 5; legacy WAL/MANIFEST log (see docs/adr/000-target-format.md)"
-active_phase: P5
-active_milestone: "M5.2 Recovery (DB.open WAL replay + MANIFEST)"
-last_completed: M5.1 Version / VersionSet / MANIFEST
-worktrees: "m5.2-recovery"
+active_phase: P6
+active_milestone: "M6.0 SST read path (table_cache + Iterator.deinit + Version reads)"
+last_completed: M5.2 Recovery (Phase 5 COMPLETE — durable KV store)
+worktrees: "m6.0-sst-read"
 test_command: "/home/ghpu/zig/zig build test"
-test_count: 256
+test_count: 264
 updated: 2026-05-28
 ---
 
@@ -53,13 +53,14 @@ RocksDB reference: https://github.com/facebook/rocksdb/wiki
 ### Phase 5 — Persistence: Version/MANIFEST + recovery
 - [x] M5.0 VersionEdit                  (src/version/version_edit.zig)
 - [x] M5.1 Version / VersionSet / MANIFEST  (src/version/{version_set,filename}.zig)
-- [~] M5.2 Recovery  <-- ACTIVE  (RocksDB real-DB read-interop gate deferred to after Phase 6 SST read path)
+- [x] M5.2 Recovery  (src/db/recovery.zig + db.zig durable open; Env.newAppendableFile)
 
 ### Phase 6 — Compaction → full embedded KV store
-- [ ] M6.0 Flush (memtable → L0)
-- [ ] M6.1 Leveled compaction
-- [ ] M6.2 Snapshots (full)
-- [ ] GATE: LevelDB-equivalent core complete (+ CLI, integration test)
+- [~] M6.0 SST read path (table_cache + Iterator.deinit + Version.get/iters; DB reads memtable+SSTs)  <-- ACTIVE
+- [ ] M6.1 Flush (immutable memtable → L0 SST + VersionEdit + log switch + write_buffer trigger)
+- [ ] M6.2 Leveled compaction (picker + job + tombstone drop below oldest snapshot)
+- [ ] M6.3 Snapshots (full SnapshotList; compaction respects oldest)
+- [ ] GATE: LevelDB-equivalent core complete (+ CLI in main.zig, randomized integration test)
 
 ### Phase 7 — RocksDB extensions
 - [ ] M7.0 Column Families
@@ -71,20 +72,22 @@ RocksDB reference: https://github.com/facebook/rocksdb/wiki
 - [ ] M7.6 Transactions (optimistic + pessimistic)
 - [ ] M7.7 Checkpoints
 
-## Active: PHASE 4 COMPLETE — next is Phase 5 (persistence/recovery)
+## Active: Phase 6 — Compaction → full LSM (4 milestones)
 
-### Phase 5 plan — Version/MANIFEST + recovery (sequential-ish)
-- M5.0 VersionEdit (S) — encode/decode the MANIFEST VersionEdit tag set (comparator name, log#, next-file#, last-seq, deleted/added files per level). New: src/version/version_edit.zig. Deps: coding. Golden bytes. (Independent — can run alone first.)
-- M5.1 Version / VersionSet / MANIFEST (O) — needs M5.0 + table_reader + log_writer/reader. New: src/version/{version_set,table_cache}.zig. FileMetaData, per-level file lists, apply edits, write/read MANIFEST log (reuse the WAL log format), CURRENT file, file-number allocation. Minimal default-CF records for interop.
-- M5.2 Recovery (O) — needs M5.1 + db.zig. DB.open: read CURRENT→MANIFEST→VersionSet, replay WAL(s) into a fresh memtable, restore last_sequence. Wire into the existing db.zig open path (which currently starts empty). INTEROP GATE: open a small DB written by real RocksDB (default CF) and read it back.
+### Phase 6 plan
+- M6.0 SST read path (O) — needs version_set + table_reader + cache + iterator. New: src/version/table_cache.zig; modify db.zig read path + add Version.get / Version.newIterators. FIRST add an optional `deinit: ?*const fn(ctx)void` to the `iterator.Iterator` vtable and have Merging/TwoLevel call children's deinit (the gap noted below). table_cache opens/caches Table handles by file number (filename.tableFileName). DB.get: check memtable, then current Version's files (L0 newest-first by file number, then levels 1.. by key range); DB.newIterator merges memtable iter + per-file table iters. Tested by building SSTs via TableBuilder, registering them with a VersionEdit, reading through DB.
+- M6.1 Flush (O) — needs M6.0. Immutable-memtable switch when active memtable exceeds write_buffer_size; build an L0 SST (TableBuilder) from the immutable memtable; logAndApply a VersionEdit adding the file + new log_number; open a fresh WAL + memtable. Background or synchronous trigger (synchronous is fine first; behind Env). Reopen then recovers via SSTs (manifest) + remaining WAL.
+- M6.2 Leveled compaction (O) — needs M6.1. Size/level picker; compaction job merges input SSTs (MergingIterator over table iters) into output level; drop tombstones/overwritten keys below the oldest snapshot; grandparent-overlap output splitting; install edits. Gate: randomized op-log vs reference AutoHashMap after compactions + reopen.
+- M6.3 Snapshots (O) — full SnapshotList pinning sequences; compaction respects the oldest live snapshot.
+- GATE: add main.zig CLI (put/get/scan/bench) + tests/integration_db_test.zig.
 
 ## Next steps (ordered)
-1. Phase 5: dispatch M5.0 (VersionEdit) first; then M5.1 (VersionSet/MANIFEST); then M5.2 (recovery + db.open wiring + RocksDB read-interop gate).
-2. Phase 6 — flush (memtable→L0 SST) + leveled compaction + full snapshots → "LevelDB-equivalent core complete" (add CLI in main.zig + integration test).
+1. Phase 6: M6.0 read path → M6.1 flush → M6.2 leveled compaction → M6.3 snapshots → CLI + integration gate = "LevelDB-equivalent core complete".
+2. Then revisit the RocksDB real-DB read-interop gate (now feasible with the SST read path).
 3. Phase 7 — RocksDB extensions (column families, merge operator, prefix seek, universal/FIFO compaction, compaction filter, DeleteRange, transactions, checkpoints).
 
-## Engine capabilities so far (on main, 235 tests, Phases 0–4 COMPLETE)
-Foundation (slice/status/coding/comparator/arena/crc32c/options) · Env capability over std.Io (+MemEnv) · WAL (byte-compat) · Skiplist · MemTable (snapshot+tombstone get) · WriteBatch · full block-based SST (block/bloom/filter/footer/TableBuilder/TableReader, byte-compat, CRC-verified, round-trips) · sharded LRU block cache · generic Iterator/Merging/TwoLevel · **in-memory DB: open/put/get/delete/write(batch)/newIterator/snapshot over MemTable+WAL (no persistence/recovery yet)**.
+## Engine capabilities so far (on main, 264 tests, Phases 0–5 COMPLETE)
+Foundation · Env capability over std.Io (+MemEnv, append) · WAL (byte-compat) · Skiplist · MemTable (snapshot+tombstone get) · WriteBatch · full block-based SST (byte-compat, CRC-verified, round-trips) · sharded LRU block cache · generic Iterator/Merging/TwoLevel · VersionEdit + VersionSet/MANIFEST (write→recover) · **durable DB: open/put/get/delete/write/newIterator/snapshot over MemTable+WAL, recovers across reopen (reuse-logs)**. Not yet: data is single-memtable + WAL only (no SST flush/compaction; reads don't consult SSTs yet).
 
 ## Decision log (ADR pointers)
 - ADR-000: RocksDB format target pinned (format_version 5 SST, legacy WAL/MANIFEST, CRC32C mask). docs/adr/000-target-format.md
