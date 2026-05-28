@@ -115,6 +115,7 @@ pub const RealEnv = struct {
 
     const vtable = Env.VTable{
         .newWritableFile = newWritableFile,
+        .newAppendableFile = newAppendableFile,
         .newSequentialFile = newSequentialFile,
         .newRandomAccessFile = newRandomAccessFile,
         .deleteFile = deleteFile,
@@ -134,6 +135,26 @@ pub const RealEnv = struct {
             return e;
         };
         h.* = .{ .io = self.io, .gpa = gpa, .file = file, .offset = 0 };
+        return .{ .ptr = h, .vtable = &RealWritable.vtable };
+    }
+
+    fn newAppendableFile(ptr: *anyopaque, gpa: std.mem.Allocator, path: []const u8) Error!WritableFile {
+        const self: *RealEnv = @ptrCast(@alignCast(ptr));
+        // Open-or-create WITHOUT truncating, then position the positional-write
+        // cursor at the current end of file so appends extend existing content.
+        const file = self.root.createFile(self.io, path, .{ .truncate = false }) catch |e| return mapOpenErr(e);
+        const start: u64 = blk: {
+            const st = file.stat(self.io) catch |e| {
+                file.close(self.io);
+                return mapStatErr(e);
+            };
+            break :blk st.size;
+        };
+        const h = gpa.create(RealWritable) catch |e| {
+            file.close(self.io);
+            return e;
+        };
+        h.* = .{ .io = self.io, .gpa = gpa, .file = file, .offset = start };
         return .{ .ptr = h, .vtable = &RealWritable.vtable };
     }
 

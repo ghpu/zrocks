@@ -26,6 +26,15 @@ pub const Writer = struct {
         return .{ .file = file, .block_offset = 0 };
     }
 
+    /// Continue writing into an existing log mid-block.  `block_offset` is the
+    /// current write position within the active block, i.e. `file_size %
+    /// kBlockSize`.  WAL records are always written whole, so resuming at that
+    /// offset preserves the block-fragmentation invariant.
+    pub fn initWithOffset(file: env.WritableFile, block_offset: usize) Writer {
+        std.debug.assert(block_offset < kBlockSize);
+        return .{ .file = file, .block_offset = block_offset };
+    }
+
     /// Append one logical record. The payload is opaque bytes (may be empty).
     ///
     /// Fragments `data` across block boundaries: a single `full` fragment when
