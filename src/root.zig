@@ -49,6 +49,9 @@ pub const flush = @import("db/flush.zig");
 pub const compaction = @import("db/compaction.zig");
 pub const snapshot = @import("db/snapshot.zig");
 
+// RocksDB extensions (Phase 7).
+pub const checkpoint = @import("rocks/checkpoint.zig");
+
 // Version / MANIFEST (Phase 5).
 pub const version_edit = @import("version/version_edit.zig");
 pub const version_set = @import("version/version_set.zig");

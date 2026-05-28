@@ -4,11 +4,11 @@ zig_binary: /home/ghpu/zig/zig
 stdlib: /home/ghpu/zig/lib/std
 target_rocksdb: "9.x line; block-based table format_version 5; legacy WAL/MANIFEST log (see docs/adr/000-target-format.md)"
 active_phase: P7
-active_milestone: "M7.2 Prefix bloom/seek + M7.7 Checkpoint (parallel wave A — disjoint files)"
-last_completed: M6.3 Snapshots + CLI + integration gate (Phase 6 COMPLETE; LevelDB-equivalent core done)
-worktrees: "m7.2-prefix, m7.7-checkpoint"
+active_milestone: "M7.2 Prefix bloom/seek (M7.7 Checkpoint done)"
+last_completed: M7.7 Checkpoints (src/rocks/checkpoint.zig)
+worktrees: "m7.2-prefix"
 test_command: "/home/ghpu/zig/zig build test"
-test_count: 296
+test_count: 299
 artifacts: "zig build -> zig-out/lib/libzrocks.a + zig-out/bin/zrocks (CLI). CLI verified end-to-end (put/get/scan/bench, durable across processes)."
 updated: 2026-05-28
 ---
@@ -71,7 +71,7 @@ RocksDB reference: https://github.com/facebook/rocksdb/wiki
 - [ ] M7.4 CompactionFilter
 - [ ] M7.5 DeleteRange (range tombstones)
 - [ ] M7.6 Transactions (optimistic + pessimistic)
-- [~] M7.7 Checkpoints  <-- ACTIVE (wave A)
+- [x] M7.7 Checkpoints                (src/rocks/checkpoint.zig)
 - [ ] (revisit) RocksDB real-DB read-interop gate (now feasible: SST read path + manifest exist; needs RocksDB kNewFile4 manifest tag + full-filter format)
 
 Phase 7 parallelization: core files (db.zig, compaction.zig, version_set.zig, memtable.zig) are shared — only run DISJOINT-footprint milestones in parallel. Compaction-modifiers (M7.3/M7.4/M7.5) one at a time; db/memtable-modifiers (M7.0 CF, M7.1 merge, M7.6 txn) one at a time. Wave A = M7.2 (SST-format/read-path) + M7.7 (standalone checkpoint, new file only) — disjoint.
