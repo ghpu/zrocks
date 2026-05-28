@@ -22,7 +22,9 @@ pub const internal_key = @import("format/internal_key.zig");
 pub const log_format = @import("format/log_format.zig");
 pub const log_writer = @import("format/log_writer.zig");
 pub const log_reader = @import("format/log_reader.zig");
+pub const write_batch = @import("format/write_batch.zig");
 pub const skiplist = @import("memtable/skiplist.zig");
+pub const memtable = @import("memtable/memtable.zig");
 
 test "version constant" {
     try std.testing.expectEqualStrings("0.0.0", version);
