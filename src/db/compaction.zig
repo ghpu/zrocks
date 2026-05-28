@@ -20,10 +20,20 @@
 //! (with the underlying base/deletion) into a single value — keeping
 //! above-snapshot operands verbatim and never losing an operand.
 //!
+//! Compaction filter (M7.4): when `options.compaction_filter` is set, the newest
+//! plain `.value` survivor of each user key that is NOT visible to a live
+//! snapshot is handed to the filter, which may keep, drop (`.remove`), or rewrite
+//! (`.change`) it.  A `.change` replacement is gpa-allocated by the filter and
+//! freed here after writing.  Snapshot-protected versions, merge operands,
+//! deletions, and older (hidden) versions are never filtered.
+//!
 //! What is implemented vs left as TODO:
 //!   * Size-based output split — implemented (correctness-sufficient).
 //!   * Tombstone drop at the base level — implemented (isBaseLevelForKey).
 //!   * Merge operand collapse — implemented (collapseMergeRun, M7.1).
+//!   * Compaction filter on plain `.value` survivors — implemented (M7.4).
+//!   * Compaction filter on merge-derived values / FilterMergeOperand — TODO.
+//!   * Per-compaction CompactionFilterFactory — TODO (single filter for now).
 //!   * Grandparent-overlap split — TODO (refinement; size split suffices).
 //!   * Boundary-input expansion ("AddBoundaryInputs") — TODO (refinement).
 //!   * Obsolete .sst deletion from disk — TODO (files are dropped from the
