@@ -1,25 +1,26 @@
-//! db.zig — the embedded key/value store (M4.1 store + M5.2 durability).
+//! db.zig — the embedded key/value store (M4.1 store + M5.2 durability +
+//! M6.0 SST read path).
 //!
-//! Ties the building blocks into a usable DB: a single MemTable behind a
-//! write-ahead log, with snapshot-aware point lookups and a tombstone-hiding
-//! forward iterator.  `open` recovers durable state: a VersionSet reconstructs
-//! the MANIFEST/CURRENT and the active WAL is replayed into the MemTable, then
-//! that SAME log is reused for new appends so committed writes survive reopen
-//! (the "reuse-logs" design).  No flush to SST / immutable memtable / compaction
-//! (Phase 6) yet — recovered data lives in the single MemTable kept durable by
-//! the reused log.
+//! Ties the building blocks into a usable DB: a MemTable behind a write-ahead
+//! log plus the on-disk SSTs of the current Version, with snapshot-aware point
+//! lookups and a tombstone-hiding forward iterator.  `open` recovers durable
+//! state: a VersionSet reconstructs the MANIFEST/CURRENT and the active WAL is
+//! replayed into the MemTable, then that SAME log is reused for new appends so
+//! committed writes survive reopen (the "reuse-logs" design).  No flush to SST
+//! / immutable memtable / compaction yet — SSTs are injected via VersionEdit
+//! until M6.1 adds flush.
 //!
-//! Single source for reads (the live MemTable).  `newIterator` wraps the
-//! memtable's internal iterator behind the generic `iterator.Iterator` and then
-//! a `DBIterator` for user-facing snapshot/tombstone semantics; later phases add
-//! SST sources by composing a MergingIterator in that same slot.
+//! Reads consult the MemTable FIRST (newest writes) and fall through to the
+//! current Version's SSTs via a `TableCache` (M6.0).  `get` returns the newest
+//! value visible at the snapshot, or null on a tombstone/absence.
+//! `newIterator` merges the memtable iterator with one iterator per SST file
+//! into a `MergingIterator` (ordered by the InternalKeyComparator) and wraps it
+//! in a `DBIterator` for user-facing snapshot/tombstone semantics.
 //!
 //! Standalone test note (Zig 0.16): this file uses `../...` imports that only
 //! resolve when compiled as part of the `src`-rooted module.  To run the suite:
 //!   printf 'test { _ = @import("db/db.zig"); }' > src/_verify.zig \
 //!     && zig test src/_verify.zig && rm src/_verify.zig
-
-// RED phase: declarations with @panic stubs + full tests.
 
 const std = @import("std");
 
