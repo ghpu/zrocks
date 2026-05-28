@@ -60,6 +60,7 @@ const MemTable = memtable_mod.MemTable;
 const WriteBatch = write_batch.WriteBatch;
 
 pub const Snapshot = snapshot_mod.Snapshot;
+pub const SnapshotList = snapshot_mod.SnapshotList;
 pub const DBIterator = db_iter.DBIterator;
 
 pub const DB = struct {
@@ -82,6 +83,9 @@ pub const DB = struct {
     wal_file: env.WritableFile,
     wal: log_writer.Writer,
     last_sequence: u64,
+    /// Live point-in-time snapshots.  Their oldest sequence bounds what
+    /// compaction may discard (M6.3 snapshot pinning).
+    snapshots: SnapshotList,
     // TODO(concurrency): DB write mutex (single-threaded for M4.1/M5.2).
 
     /// Open a DB rooted at directory `name` on `e`, recovering durable state.
@@ -129,6 +133,10 @@ pub const DB = struct {
         // internal comparator address stays stable.  No block cache wired yet.
         self.table_cache = table_cache_mod.TableCache.init(gpa, e, self.name, options, null);
         errdefer self.table_cache.deinit();
+
+        // Live snapshots start empty; populated by getSnapshot/releaseSnapshot.
+        self.snapshots = SnapshotList.init(gpa);
+        errdefer self.snapshots.deinit();
 
         const current_path = try filename.currentFileName(gpa, name);
         defer gpa.free(current_path);
@@ -190,6 +198,8 @@ pub const DB = struct {
     pub fn close(self: *DB) void {
         const gpa = self.gpa;
         self.wal_file.close() catch {};
+        // Free any snapshots the client never released.
+        self.snapshots.deinit();
         self.table_cache.deinit();
         self.versions.deinit();
         gpa.destroy(self.versions);
@@ -441,15 +451,17 @@ pub const DB = struct {
         gpa.destroy(merger);
     }
 
-    /// A snapshot pinned at the current latest sequence.
-    pub fn getSnapshot(self: *DB) Snapshot {
-        return .{ .sequence = self.last_sequence };
+    /// Take a snapshot pinned at the current latest sequence.  The returned
+    /// `*Snapshot` is owned by the DB's SnapshotList until `releaseSnapshot`;
+    /// while it is live, compaction will not discard versions visible to it.
+    pub fn getSnapshot(self: *DB) !*Snapshot {
+        return self.snapshots.newSnapshot(self.last_sequence);
     }
 
-    /// No-op for M4.1 (no SnapshotList / compaction pinning yet).
-    pub fn releaseSnapshot(self: *DB, snap: Snapshot) void {
-        _ = self;
-        _ = snap;
+    /// Release a snapshot taken with `getSnapshot`, unpinning its sequence so
+    /// later compactions may reclaim versions it was holding.
+    pub fn releaseSnapshot(self: *DB, snap: *Snapshot) void {
+        self.snapshots.release(snap);
     }
 };
 
@@ -636,7 +648,7 @@ test "snapshot isolation" {
 
     try db.put(.{}, "k", "v1");
     try db.put(.{}, "k", "v2");
-    const snap = db.getSnapshot();
+    const snap = try db.getSnapshot();
     defer db.releaseSnapshot(snap);
 
     try db.put(.{}, "k", "v3");
@@ -834,7 +846,7 @@ test "sequence continuity: a new put outranks all recovered writes" {
         const recovered_seq = db.last_sequence;
 
         // A snapshot taken right after reopen sees the recovered values.
-        const snap = db.getSnapshot();
+        const snap = try db.getSnapshot();
         defer db.releaseSnapshot(snap);
 
         // A new write must get a strictly higher sequence (no regression).
@@ -1205,7 +1217,7 @@ test "M6.1 flush: overwrite + delete across flushes with snapshot semantics" {
     defer db.close();
 
     try db.put(.{}, "k", "v1"); // -> flushed to an L0 SST
-    const snap_after_v1 = db.getSnapshot(); // sees v1
+    const snap_after_v1 = try db.getSnapshot(); // sees v1
     defer db.releaseSnapshot(snap_after_v1);
 
     try db.put(.{}, "k", "v2"); // -> flushed to a second L0 SST (newer)
