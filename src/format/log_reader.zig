@@ -46,6 +46,8 @@ pub const Reader = struct {
     /// further blocks, so a fragment that runs past `buf_len` is a truncated
     /// tail (clean EOF) rather than corruption.
     eof_seen: bool = false,
+    /// False until the first physical block has been loaded.
+    started: bool = false,
 
     pub fn init(file: env.SequentialFile) Reader {
         return .{ .file = file };
@@ -105,6 +107,7 @@ pub const Reader = struct {
     /// marks `eof_seen` so the parser treats a later run-past-end as a
     /// truncated tail rather than corruption.
     fn loadBlock(self: *Reader) Error!bool {
+        self.started = true;
         self.pos = 0;
         self.buf_len = 0;
         // `SequentialFile.read` may return short; loop until the block is full
@@ -122,8 +125,8 @@ pub const Reader = struct {
 
     /// Parse one physical record at `pos` within the current block buffer.
     fn readPhysicalRecord(self: *Reader) Error!Fragment {
-        // Lazily load the first block.
-        if (self.buf_len == 0 and self.pos == 0 and !self.eof_seen) {
+        // Lazily load the first block on the very first call.
+        if (!self.started) {
             if (!try self.loadBlock()) return .eof;
         }
 
@@ -474,4 +477,92 @@ test "truncated tail: truncating in the middle of a header yields clean EOF" {
     var scratch: std.ArrayList(u8) = .empty;
     defer scratch.deinit(gpa);
     try std.testing.expect((try r.readRecord(gpa, &scratch)) == null);
+}
+
+/// Encode one physical record (valid CRC) into `out`.
+fn encodeRecord(
+    out: *std.ArrayList(u8),
+    gpa: std.mem.Allocator,
+    record_type: format.RecordType,
+    payload: []const u8,
+) !void {
+    var header: [format.kHeaderSize]u8 = undefined;
+    std.mem.writeInt(u32, header[0..4], format.checksum(record_type, payload), .little);
+    std.mem.writeInt(u16, header[4..6], @intCast(payload.len), .little);
+    header[6] = @intFromEnum(record_type);
+    try out.appendSlice(gpa, &header);
+    try out.appendSlice(gpa, payload);
+}
+
+test "corruption: stray `last` fragment with no preceding `first`" {
+    const gpa = std.testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(gpa);
+    // A lone `last` fragment (valid CRC) that was never preceded by a `first`.
+    try encodeRecord(&raw, gpa, .last, "orphan tail");
+
+    {
+        var wf = try e.newWritableFile(gpa, "wal");
+        errdefer wf.close() catch {};
+        try wf.append(raw.items);
+        try wf.flush();
+        try wf.close();
+    }
+
+    var sf = try e.newSequentialFile(gpa, "wal");
+    var r = Reader.init(sf);
+    defer sf.close() catch {};
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(gpa);
+    try std.testing.expectError(error.Corruption, r.readRecord(gpa, &scratch));
+}
+
+test "corruption: bad record length within a fully-present block (not the tail)" {
+    const gpa = std.testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    // Build a full 32 KiB block 0 whose first record header claims a length
+    // larger than the bytes remaining in the block. Because block 0 is fully
+    // present (a second block follows), `eof_seen` is false while parsing it,
+    // so the over-long length is corruption — not a truncated tail.
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(gpa);
+
+    // Header claiming a payload that overruns the block remainder.
+    const bogus_payload_claim: u16 = @intCast(format.kBlockSize); // >> remainder
+    var header: [format.kHeaderSize]u8 = undefined;
+    std.mem.writeInt(u32, header[0..4], format.checksum(.full, ""), .little);
+    std.mem.writeInt(u16, header[4..6], bogus_payload_claim, .little);
+    header[6] = @intFromEnum(format.RecordType.full);
+    try raw.appendSlice(gpa, &header);
+
+    // Pad block 0 out to exactly kBlockSize with zeros (acts as a trailer-ish
+    // filler; the parser never reaches it because the header already faults).
+    try raw.appendNTimes(gpa, 0, format.kBlockSize - raw.items.len);
+    // A valid record in block 1 so the file genuinely has a second block.
+    try encodeRecord(&raw, gpa, .full, "block one record");
+    try std.testing.expectEqual(@as(usize, format.kBlockSize + format.kHeaderSize + "block one record".len), raw.items.len);
+
+    {
+        var wf = try e.newWritableFile(gpa, "wal");
+        errdefer wf.close() catch {};
+        try wf.append(raw.items);
+        try wf.flush();
+        try wf.close();
+    }
+
+    var sf = try e.newSequentialFile(gpa, "wal");
+    var r = Reader.init(sf);
+    defer sf.close() catch {};
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(gpa);
+
+    // Bad length in a fully-present (non-tail) block -> Corruption.
+    try std.testing.expectError(error.Corruption, r.readRecord(gpa, &scratch));
 }
