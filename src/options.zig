@@ -11,6 +11,20 @@ pub const MergeOperator = merge_operator.MergeOperator;
 // Re-export so callers can write `options_mod.CompactionFilter` / `.Decision` (M7.4).
 pub const CompactionFilter = compaction_filter.CompactionFilter;
 pub const Decision = compaction_filter.Decision;
+// `CompactionStyle` is declared below; nothing to re-export from another module.
+
+// ---------------------------------------------------------------------------
+// CompactionStyle — which compaction algorithm the DB drives (M7.3)
+// ---------------------------------------------------------------------------
+
+/// Selects the compaction algorithm:
+///   * `.level`     — classic LevelDB-style leveled compaction (default).
+///   * `.universal` — tiered/size-tiered: each L0 file is a sorted "run";
+///                    similarly-sized runs are merged together (kept in L0 in
+///                    this implementation — see compaction.zig).
+///   * `.fifo`      — cache-like: never merges, just DROPS the oldest L0 files
+///                    once the total L0 byte budget is exceeded.
+pub const CompactionStyle = enum { level, universal, fifo };
 
 // ---------------------------------------------------------------------------
 // CompressionType — RocksDB-compatible byte values
@@ -75,6 +89,34 @@ pub const Options = struct {
     /// snapshot, merge operands, deletions, and older (hidden) versions are NOT
     /// filtered.  Default null leaves compaction behaviour unchanged.
     compaction_filter: ?compaction_filter.CompactionFilter = null,
+
+    /// Which compaction algorithm the DB runs (M7.3).  Default `.level` keeps the
+    /// classic leveled behaviour; `.universal` and `.fifo` switch to alternative
+    /// styles whose extra knobs are below.
+    compaction_style: CompactionStyle = .level,
+
+    // -- FIFO compaction (M7.3) ---------------------------------------------
+    /// Total byte budget for the L0 table files under `.fifo` style.  Once
+    /// `totalFileSize(0)` exceeds this, the OLDEST L0 files (lowest file numbers)
+    /// are DROPPED whole — cache-like eviction — until back under budget.  Has no
+    /// effect under other styles.  Default 1 GiB.
+    // TODO: ttl — RocksDB FIFO also supports a time-to-live eviction; only the
+    // size-based policy is implemented here.
+    fifo_max_table_files_size: u64 = 1 << 30,
+
+    // -- Universal compaction (M7.3) ----------------------------------------
+    /// Size-ratio trigger (PERCENT) for `.universal` style.  When extending the
+    /// candidate run set from newest to older, the next older run is admitted
+    /// while its size is within `(1 + universal_size_ratio/100)` of the running
+    /// total of the already-selected runs.  Default 1 (%).
+    universal_size_ratio: u32 = 1,
+    /// Minimum number of runs that a size-ratio-selected candidate set must reach
+    /// before it is compacted under `.universal` style.  Default 2.
+    universal_min_merge_width: usize = 2,
+    /// Space-amplification trigger (PERCENT) for `.universal` style.  When
+    /// `(sum of all runs except the oldest) / (oldest run) * 100` exceeds this,
+    /// ALL L0 runs are merged together regardless of size ratios.  Default 200.
+    universal_max_size_amplification_percent: u32 = 200,
 };
 
 // ---------------------------------------------------------------------------
@@ -169,4 +211,19 @@ test "WriteOptions field override works" {
     const wo = WriteOptions{ .sync = true };
     try std.testing.expectEqual(true, wo.sync);
     try std.testing.expectEqual(false, wo.disable_wal);
+}
+
+test "M7.3: compaction style defaults to leveled with documented param defaults" {
+    const opts = Options{};
+    try std.testing.expectEqual(CompactionStyle.level, opts.compaction_style);
+    try std.testing.expectEqual(@as(u64, 1 << 30), opts.fifo_max_table_files_size);
+    try std.testing.expectEqual(@as(u32, 1), opts.universal_size_ratio);
+    try std.testing.expectEqual(@as(usize, 2), opts.universal_min_merge_width);
+    try std.testing.expectEqual(@as(u32, 200), opts.universal_max_size_amplification_percent);
+}
+
+test "M7.3: compaction style override works" {
+    const opts = Options{ .compaction_style = .fifo, .fifo_max_table_files_size = 4096 };
+    try std.testing.expectEqual(CompactionStyle.fifo, opts.compaction_style);
+    try std.testing.expectEqual(@as(u64, 4096), opts.fifo_max_table_files_size);
 }

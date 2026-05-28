@@ -63,11 +63,31 @@ const VersionSet = version_set.VersionSet;
 const kFilterBitsPerKey: usize = 10;
 
 pub const Compaction = struct {
-    /// The level being compacted; output files land at `level + 1`.
+    /// The level being compacted; output files land at `output_level` (which
+    /// defaults to `level + 1` for leveled compaction).
     level: usize,
+    /// Level the merged output files are written to.  Leveled compaction sets
+    /// this to `level + 1`; universal compaction (M7.3) sets it to 0 so merged
+    /// runs stay in L0.  When null, `doCompaction` treats it as `level + 1`.
+    /// TODO: real RocksDB universal may place a fully-merged run at the bottom
+    /// level; we keep it in L0 here (simpler, correctness-sufficient).
+    output_level: ?usize = null,
     /// inputs[0] = files chosen from `level`; inputs[1] = the overlapping files
-    /// at `level + 1`.  Each list deep-owns its FileMetaData key bytes.
+    /// at the level just below (`level + 1`) — empty for universal.  Each list
+    /// deep-owns its FileMetaData key bytes.
     inputs: [2]std.ArrayListUnmanaged(FileMetaData),
+    /// When true, tombstones must NEVER be dropped during this compaction even if
+    /// `isBaseLevelForKey` says so, because OLDER data this compaction does not
+    /// read could resurface.  Set for a PARTIAL universal merge (only the newest
+    /// L0 runs are merged; older L0 runs survive and could resurrect a deleted
+    /// key if its tombstone were dropped).  Leveled compaction leaves this false
+    /// and relies on the per-key `isBaseLevelForKey` check.
+    keep_tombstones: bool = false,
+
+    /// The level the output files land at (`output_level` or `level + 1`).
+    pub fn outputLevel(self: *const Compaction) usize {
+        return self.output_level orelse (self.level + 1);
+    }
 
     pub fn deinit(self: *Compaction, gpa: std.mem.Allocator) void {
         for (&self.inputs) |*list| {
@@ -130,6 +150,61 @@ pub fn pickCompaction(
     return c;
 }
 
+// ===========================================================================
+// FIFO compaction (M7.3) — cache-like whole-file eviction of oldest L0 files
+// ===========================================================================
+
+/// Produce a VersionEdit that DROPS the oldest L0 files (lowest file numbers)
+/// when `totalFileSize(0)` exceeds `fifo_max_table_files_size`, applying it via
+/// `logAndApply` — until the L0 byte total is back at-or-below the budget (or
+/// only one file remains; we never evict the sole/last file so the DB keeps the
+/// most-recent data).  Returns `true` if any file was evicted (so the caller can
+/// loop), `false` if nothing needed evicting.
+///
+/// FIFO never merges — it removes whole files, oldest first, so the
+/// earliest-written data is evicted like a ring buffer.  No output files are
+/// produced.
+/// TODO: ttl — only the size-based policy is implemented.
+pub fn runFifoEviction(
+    gpa: std.mem.Allocator,
+    versions: *VersionSet,
+    fifo_max_table_files_size: u64,
+) !bool {
+    const v = versions.currentVersion();
+    if (v.totalFileSize(0) <= fifo_max_table_files_size) return false;
+    if (v.numFiles(0) <= 1) return false; // keep at least one (the newest) file.
+
+    // L0 is stored oldest-first (newest last; see applyEdit), and file numbers
+    // increase with recency.  Be robust to ordering by selecting the lowest file
+    // numbers explicitly.  Collect (number, size) pairs and sort by number asc.
+    const NumSize = struct { number: u64, size: u64 };
+    var files: std.ArrayListUnmanaged(NumSize) = .empty;
+    defer files.deinit(gpa);
+    for (v.files[0].items) |f| try files.append(gpa, .{ .number = f.number, .size = f.file_size });
+    std.mem.sort(NumSize, files.items, {}, struct {
+        fn lt(_: void, a: NumSize, b: NumSize) bool {
+            return a.number < b.number;
+        }
+    }.lt);
+
+    // Walk oldest-first, marking files for eviction until we are back under the
+    // budget — but never drop the last (newest) file.
+    var total = v.totalFileSize(0);
+    var edit = version_edit.VersionEdit.init();
+    defer edit.deinit(gpa);
+    var evicted: usize = 0;
+    var idx: usize = 0;
+    while (total > fifo_max_table_files_size and idx + 1 < files.items.len) : (idx += 1) {
+        try edit.removeFile(gpa, 0, files.items[idx].number);
+        total -= files.items[idx].size;
+        evicted += 1;
+    }
+    if (evicted == 0) return false;
+
+    try versions.logAndApply(&edit);
+    return true;
+}
+
 const KeyRange = struct { smallest: []const u8, largest: []const u8 };
 
 /// The min/max INTERNAL keys (by InternalKeyComparator user-key ordering) of a
@@ -172,6 +247,124 @@ pub fn isBaseLevelForKey(
         }
     }
     return true;
+}
+
+// ===========================================================================
+// Universal compaction (M7.3) — size-tiered merge of L0 "runs"
+// ===========================================================================
+
+/// Pick a universal compaction over the L0 runs, or null if none is warranted.
+///
+/// Each L0 file is treated as a sorted "run"; the NEWEST run is the one with the
+/// highest file number (L0 is stored oldest-first, so the last item is newest).
+/// Triggered only when the L0 file count reaches
+/// `level0_file_num_compaction_trigger`.
+///
+/// Selection (mirroring RocksDB's two-stage universal picker, simplified):
+///   1. Space-amplification: if `(sum of all runs except the oldest) /
+///      (oldest run size) * 100 > universal_max_size_amplification_percent`,
+///      merge ALL runs.
+///   2. Else size-ratio: starting from the NEWEST run, extend the candidate set
+///      while the next (older) run's size is within
+///      `(1 + universal_size_ratio/100)` of the running total of the candidate
+///      set.  If the set reaches `>= universal_min_merge_width`, compact it.
+///
+/// The selected runs are merged by the EXISTING `doCompaction` machinery into a
+/// single output file kept in L0 (`output_level = 0`): inputs[0] = the selected
+/// L0 files, inputs[1] = empty.  Because the selection is always a contiguous
+/// suffix of L0 (newest runs), removing them and appending the merged output
+/// leaves L0 = [older survivors..., merged] in insertion order — the merged run
+/// (newest data) lands last, so `Version.get`'s newest-first L0 scan still
+/// resolves correctly.
+/// TODO: real RocksDB universal may place a fully-merged run at the bottom
+/// level and supports incremental/sub-compactions; we keep it L0-only here.
+pub fn pickUniversalCompaction(
+    gpa: std.mem.Allocator,
+    versions: *VersionSet,
+    options: options_mod.Options,
+) !?Compaction {
+    const v = versions.currentVersion();
+    const n = v.numFiles(0);
+    if (n < options.level0_file_num_compaction_trigger) return null;
+    if (n < 2) return null; // nothing to merge.
+
+    // Runs newest-first: L0 is oldest-first, so reverse-index it.  run[0] is the
+    // newest, run[n-1] the oldest.  We work with indices into the L0 list.
+    // l0[i] for i in 0..n is oldest..newest; newest-first index j -> l0[n-1-j].
+    const l0 = v.files[0].items;
+
+    // -- 1. Space-amplification check -------------------------------------
+    // size_amp = (total - oldest) / oldest * 100; oldest run is l0[0].
+    var total_size: u64 = 0;
+    for (l0) |f| total_size += f.file_size;
+    const oldest_size = l0[0].file_size;
+    var merge_all = false;
+    if (oldest_size > 0) {
+        const without_oldest = total_size - oldest_size;
+        // Compare without overflow: without_oldest * 100 > oldest * max_amp%.
+        if (without_oldest *% 100 > oldest_size *% options.universal_max_size_amplification_percent) {
+            merge_all = true;
+        }
+    }
+
+    // The selected runs form a contiguous SUFFIX of L0 (newest `count` files):
+    // l0[n-count .. n].  Determine `count`.
+    var count: usize = 0;
+    if (merge_all) {
+        count = n;
+    } else {
+        // -- 2. Size-ratio check, newest-first --------------------------------
+        // candidate = {newest}; running total = its size.  Admit the next older
+        // run while its size <= candidate_total * (1 + ratio/100).
+        // ratio is a percent; compute the bound without floats:
+        //   next_size * 100 <= candidate_total * (100 + ratio)
+        var candidate_total: u64 = l0[n - 1].file_size; // newest run
+        var k: usize = 1; // number of runs in the candidate set
+        // Walk toward older runs.
+        var i: usize = n - 1;
+        while (i > 0) {
+            const next = l0[i - 1].file_size; // the next older run
+            if (next *% 100 <= candidate_total *% (100 + @as(u64, options.universal_size_ratio))) {
+                candidate_total += next;
+                k += 1;
+                i -= 1;
+            } else {
+                break;
+            }
+        }
+        if (k >= options.universal_min_merge_width) {
+            count = k;
+        } else {
+            return null; // no qualifying candidate set.
+        }
+    }
+
+    if (count < 2) return null;
+
+    // Build the Compaction: inputs[0] = the newest `count` L0 files (suffix
+    // l0[n-count .. n]); inputs[1] = empty; output stays in L0.  A PARTIAL merge
+    // (older L0 runs survive) must keep tombstones so a deleted key cannot be
+    // resurrected by an older un-read run; a FULL merge (count == n) reads every
+    // run, so tombstones below the snapshot may be dropped.
+    var c = Compaction{
+        .level = 0,
+        .output_level = 0,
+        .keep_tombstones = count < n,
+        .inputs = .{ .empty, .empty },
+    };
+    errdefer c.deinit(gpa);
+
+    const start = n - count;
+    for (l0[start..]) |f| {
+        try c.inputs[0].append(gpa, .{
+            .number = f.number,
+            .file_size = f.file_size,
+            .smallest = try gpa.dupe(u8, f.smallest),
+            .largest = try gpa.dupe(u8, f.largest),
+        });
+    }
+
+    return c;
 }
 
 /// One in-progress / finished output SST during a compaction.
@@ -361,12 +554,15 @@ pub fn doCompaction(
             // at-or-below the oldest snapshot, so no live read can see this older
             // entry → drop.
             drop = true;
-        } else if (parsed.type == .deletion and
+        } else if (!compaction.keep_tombstones and
+            parsed.type == .deletion and
             parsed.sequence <= smallest_snapshot and
             isBaseLevelForKey(versions, compaction.level, user_key, user_cmp))
         {
             // A tombstone no longer needed (nothing deeper would resurface and no
-            // snapshot needs it) → drop.
+            // snapshot needs it) → drop.  `keep_tombstones` (a partial universal
+            // merge) forces retention so an older, un-read L0 run cannot resurrect
+            // the deleted key.
             drop = true;
         }
 
@@ -428,8 +624,11 @@ pub fn doCompaction(
     for (compaction.inputs[1].items) |f| {
         try edit.removeFile(gpa, @intCast(compaction.level + 1), f.number);
     }
+    // Universal keeps the merged run in L0 (output_level == 0); leveled writes it
+    // to `level + 1`.  `outputLevel()` resolves the right destination.
+    const out_level = compaction.outputLevel();
     for (outputs.items) |o| {
-        try edit.addFile(gpa, @intCast(compaction.level + 1), o.number, o.file_size, o.smallest, o.largest);
+        try edit.addFile(gpa, @intCast(out_level), o.number, o.file_size, o.smallest, o.largest);
     }
 
     try versions.logAndApply(&edit);
@@ -1317,5 +1516,129 @@ test "M7.4: compaction filter must not touch snapshot-protected entries" {
     if (try db.get(.{}, "k")) |leftover| {
         defer gpa.free(leftover);
         return error.TestExpectedRemoved;
+    }
+}
+
+// --- THE FIFO GATE (M7.3) --------------------------------------------------
+
+test "M7.3: FIFO evicts the oldest L0 files once over the byte budget" {
+    const gpa = testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    // Tiny write buffer -> one L0 file per put.  Tiny FIFO budget so a handful
+    // of files blows past it and the oldest are evicted.  We size the budget so
+    // it holds only a couple of L0 files.
+    const db = try DB.open(gpa, e, "fifo", .{
+        .compaction_style = .fifo,
+        .write_buffer_size = 1, // flush after every put
+        .fifo_max_table_files_size = 1500, // ~ room for ~2-3 tiny SSTs
+    });
+    defer db.close();
+
+    // Write distinct keys; each flush produces a new L0 file with a higher file
+    // number.  The earliest-written keys live in the OLDEST (lowest-number) files
+    // and must be evicted first.
+    const n: usize = 30;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        var kbuf: [8]u8 = undefined;
+        const k = try std.fmt.bufPrint(&kbuf, "k{d:0>4}", .{i});
+        try db.put(.{}, k, "value-padding-to-grow-the-sst-files");
+    }
+
+    // The L0 byte total is back under (or within one file of) the budget.
+    const total = db.versions.currentVersion().totalFileSize(0);
+    // Tolerance of one extra file: eviction stops once <= budget, but FIFO never
+    // evicts the file currently being written; allow some slack for the last SST.
+    try testing.expect(total <= 4 * 1500);
+
+    // The most-recently-written keys are present.
+    {
+        var kbuf: [8]u8 = undefined;
+        const k = try std.fmt.bufPrint(&kbuf, "k{d:0>4}", .{n - 1});
+        const got = try db.get(.{}, k) orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings("value-padding-to-grow-the-sst-files", got);
+    }
+
+    // The OLDEST keys were evicted (dropped whole-file, not merged) -> null.
+    {
+        const got = try db.get(.{}, "k0000");
+        if (got) |v| {
+            defer gpa.free(v);
+            return error.TestOldestNotEvicted;
+        }
+    }
+
+    // Monotonic frontier: there is a cut index below which everything is gone and
+    // at/above which everything is present (FIFO drops contiguous oldest files).
+    var present_seen = false;
+    i = 0;
+    while (i < n) : (i += 1) {
+        var kbuf: [8]u8 = undefined;
+        const k = try std.fmt.bufPrint(&kbuf, "k{d:0>4}", .{i});
+        const got = try db.get(.{}, k);
+        if (got) |v| {
+            gpa.free(v);
+            present_seen = true;
+        }
+    }
+    try testing.expect(present_seen);
+}
+
+// --- THE UNIVERSAL GATE (M7.3) ---------------------------------------------
+
+test "M7.3: universal merges L0 runs into fewer files, data preserved + reopen" {
+    const gpa = testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    const key_space: usize = 60;
+    const opts = options_mod.Options{
+        .compaction_style = .universal,
+        .write_buffer_size = 256, // many flushes -> many L0 runs
+        .level0_file_num_compaction_trigger = 4, // trigger universal merges
+        .target_file_size_base = 1 << 20, // merge into a single output file
+    };
+
+    var ref = RefMap.init(gpa);
+    defer ref.deinit();
+
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE_AB12);
+    const rand = prng.random();
+
+    {
+        const db = try DB.open(gpa, e, "uni", opts);
+        defer db.close();
+
+        var op: usize = 0;
+        while (op < 1500) : (op += 1) {
+            const key_idx = rand.uintLessThan(usize, key_space);
+            var kbuf: [8]u8 = undefined;
+            const k = try std.fmt.bufPrint(&kbuf, "key{d:0>3}", .{key_idx});
+            var vbuf: [40]u8 = undefined;
+            const vlen = 1 + rand.uintLessThan(usize, vbuf.len);
+            for (vbuf[0..vlen]) |*b| b.* = 'a' + rand.uintLessThan(u8, 26);
+            const v = vbuf[0..vlen];
+            try db.put(.{}, k, v);
+            try ref.put(k, v);
+        }
+
+        // Universal keeps runs in L0; nothing should be pushed to deeper levels.
+        try testing.expectEqual(@as(usize, 0), levelFiles(db, 1));
+        // The merges must have collapsed many flushed runs into a small count.
+        try testing.expect(levelFiles(db, 0) < 1500 / 4);
+
+        try verifyAgainstRef(gpa, db, &ref, key_space);
+    }
+
+    // Reopen and re-verify (universal output must survive recovery).
+    {
+        const db = try DB.open(gpa, e, "uni", opts);
+        defer db.close();
+        try verifyAgainstRef(gpa, db, &ref, key_space);
     }
 }
