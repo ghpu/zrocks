@@ -25,81 +25,120 @@ const kHeaderSize: usize = 12;
 pub const WriteBatch = struct {
     rep: std.ArrayList(u8),
 
+    /// Initialise a new WriteBatch with a zeroed 12-byte header.
     pub fn init(gpa: std.mem.Allocator) !WriteBatch {
-        _ = gpa;
-        @panic("TODO");
+        var rep: std.ArrayList(u8) = .empty;
+        const zero_header = [_]u8{0} ** kHeaderSize;
+        try rep.appendSlice(gpa, &zero_header);
+        return WriteBatch{ .rep = rep };
     }
 
     pub fn deinit(self: *WriteBatch, gpa: std.mem.Allocator) void {
-        _ = self;
-        _ = gpa;
-        @panic("TODO");
+        self.rep.deinit(gpa);
     }
 
+    /// Append a Put record and increment the count.
     pub fn put(self: *WriteBatch, gpa: std.mem.Allocator, key: []const u8, value: []const u8) !void {
-        _ = self;
-        _ = gpa;
-        _ = key;
-        _ = value;
-        @panic("TODO");
+        try self.rep.append(gpa, @intFromEnum(ValueType.value));
+        try coding.putLengthPrefixedSlice(&self.rep, gpa, key);
+        try coding.putLengthPrefixedSlice(&self.rep, gpa, value);
+        self.setCount(self.count() + 1);
     }
 
+    /// Append a Delete record and increment the count.
     pub fn delete(self: *WriteBatch, gpa: std.mem.Allocator, key: []const u8) !void {
-        _ = self;
-        _ = gpa;
-        _ = key;
-        @panic("TODO");
+        try self.rep.append(gpa, @intFromEnum(ValueType.deletion));
+        try coding.putLengthPrefixedSlice(&self.rep, gpa, key);
+        self.setCount(self.count() + 1);
     }
 
+    /// Read the record count from the header (fixed32 LE at offset 8).
     pub fn count(self: *const WriteBatch) u32 {
-        _ = self;
-        @panic("TODO");
+        const bytes: *const [4]u8 = self.rep.items[kCountOffset..][0..4];
+        return coding.decodeFixed32(bytes);
     }
 
+    /// Write the record count into the header.
     pub fn setCount(self: *WriteBatch, n: u32) void {
-        _ = self;
-        _ = n;
-        @panic("TODO");
+        const bytes: *[4]u8 = self.rep.items[kCountOffset..][0..4];
+        coding.encodeFixed32(bytes, n);
     }
 
+    /// Read the sequence number from the header (fixed64 LE at offset 0).
     pub fn sequence(self: *const WriteBatch) u64 {
-        _ = self;
-        @panic("TODO");
+        const bytes: *const [8]u8 = self.rep.items[kSeqOffset..][0..8];
+        return coding.decodeFixed64(bytes);
     }
 
+    /// Write the sequence number into the header.
     pub fn setSequence(self: *WriteBatch, seq: u64) void {
-        _ = self;
-        _ = seq;
-        @panic("TODO");
+        const bytes: *[8]u8 = self.rep.items[kSeqOffset..][0..8];
+        coding.encodeFixed64(bytes, seq);
     }
 
+    /// Reset to an empty 12-byte zeroed header, discarding all records.
     pub fn clear(self: *WriteBatch, gpa: std.mem.Allocator) !void {
-        _ = self;
-        _ = gpa;
-        @panic("TODO");
+        self.rep.clearRetainingCapacity();
+        const zero_header = [_]u8{0} ** kHeaderSize;
+        try self.rep.appendSlice(gpa, &zero_header);
     }
 
+    /// Return the raw byte representation.
     pub fn contents(self: *const WriteBatch) []const u8 {
-        _ = self;
-        @panic("TODO");
+        return self.rep.items;
     }
 
+    /// Replace the rep with the provided bytes (e.g. from WAL replay).
     pub fn setContents(self: *WriteBatch, gpa: std.mem.Allocator, bytes: []const u8) !void {
-        _ = self;
-        _ = gpa;
-        _ = bytes;
-        @panic("TODO");
+        self.rep.clearRetainingCapacity();
+        try self.rep.appendSlice(gpa, bytes);
     }
 
+    /// Total byte size of the batch.
     pub fn byteSize(self: *const WriteBatch) usize {
-        _ = self;
-        @panic("TODO");
+        return self.rep.items.len;
     }
 
+    /// Iterate over all records in the batch, calling handler methods for each.
+    ///
+    /// The handler must implement:
+    ///   fn put(self: @TypeOf(handler), key: []const u8, value: []const u8) !void
+    ///   fn delete(self: @TypeOf(handler), key: []const u8) !void
+    ///
+    /// Returns error.Corruption if:
+    ///   - the rep is shorter than the header,
+    ///   - a record type byte is unknown,
+    ///   - a length-prefixed field is truncated, or
+    ///   - the number of parsed records does not match the header count.
     pub fn iterate(self: *const WriteBatch, handler: anytype) !void {
-        _ = self;
-        _ = handler;
-        @panic("TODO");
+        if (self.rep.items.len < kHeaderSize) return error.Corruption;
+
+        const expected_count = self.count();
+        var input: []const u8 = self.rep.items[kHeaderSize..];
+        var parsed_count: u32 = 0;
+
+        while (input.len > 0) {
+            // Read the type byte.
+            const type_byte = input[0];
+            input = input[1..];
+
+            if (type_byte == @intFromEnum(ValueType.value)) {
+                // Put record: key + value
+                const key = coding.getLengthPrefixedSlice(&input) catch return error.Corruption;
+                const value = coding.getLengthPrefixedSlice(&input) catch return error.Corruption;
+                try handler.put(key, value);
+                parsed_count += 1;
+            } else if (type_byte == @intFromEnum(ValueType.deletion)) {
+                // Delete record: key only
+                const key = coding.getLengthPrefixedSlice(&input) catch return error.Corruption;
+                try handler.delete(key);
+                parsed_count += 1;
+            } else {
+                return error.Corruption;
+            }
+        }
+
+        if (parsed_count != expected_count) return error.Corruption;
     }
 };
 
