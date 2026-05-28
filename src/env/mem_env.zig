@@ -217,11 +217,10 @@ const MemWritable = struct {
     fn close(ptr: *anyopaque) Error!void {
         const h: *MemWritable = @ptrCast(@alignCast(ptr));
         const gpa = h.gpa;
-        // Commit on close (errors here are surfaced before we free).
-        const commit_err: ?Error = blk: {
-            h.me.store(h.path, h.buf.items) catch |e| break :blk e;
-            break :blk null;
-        };
+        // Commit on close, but always release the handle's resources first so a
+        // failed commit can never leak.  The commit error (if any) is surfaced
+        // after cleanup.
+        const commit_err: ?Error = if (h.me.store(h.path, h.buf.items)) |_| null else |e| e;
         h.buf.deinit(gpa);
         gpa.free(h.path);
         gpa.destroy(h);
