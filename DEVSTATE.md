@@ -4,11 +4,11 @@ zig_binary: /home/ghpu/zig/zig
 stdlib: /home/ghpu/zig/lib/std
 target_rocksdb: "9.x line; block-based table format_version 5; legacy WAL/MANIFEST log (see docs/adr/000-target-format.md)"
 active_phase: P3
-active_milestone: "M3.3 TableBuilder"
-last_completed: M3.0 Block, M3.1 Bloom/filter, M3.2 Footer (Phase 3 wave 1)
-worktrees: "m3.3-table-builder"
+active_milestone: "M3.4 TableReader"
+last_completed: M3.3 TableBuilder
+worktrees: "m3.4-table-reader"
 test_command: "/home/ghpu/zig/zig build test"
-test_count: 189
+test_count: 191
 updated: 2026-05-28
 ---
 
@@ -42,8 +42,8 @@ RocksDB reference: https://github.com/facebook/rocksdb/wiki
 - [x] M3.0 Block builder/reader        (src/format/block.zig)
 - [x] M3.1 Bloom filter + filter block (src/format/bloom.zig, filter_block.zig)
 - [x] M3.2 Footer & BlockHandle        (src/format/footer.zig)
-- [~] M3.3 TableBuilder  <-- ACTIVE
-- [ ] M3.4 TableReader
+- [x] M3.3 TableBuilder                (src/format/table_builder.zig)
+- [~] M3.4 TableReader  <-- ACTIVE
 - [ ] M3.5 LRU block cache + table cache
 
 ### Phase 4 — Iterators & in-memory DB
