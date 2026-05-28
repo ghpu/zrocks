@@ -2,7 +2,6 @@ const std = @import("std");
 
 // ---------------------------------------------------------------------------
 // Status / error vocabulary for zrocks, mirroring RocksDB's Status::Code.
-// Stubs — implementations will follow in the green commit.
 // ---------------------------------------------------------------------------
 
 pub const Code = enum {
@@ -38,33 +37,63 @@ pub const Error = error{
     TryAgain,
 };
 
+/// Human-readable name for a Code value.
 pub fn codeName(c: Code) []const u8 {
-    _ = c;
-    @panic("TODO");
+    return switch (c) {
+        .ok => "OK",
+        .not_found => "NotFound",
+        .corruption => "Corruption",
+        .not_supported => "NotSupported",
+        .invalid_argument => "InvalidArgument",
+        .io_error => "IOError",
+        .merge_in_progress => "MergeInProgress",
+        .incomplete => "Incomplete",
+        .shutdown_in_progress => "ShutdownInProgress",
+        .timed_out => "TimedOut",
+        .aborted => "Aborted",
+        .busy => "Busy",
+        .expired => "Expired",
+        .try_again => "TryAgain",
+    };
 }
 
+/// Convert a Code to an error union.
+/// .ok  -> returns void (success).
+/// else -> returns the matching Error.
 pub fn toError(c: Code) Error!void {
-    _ = c;
-    @panic("TODO");
+    return switch (c) {
+        .ok => {},
+        .not_found => error.NotFound,
+        .corruption => error.Corruption,
+        .not_supported => error.NotSupported,
+        .invalid_argument => error.InvalidArgument,
+        .io_error => error.IOError,
+        .merge_in_progress => error.MergeInProgress,
+        .incomplete => error.Incomplete,
+        .shutdown_in_progress => error.ShutdownInProgress,
+        .timed_out => error.TimedOut,
+        .aborted => error.Aborted,
+        .busy => error.Busy,
+        .expired => error.Expired,
+        .try_again => error.TryAgain,
+    };
 }
 
+/// Lightweight status value — no ownership of msg.
 pub const Status = struct {
     code: Code,
     msg: ?[]const u8 = null,
 
     pub fn ok() Status {
-        @panic("TODO");
+        return .{ .code = .ok };
     }
 
     pub fn err(code: Code, msg: ?[]const u8) Status {
-        _ = code;
-        _ = msg;
-        @panic("TODO");
+        return .{ .code = code, .msg = msg };
     }
 
     pub fn isOk(self: Status) bool {
-        _ = self;
-        @panic("TODO");
+        return self.code == .ok;
     }
 };
 

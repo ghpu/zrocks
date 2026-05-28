@@ -2,36 +2,28 @@ const std = @import("std");
 
 // ---------------------------------------------------------------------------
 // Byte-slice vocabulary used throughout the zrocks engine.
-// Stubs — implementations will follow in the green commit.
+// All functions operate on []const u8 directly — no {ptr,len} wrapper needed.
 // ---------------------------------------------------------------------------
 
 pub fn compare(a: []const u8, b: []const u8) std.math.Order {
-    _ = a;
-    _ = b;
-    @panic("TODO");
+    return std.mem.order(u8, a, b);
 }
 
 pub fn equal(a: []const u8, b: []const u8) bool {
-    _ = a;
-    _ = b;
-    @panic("TODO");
+    return std.mem.eql(u8, a, b);
 }
 
 pub fn startsWith(slice: []const u8, prefix: []const u8) bool {
-    _ = slice;
-    _ = prefix;
-    @panic("TODO");
+    return std.mem.startsWith(u8, slice, prefix);
 }
 
 pub fn isEmpty(s: []const u8) bool {
-    _ = s;
-    @panic("TODO");
+    return s.len == 0;
 }
 
+/// Return s[n..] — caller must ensure n <= s.len.
 pub fn removePrefix(s: []const u8, n: usize) []const u8 {
-    _ = s;
-    _ = n;
-    @panic("TODO");
+    return s[n..];
 }
 
 // ---------------------------------------------------------------------------
