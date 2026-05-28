@@ -8,6 +8,15 @@
 ///   record (Merge)  := 0x02  varint32(len(key)) key  varint32(len(value)) value
 ///
 /// The type bytes 0x01 / 0x00 / 0x02 match ValueType.value / .deletion / .merge.
+///
+/// M7.0 Column-family tagging: a record targeting a NON-default column family
+/// (cf_id != 0) is prefixed with `kColumnFamilyTag` (0x10) ++ varint32(cf_id),
+/// then the ordinary record bytes follow.  Default-CF records (cf_id 0) are left
+/// UNTAGGED, so existing single-CF batches are byte-for-byte unchanged and remain
+/// back-compatible (the WAL replay + iterate paths treat an untagged record as
+/// cf 0).  `iterate` yields `(cf_id, op)` by calling `handler.putCF(cf_id, ...)`
+/// etc. when those methods exist, falling back to the cf-0 `put`/`delete`/...
+/// methods otherwise.
 const std = @import("std");
 const coding = @import("../util/coding.zig");
 const internal_key = @import("internal_key.zig");
@@ -15,6 +24,13 @@ const internal_key = @import("internal_key.zig");
 const ValueType = internal_key.ValueType;
 
 pub const Error = error{Corruption} || std.mem.Allocator.Error;
+
+/// Record-prefix tag introducing a non-default column-family id (M7.0).  The
+/// next bytes are varint32(cf_id) followed by the ordinary record (type byte +
+/// fields).  Chosen distinct from every ValueType tag used in a batch record
+/// (0x00/0x01/0x02/0x0F), so the first byte of a record unambiguously says
+/// whether a CF id precedes it.
+pub const kColumnFamilyTag: u8 = 0x10;
 
 /// Byte offset of the sequence number in the header.
 const kSeqOffset: usize = 0;
@@ -73,6 +89,50 @@ pub const WriteBatch = struct {
         self.setCount(self.count() + 1);
     }
 
+    /// Emit the CF prefix `kColumnFamilyTag ++ varint32(cf_id)` when `cf_id` is
+    /// non-default; default (0) emits nothing so the record stays untagged.
+    fn putCfPrefix(self: *WriteBatch, gpa: std.mem.Allocator, cf_id: u32) !void {
+        if (cf_id == 0) return;
+        try self.rep.append(gpa, kColumnFamilyTag);
+        try coding.putVarint32(&self.rep, gpa, cf_id);
+    }
+
+    /// Append a Put record targeting column family `cf_id` and increment the
+    /// count.  `cf_id == 0` is identical to `put` (untagged, back-compatible).
+    pub fn putCF(self: *WriteBatch, gpa: std.mem.Allocator, cf_id: u32, key: []const u8, value: []const u8) !void {
+        try self.putCfPrefix(gpa, cf_id);
+        try self.rep.append(gpa, @intFromEnum(ValueType.value));
+        try coding.putLengthPrefixedSlice(&self.rep, gpa, key);
+        try coding.putLengthPrefixedSlice(&self.rep, gpa, value);
+        self.setCount(self.count() + 1);
+    }
+
+    /// Append a Delete record targeting column family `cf_id`.
+    pub fn deleteCF(self: *WriteBatch, gpa: std.mem.Allocator, cf_id: u32, key: []const u8) !void {
+        try self.putCfPrefix(gpa, cf_id);
+        try self.rep.append(gpa, @intFromEnum(ValueType.deletion));
+        try coding.putLengthPrefixedSlice(&self.rep, gpa, key);
+        self.setCount(self.count() + 1);
+    }
+
+    /// Append a Merge operand targeting column family `cf_id`.
+    pub fn mergeCF(self: *WriteBatch, gpa: std.mem.Allocator, cf_id: u32, key: []const u8, value: []const u8) !void {
+        try self.putCfPrefix(gpa, cf_id);
+        try self.rep.append(gpa, @intFromEnum(ValueType.merge));
+        try coding.putLengthPrefixedSlice(&self.rep, gpa, key);
+        try coding.putLengthPrefixedSlice(&self.rep, gpa, value);
+        self.setCount(self.count() + 1);
+    }
+
+    /// Append a DeleteRange record targeting column family `cf_id`.
+    pub fn deleteRangeCF(self: *WriteBatch, gpa: std.mem.Allocator, cf_id: u32, begin: []const u8, end: []const u8) !void {
+        try self.putCfPrefix(gpa, cf_id);
+        try self.rep.append(gpa, @intFromEnum(ValueType.range_deletion));
+        try coding.putLengthPrefixedSlice(&self.rep, gpa, begin);
+        try coding.putLengthPrefixedSlice(&self.rep, gpa, end);
+        self.setCount(self.count() + 1);
+    }
+
     /// Read the record count from the header (fixed32 LE at offset 8).
     pub fn count(self: *const WriteBatch) u32 {
         const bytes: *const [4]u8 = self.rep.items[kCountOffset..][0..4];
@@ -122,10 +182,21 @@ pub const WriteBatch = struct {
 
     /// Iterate over all records in the batch, calling handler methods for each.
     ///
-    /// The handler must implement:
-    ///   fn put(self: @TypeOf(handler), key: []const u8, value: []const u8) !void
-    ///   fn delete(self: @TypeOf(handler), key: []const u8) !void
-    ///   fn merge(self: @TypeOf(handler), key: []const u8, value: []const u8) !void
+    /// The handler must implement the cf-0 methods:
+    ///   fn put(self, key, value) !void
+    ///   fn delete(self, key) !void
+    ///   fn merge(self, key, value) !void
+    ///   (optionally) fn deleteRange(self, begin, end) !void
+    ///
+    /// A CF-AWARE handler additionally declares any of:
+    ///   fn putCF(self, cf_id: u32, key, value) !void
+    ///   fn deleteCF(self, cf_id: u32, key) !void
+    ///   fn mergeCF(self, cf_id: u32, key, value) !void
+    ///   fn deleteRangeCF(self, cf_id: u32, begin, end) !void
+    /// When present, records are dispatched to the `*CF` method with the parsed
+    /// column-family id (0 for untagged records); otherwise records are routed to
+    /// the cf-0 method and a NON-default cf id is an error (a usage error: a
+    /// CF-tagged batch reached a CF-unaware handler).
     ///
     /// Returns error.Corruption if:
     ///   - the rep is shorter than the header,
@@ -135,42 +206,68 @@ pub const WriteBatch = struct {
     pub fn iterate(self: *const WriteBatch, handler: anytype) !void {
         if (self.rep.items.len < kHeaderSize) return error.Corruption;
 
+        const Handler = @typeInfo(@TypeOf(handler)).pointer.child;
         const expected_count = self.count();
         var input: []const u8 = self.rep.items[kHeaderSize..];
         var parsed_count: u32 = 0;
 
         while (input.len > 0) {
+            // Optional CF prefix: kColumnFamilyTag ++ varint32(cf_id).
+            var cf_id: u32 = 0;
+            if (input[0] == kColumnFamilyTag) {
+                input = input[1..];
+                cf_id = coding.getVarint32(&input) catch return error.Corruption;
+            }
+
             // Read the type byte.
+            if (input.len == 0) return error.Corruption;
             const type_byte = input[0];
             input = input[1..];
 
             if (type_byte == @intFromEnum(ValueType.value)) {
-                // Put record: key + value
                 const key = coding.getLengthPrefixedSlice(&input) catch return error.Corruption;
                 const value = coding.getLengthPrefixedSlice(&input) catch return error.Corruption;
-                try handler.put(key, value);
+                if (@hasDecl(Handler, "putCF")) {
+                    try handler.putCF(cf_id, key, value);
+                } else {
+                    if (cf_id != 0) return error.Corruption;
+                    try handler.put(key, value);
+                }
                 parsed_count += 1;
             } else if (type_byte == @intFromEnum(ValueType.deletion)) {
-                // Delete record: key only
                 const key = coding.getLengthPrefixedSlice(&input) catch return error.Corruption;
-                try handler.delete(key);
+                if (@hasDecl(Handler, "deleteCF")) {
+                    try handler.deleteCF(cf_id, key);
+                } else {
+                    if (cf_id != 0) return error.Corruption;
+                    try handler.delete(key);
+                }
                 parsed_count += 1;
             } else if (type_byte == @intFromEnum(ValueType.merge)) {
-                // Merge record: key + value (operand)
                 const key = coding.getLengthPrefixedSlice(&input) catch return error.Corruption;
                 const value = coding.getLengthPrefixedSlice(&input) catch return error.Corruption;
-                try handler.merge(key, value);
+                if (@hasDecl(Handler, "mergeCF")) {
+                    try handler.mergeCF(cf_id, key, value);
+                } else {
+                    if (cf_id != 0) return error.Corruption;
+                    try handler.merge(key, value);
+                }
                 parsed_count += 1;
             } else if (type_byte == @intFromEnum(ValueType.range_deletion)) {
-                // DeleteRange record (M7.5): begin + end (both user keys).
                 const begin = coding.getLengthPrefixedSlice(&input) catch return error.Corruption;
                 const end = coding.getLengthPrefixedSlice(&input) catch return error.Corruption;
-                // Only handlers that implement `deleteRange` accept range records;
-                // a range record reaching a handler without the method is a usage
-                // error (e.g. an old put/delete-only handler) and is rejected.
-                const Handler = @typeInfo(@TypeOf(handler)).pointer.child;
-                if (!@hasDecl(Handler, "deleteRange")) return error.Corruption;
-                try handler.deleteRange(begin, end);
+                if (@hasDecl(Handler, "deleteRangeCF")) {
+                    try handler.deleteRangeCF(cf_id, begin, end);
+                } else if (@hasDecl(Handler, "deleteRange")) {
+                    // A range record reaching a CF-unaware handler with only the
+                    // cf-0 method must target the default CF.
+                    if (cf_id != 0) return error.Corruption;
+                    try handler.deleteRange(begin, end);
+                } else {
+                    // A range record reaching a put/delete-only handler is a usage
+                    // error (e.g. an old handler without range support).
+                    return error.Corruption;
+                }
                 parsed_count += 1;
             } else {
                 return error.Corruption;
@@ -481,6 +578,87 @@ test "M7.5 golden bytes: deleteRange(b, d) produces type 0x0F wire encoding" {
         0x01, 'd',
     };
     try std.testing.expectEqualSlices(u8, &expected, wb.contents());
+}
+
+// ---------------------------------------------------------------------------
+// M7.0 — Column-family tagging
+// ---------------------------------------------------------------------------
+
+test "M7.0 golden bytes: putCF(cf=0) is untagged (back-compatible with put)" {
+    const gpa = std.testing.allocator;
+    var a = try WriteBatch.init(gpa);
+    defer a.deinit(gpa);
+    var b = try WriteBatch.init(gpa);
+    defer b.deinit(gpa);
+
+    try a.put(gpa, "foo", "bar");
+    try b.putCF(gpa, 0, "foo", "bar");
+    try std.testing.expectEqualSlices(u8, a.contents(), b.contents());
+}
+
+test "M7.0 golden bytes: putCF(cf=5) prefixes kColumnFamilyTag + varint(5)" {
+    const gpa = std.testing.allocator;
+    var wb = try WriteBatch.init(gpa);
+    defer wb.deinit(gpa);
+
+    try wb.putCF(gpa, 5, "k", "v");
+    const expected = [_]u8{
+        0, 0, 0, 0, 0, 0, 0, 0, // seq=0
+        1, 0, 0, 0, // count=1
+        kColumnFamilyTag, 0x05, // CF prefix: tag + varint(5)
+        0x01, // ValueType.value
+        0x01, 'k',
+        0x01, 'v',
+    };
+    try std.testing.expectEqualSlices(u8, &expected, wb.contents());
+}
+
+test "M7.0 iterate: CF-aware handler receives per-record cf ids" {
+    const gpa = std.testing.allocator;
+    var wb = try WriteBatch.init(gpa);
+    defer wb.deinit(gpa);
+
+    try wb.put(gpa, "d", "dv"); // cf 0 (untagged)
+    try wb.putCF(gpa, 1, "u", "uv"); // cf 1
+    try wb.deleteCF(gpa, 2, "o"); // cf 2
+
+    const Handler = struct {
+        ids: [8]u32 = undefined,
+        n: usize = 0,
+        pub fn putCF(self: *@This(), cf_id: u32, _: []const u8, _: []const u8) !void {
+            self.ids[self.n] = cf_id;
+            self.n += 1;
+        }
+        pub fn deleteCF(self: *@This(), cf_id: u32, _: []const u8) !void {
+            self.ids[self.n] = cf_id;
+            self.n += 1;
+        }
+        pub fn mergeCF(self: *@This(), cf_id: u32, _: []const u8, _: []const u8) !void {
+            self.ids[self.n] = cf_id;
+            self.n += 1;
+        }
+    };
+    var h = Handler{};
+    try wb.iterate(&h);
+    try std.testing.expectEqual(@as(usize, 3), h.n);
+    try std.testing.expectEqual(@as(u32, 0), h.ids[0]);
+    try std.testing.expectEqual(@as(u32, 1), h.ids[1]);
+    try std.testing.expectEqual(@as(u32, 2), h.ids[2]);
+}
+
+test "M7.0 iterate: CF-tagged record rejected by a CF-unaware handler" {
+    const gpa = std.testing.allocator;
+    var wb = try WriteBatch.init(gpa);
+    defer wb.deinit(gpa);
+    try wb.putCF(gpa, 3, "k", "v");
+
+    const Handler = struct {
+        pub fn put(_: *@This(), _: []const u8, _: []const u8) !void {}
+        pub fn delete(_: *@This(), _: []const u8) !void {}
+        pub fn merge(_: *@This(), _: []const u8, _: []const u8) !void {}
+    };
+    var h = Handler{};
+    try std.testing.expectError(error.Corruption, wb.iterate(&h));
 }
 
 test "M7.5 iterate: deleteRange handler called with begin + end" {
