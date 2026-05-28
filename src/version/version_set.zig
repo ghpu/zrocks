@@ -179,7 +179,7 @@ pub const VersionSet = struct {
     /// edit to the MANIFEST, install the new Version, and free the old one.
     pub fn logAndApply(self: *VersionSet, edit: *VersionEdit) !void {
         // 1. Build the new Version from the current one + the edit.
-        var next = try self.buildNextVersion(edit);
+        var next = try applyEdit(self.gpa, &self.current, edit, self.cmp);
         errdefer next.deinit(self.gpa);
 
         // 2. Ensure a MANIFEST exists; on the very first call create it and
@@ -214,29 +214,32 @@ pub const VersionSet = struct {
         for (edit.new_files.items) |nf| self.markFileNumberUsed(nf.meta.number);
     }
 
-    /// Compute the next Version by applying `edit` to `self.current`:
+    /// Compute a fresh Version by applying `edit` to `base` (which is NOT
+    /// modified or freed — the returned Version deep-owns its own key bytes):
     /// carry forward every surviving file (minus edit.deleted_files), add
-    /// edit.new_files, then sort levels >= 1 by smallest internal key.
-    fn buildNextVersion(self: *VersionSet, edit: *const VersionEdit) !Version {
+    /// edit.new_files, then sort levels >= 1 by smallest internal key.  Level 0
+    /// keeps insertion order (overlapping ranges, newest last).
+    fn applyEdit(
+        gpa: std.mem.Allocator,
+        base: *const Version,
+        edit: *const VersionEdit,
+        cmp: comparator.Comparator,
+    ) !Version {
         var next = Version.initEmpty();
-        errdefer next.deinit(self.gpa);
+        errdefer next.deinit(gpa);
 
         var level: usize = 0;
         while (level < kNumLevels) : (level += 1) {
-            // Carry forward surviving files from the current Version.
-            for (self.current.files[level].items) |f| {
+            for (base.files[level].items) |f| {
                 if (isDeleted(edit, level, f.number)) continue;
-                try next.addFileOwned(self.gpa, level, f);
+                try next.addFileOwned(gpa, level, f);
             }
-            // Add new files targeting this level.
             for (edit.new_files.items) |nf| {
                 if (nf.level != level) continue;
                 if (isDeleted(edit, level, nf.meta.number)) continue;
-                try next.addFileOwned(self.gpa, level, nf.meta);
+                try next.addFileOwned(gpa, level, nf.meta);
             }
-            // Levels >= 1 are non-overlapping and kept sorted by smallest key.
-            // Level 0 keeps insertion order (overlapping ranges, newest last).
-            if (level >= 1) sortLevel(&next.files[level], self.cmp);
+            if (level >= 1) sortLevel(&next.files[level], cmp);
         }
         return next;
     }
@@ -390,7 +393,9 @@ pub const VersionSet = struct {
             var edit = try VersionEdit.decodeFrom(self.gpa, record);
             defer edit.deinit(self.gpa);
 
-            built = try applyEditToVersion(self.gpa, built, &edit, self.cmp);
+            const next = try applyEdit(self.gpa, &built, &edit, self.cmp);
+            built.deinit(self.gpa);
+            built = next;
 
             if (edit.log_number) |v| {
                 log_num = v;
@@ -408,10 +413,6 @@ pub const VersionSet = struct {
                 last_seq = v;
                 have_last_seq = true;
             }
-            for (edit.new_files.items) |nf| {
-                if (!have_next_file or next_file <= nf.meta.number)
-                    self.markFileNumberUsed(nf.meta.number);
-            }
         }
 
         // 3. Install the recovered scalars and Version.
@@ -419,7 +420,8 @@ pub const VersionSet = struct {
         if (have_prev_log) self.prev_log_number = prev_log_num;
         if (have_last_seq) self.last_sequence = last_seq;
         if (have_next_file) self.markFileNumberUsed(next_file -| 1);
-        // Ensure every recovered file number is reserved.
+        // Ensure every surviving file number stays reserved (defensive — a
+        // well-formed MANIFEST's next_file_number already covers them).
         for (&built.files) |*level| {
             for (level.items) |f| self.markFileNumberUsed(f.number);
         }
@@ -427,35 +429,6 @@ pub const VersionSet = struct {
         var old = self.current;
         self.current = built;
         old.deinit(self.gpa);
-    }
-
-    /// Apply `edit` to `base`, returning the new Version (and freeing `base`).
-    /// On error `base` is left intact and ownership stays with the caller.
-    fn applyEditToVersion(
-        gpa: std.mem.Allocator,
-        base: Version,
-        edit: *const VersionEdit,
-        cmp: comparator.Comparator,
-    ) !Version {
-        var next = Version.initEmpty();
-        errdefer next.deinit(gpa);
-
-        var level: usize = 0;
-        while (level < kNumLevels) : (level += 1) {
-            for (base.files[level].items) |f| {
-                if (isDeleted(edit, level, f.number)) continue;
-                try next.addFileOwned(gpa, level, f);
-            }
-            for (edit.new_files.items) |nf| {
-                if (nf.level != level) continue;
-                if (isDeleted(edit, level, nf.meta.number)) continue;
-                try next.addFileOwned(gpa, level, nf.meta);
-            }
-            if (level >= 1) sortLevel(&next.files[level], cmp);
-        }
-        var b = base;
-        b.deinit(gpa);
-        return next;
     }
 };
 
