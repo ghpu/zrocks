@@ -5,61 +5,58 @@ const std = @import("std");
 pub const Error = error{Corruption};
 
 // ---------------------------------------------------------------------------
-// Fixed-width little-endian helpers (to be implemented)
+// Fixed-width little-endian helpers
 // ---------------------------------------------------------------------------
 
 pub fn encodeFixed32(dst: *[4]u8, v: u32) void {
-    _ = dst;
-    _ = v;
-    @panic("not implemented");
+    std.mem.writeInt(u32, dst, v, .little);
 }
 
 pub fn decodeFixed32(src: *const [4]u8) u32 {
-    _ = src;
-    @panic("not implemented");
+    return std.mem.readInt(u32, src, .little);
 }
 
 pub fn encodeFixed64(dst: *[8]u8, v: u64) void {
-    _ = dst;
-    _ = v;
-    @panic("not implemented");
+    std.mem.writeInt(u64, dst, v, .little);
 }
 
 pub fn decodeFixed64(src: *const [8]u8) u64 {
-    _ = src;
-    @panic("not implemented");
+    return std.mem.readInt(u64, src, .little);
 }
 
 // ---------------------------------------------------------------------------
-// ArrayList append helpers (to be implemented)
+// ArrayList append helpers
 // ---------------------------------------------------------------------------
 
 pub fn putFixed32(list: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, v: u32) !void {
-    _ = list;
-    _ = gpa;
-    _ = v;
-    @panic("not implemented");
+    var buf: [4]u8 = undefined;
+    encodeFixed32(&buf, v);
+    try list.appendSlice(gpa, &buf);
 }
 
 pub fn putFixed64(list: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, v: u64) !void {
-    _ = list;
-    _ = gpa;
-    _ = v;
-    @panic("not implemented");
+    var buf: [8]u8 = undefined;
+    encodeFixed64(&buf, v);
+    try list.appendSlice(gpa, &buf);
 }
 
 pub fn putVarint32(list: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, v: u32) !void {
-    _ = list;
-    _ = gpa;
-    _ = v;
-    @panic("not implemented");
+    // Promote to u64 to share the varint64 encoder.
+    try putVarint64(list, gpa, @as(u64, v));
 }
 
 pub fn putVarint64(list: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, v: u64) !void {
-    _ = list;
-    _ = gpa;
-    _ = v;
-    @panic("not implemented");
+    var val = v;
+    while (true) {
+        const byte: u8 = @intCast(val & 0x7f);
+        val >>= 7;
+        if (val == 0) {
+            try list.append(gpa, byte);
+            break;
+        } else {
+            try list.append(gpa, byte | 0x80);
+        }
+    }
 }
 
 pub fn putLengthPrefixedSlice(
@@ -67,38 +64,66 @@ pub fn putLengthPrefixedSlice(
     gpa: std.mem.Allocator,
     data: []const u8,
 ) !void {
-    _ = list;
-    _ = gpa;
-    _ = data;
-    @panic("not implemented");
+    try putVarint32(list, gpa, @intCast(data.len));
+    try list.appendSlice(gpa, data);
 }
 
 // ---------------------------------------------------------------------------
-// Slice-consuming decoders (to be implemented)
+// Slice-consuming decoders (advance input past consumed bytes)
 // ---------------------------------------------------------------------------
 
 pub fn getVarint32(input: *[]const u8) Error!u32 {
-    _ = input;
-    @panic("not implemented");
+    const result = try getVarint64(input);
+    // Values that overflow u32 are corrupt for a varint32 field.
+    if (result > 0xffffffff) return error.Corruption;
+    return @intCast(result);
 }
 
 pub fn getVarint64(input: *[]const u8) Error!u64 {
-    _ = input;
-    @panic("not implemented");
+    var result: u64 = 0;
+    var shift: u6 = 0;
+    var i: usize = 0;
+    const src = input.*;
+    while (i < src.len) {
+        const byte = src[i];
+        i += 1;
+        if (shift == 63 and byte > 1) {
+            // Would overflow 64 bits.
+            return error.Corruption;
+        }
+        result |= @as(u64, byte & 0x7f) << shift;
+        if (byte & 0x80 == 0) {
+            input.* = src[i..];
+            return result;
+        }
+        // Varint64 is at most 10 bytes (ceil(64/7)=10).
+        if (i >= 10) return error.Corruption;
+        shift += 7;
+    }
+    // Ran out of bytes without a terminating byte.
+    return error.Corruption;
 }
 
 pub fn getLengthPrefixedSlice(input: *[]const u8) Error![]const u8 {
-    _ = input;
-    @panic("not implemented");
+    const len = try getVarint32(input);
+    if (len > input.len) return error.Corruption;
+    const data = input.*[0..len];
+    input.* = input.*[len..];
+    return data;
 }
 
 // ---------------------------------------------------------------------------
-// Utility (to be implemented)
+// Utility
 // ---------------------------------------------------------------------------
 
 pub fn varintLength(v: u64) usize {
-    _ = v;
-    @panic("not implemented");
+    var val = v;
+    var len: usize = 1;
+    while (val >= 0x80) {
+        val >>= 7;
+        len += 1;
+    }
+    return len;
 }
 
 // ---------------------------------------------------------------------------
@@ -199,7 +224,7 @@ test "varint32 round-trip sweep" {
         var slice: []const u8 = list.items;
         const decoded = try getVarint32(&slice);
         try std.testing.expectEqual(v, decoded);
-        try std.testing.expectEqual(@as(usize, 0), slice.len);
+        try std.testing.expectEqual(@as(usize, 0), slice.len); // fully consumed
     }
 }
 
