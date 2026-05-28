@@ -4,11 +4,11 @@ zig_binary: /home/ghpu/zig/zig
 stdlib: /home/ghpu/zig/lib/std
 target_rocksdb: "9.x line; block-based table format_version 5; legacy WAL/MANIFEST log (see docs/adr/000-target-format.md)"
 active_phase: P2
-active_milestone: "M2.0 InternalKey, M2.2 WAL, M2.3 Skiplist (parallel wave 1)"
-last_completed: M1.0 Env (Phase 1 COMPLETE)
-worktrees: "m2.0-internal-key, m2.2-wal, m2.3-skiplist (see `git worktree list`)"
+active_milestone: "M2.1 WriteBatch, M2.4 MemTable (parallel wave 2)"
+last_completed: M2.0 InternalKey, M2.2 WAL, M2.3 Skiplist (Phase 2 wave 1)
+worktrees: "m2.1-write-batch, m2.4-memtable (see `git worktree list`)"
 test_command: "/home/ghpu/zig/zig build test"
-test_count: 100
+test_count: 140
 updated: 2026-05-28
 ---
 
@@ -32,11 +32,11 @@ RocksDB reference: https://github.com/facebook/rocksdb/wiki
 - [x] M1.0 Env over std.Io (+ MemEnv)  (merged; src/env/{env,real_env,mem_env}.zig)
 
 ### Phase 2 — Write durability core
-- [ ] M2.0 InternalKey
-- [ ] M2.1 WriteBatch
-- [ ] M2.2 WAL (log writer + reader)
-- [ ] M2.3 Skiplist
-- [ ] M2.4 MemTable
+- [x] M2.0 InternalKey                (src/format/internal_key.zig)
+- [~] M2.1 WriteBatch  <-- ACTIVE (wave 2)
+- [x] M2.2 WAL (log writer + reader)  (src/format/log_{format,writer,reader}.zig)
+- [x] M2.3 Skiplist                   (src/memtable/skiplist.zig)
+- [~] M2.4 MemTable  <-- ACTIVE (wave 2)
 
 ### Phase 3 — Block-based table (SST)
 - [ ] M3.0 Block builder/reader
@@ -71,16 +71,14 @@ RocksDB reference: https://github.com/facebook/rocksdb/wiki
 - [ ] M7.6 Transactions (optimistic + pessimistic)
 - [ ] M7.7 Checkpoints
 
-## Active: Phase 2 — Write durability core (wave 1, parallel)
-- M2.0 InternalKey (S) — depends on coding + comparator. New: src/format/internal_key.zig.
-- M2.2 WAL (O) — depends on Env + crc32c + coding. New: src/format/log_format.zig, log_writer.zig, log_reader.zig. Byte-compatible legacy log (see docs/format/wal.md).
-- M2.3 Skiplist (O) — depends on Arena + Comparator. New: src/memtable/skiplist.zig.
-- These three are independent (distinct files); run in parallel worktrees, each verifying standalone via `zig test <file>`, root.zig wired at merge.
+## Active: Phase 2 — Write durability core (wave 2, parallel)
+- M2.1 WriteBatch (S) — needs M2.0 (ValueType/InternalKey). New: src/format/write_batch.zig.
+- M2.4 MemTable (O) — needs M2.3 Skiplist + M2.0 InternalKey. New: src/memtable/memtable.zig.
+- Independent of each other (distinct files); run in parallel worktrees off the post-wave-1 main.
 
 ## Next steps (ordered)
-1. Dispatch wave 1 {M2.0, M2.2, M2.3}; integrate as each lands.
-2. Wave 2 (after M2.0 + M2.3 merged): M2.1 WriteBatch (S, needs M2.0), M2.4 MemTable (O, needs M2.3 + M2.0). Parallel with each other.
-3. Phase 2 done → Phase 3 (block-based SST table).
+1. Integrate wave 2 {M2.1, M2.4} as each lands → wire root.zig → `zig build test` → DEVSTATE → cleanup.
+2. Phase 2 complete → Phase 3 (block-based SST table): M3.0 Block, M3.1 Bloom/filter block, M3.2 Footer, M3.3 TableBuilder, M3.4 TableReader, M3.5 LRU/table cache. Earliest parallel set: M3.0 (O), M3.1 (O), M3.2 (S) are independent; M3.3 needs M3.0/M3.1/M3.2; M3.4 needs M3.3; M3.5 needs M3.4.
 
 ## Decision log (ADR pointers)
 - ADR-000: RocksDB format target pinned (format_version 5 SST, legacy WAL/MANIFEST, CRC32C mask). docs/adr/000-target-format.md
@@ -106,3 +104,10 @@ RocksDB reference: https://github.com/facebook/rocksdb/wiki
 - File positional I/O (no pread/pwrite/fsync): `writePositionalAll(file, io, bytes, offset)`; `readPositionalAll(file, io, buf, offset) -> usize` (short/0 read = EOF); `sync(file, io)` (fsync); `close(file, io)`; `stat(file, io)`. Lower-level `read/writePositional` take iovec `[]const []u8`.
 - Errors are large platform unions (OpenError ~25, RenameError ~18) — map down via small switches. Env maps to `env.Error{NotFound,AlreadyExists,IoError,PermissionDenied,NotSupported} || Allocator.Error`.
 - Env interface convention: file handles are vtable structs `{ptr,vtable}` (WritableFile.append/flush/sync/close, SequentialFile.read/skip/close, RandomAccessFile.readAt/close). NOTE for WAL: RealWritable.append currently does one writePositionalAll per call with no userspace buffer (flush is a no-op) — WAL layer should buffer 32KB blocks itself.
+
+### Standalone-test rule (IMPORTANT for subagent briefs)
+- `zig test src/foo/bar.zig` roots the module at `bar.zig`'s DIRECTORY, so any `@import("../...")` is rejected (`error: import of file outside module path`). This hits every file under src/format, src/memtable, src/db, etc.
+- Files MUST keep relative PATH imports (e.g. `@import("../util/coding.zig")`) — these are what the single `src`-rooted `zrocks` module + `root.zig` wiring use. Do NOT switch to named `-M`/`@import("coding")` modules (breaks `zig build test`). [M2.0 regressed this; fixed in 5ddbc10.]
+- Canonical standalone-verify for a `../`-importing file (subagents use this for TDD; remove the temp file after):
+  `printf 'test { _ = @import("format/internal_key.zig"); }' > src/_verify.zig && /home/ghpu/zig/zig test src/_verify.zig && rm src/_verify.zig`
+- The authoritative check is always `zig build test` on main after root.zig wiring (orchestrator runs it at every integration).

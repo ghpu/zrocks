@@ -17,6 +17,13 @@ pub const options = @import("options.zig");
 // Environment / filesystem capability (Phase 1).
 pub const env = @import("env/env.zig");
 
+// Write durability core (Phase 2).
+pub const internal_key = @import("format/internal_key.zig");
+pub const log_format = @import("format/log_format.zig");
+pub const log_writer = @import("format/log_writer.zig");
+pub const log_reader = @import("format/log_reader.zig");
+pub const skiplist = @import("memtable/skiplist.zig");
+
 test "version constant" {
     try std.testing.expectEqualStrings("0.0.0", version);
 }
