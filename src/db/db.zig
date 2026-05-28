@@ -275,12 +275,19 @@ pub const DB = struct {
         try self.maybeScheduleCompaction();
     }
 
-    /// Run leveled compactions until no level wants one (or a guard trips).
-    /// Synchronous + single-threaded.  The compaction's `smallest_snapshot` is
-    /// the oldest LIVE snapshot's sequence (or the latest sequence if none is
-    /// live), so versions/tombstones still visible to a snapshot are never
-    /// dropped (M6.3 snapshot pinning).  TODO(perf): background compaction
-    /// thread.
+    /// Run compactions for the configured style until nothing wants one (or a
+    /// guard trips).  Synchronous + single-threaded.
+    ///
+    /// `smallest_snapshot` is the oldest LIVE snapshot's sequence (or the latest
+    /// sequence if none is live), so versions/tombstones still visible to a
+    /// snapshot are never dropped (M6.3 snapshot pinning).
+    ///
+    /// Style dispatch (M7.3):
+    ///   * `.level`     — the classic leveled picker/merge loop.
+    ///   * `.universal` — merge similarly-sized L0 runs (kept in L0) until none
+    ///                    qualifies (the merged run lowers the L0 count/ratio).
+    ///   * `.fifo`      — drop the oldest L0 files until under the byte budget.
+    /// TODO(perf): background compaction thread.
     fn maybeScheduleCompaction(self: *DB) !void {
         // Pin compaction to the oldest live snapshot so it cannot discard a
         // version (or a tombstone) that a snapshot read could still need.  When no
@@ -291,8 +298,8 @@ pub const DB = struct {
         const has_live_snapshot = oldest_snapshot != null;
         const smallest_snapshot = oldest_snapshot orelse self.last_sequence;
         // Guard against a pathological loop: each compaction must make progress
-        // (it reduces a level's score by moving files down), so bound the number
-        // of iterations generously by the current file count.
+        // (it reduces a level's score by moving files down / merging runs / evicting
+        // files), so bound the number of iterations generously by the file count.
         var budget: usize = 0;
         {
             const v = self.versions.currentVersion();
@@ -300,26 +307,64 @@ pub const DB = struct {
             budget = budget * 2 + 16;
         }
 
-        while (budget > 0) : (budget -= 1) {
-            var c = (try compaction.pickCompaction(
-                self.gpa,
-                self.versions,
-                self.options.comparator,
-            )) orelse break;
-            defer c.deinit(self.gpa);
+        switch (self.options.compaction_style) {
+            .level => {
+                while (budget > 0) : (budget -= 1) {
+                    var c = (try compaction.pickCompaction(
+                        self.gpa,
+                        self.versions,
+                        self.options.comparator,
+                    )) orelse break;
+                    defer c.deinit(self.gpa);
 
-            try compaction.doCompaction(
-                self.gpa,
-                self.env,
-                self.name,
-                self.options,
-                self.ikcmp.comparatorInterface(),
-                self.options.comparator,
-                self.versions,
-                &c,
-                smallest_snapshot,
-                has_live_snapshot,
-            );
+                    try compaction.doCompaction(
+                        self.gpa,
+                        self.env,
+                        self.name,
+                        self.options,
+                        self.ikcmp.comparatorInterface(),
+                        self.options.comparator,
+                        self.versions,
+                        &c,
+                        smallest_snapshot,
+                        has_live_snapshot,
+                    );
+                }
+            },
+            .universal => {
+                while (budget > 0) : (budget -= 1) {
+                    var c = (try compaction.pickUniversalCompaction(
+                        self.gpa,
+                        self.versions,
+                        self.options,
+                        self.options.comparator,
+                    )) orelse break;
+                    defer c.deinit(self.gpa);
+
+                    try compaction.doCompaction(
+                        self.gpa,
+                        self.env,
+                        self.name,
+                        self.options,
+                        self.ikcmp.comparatorInterface(),
+                        self.options.comparator,
+                        self.versions,
+                        &c,
+                        smallest_snapshot,
+                        has_live_snapshot,
+                    );
+                }
+            },
+            .fifo => {
+                while (budget > 0) : (budget -= 1) {
+                    const evicted = try compaction.runFifoEviction(
+                        self.gpa,
+                        self.versions,
+                        self.options.fifo_max_table_files_size,
+                    );
+                    if (!evicted) break;
+                }
+            },
         }
     }
 
