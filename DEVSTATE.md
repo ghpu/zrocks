@@ -4,11 +4,11 @@ zig_binary: /home/ghpu/zig/zig
 stdlib: /home/ghpu/zig/lib/std
 target_rocksdb: "9.x line; block-based table format_version 5; legacy WAL/MANIFEST log (see docs/adr/000-target-format.md)"
 active_phase: P7
-active_milestone: "M7.1 MergeOperator (Phase 7 remaining run SEQUENTIALLY — db.zig/compaction.zig contended)"
-last_completed: M7.2 Prefix bloom & prefix seek (src/rocks/prefix.zig)
-worktrees: "m7.1-merge"
+active_milestone: "M7.4 CompactionFilter (sequential)"
+last_completed: M7.1 MergeOperator (src/rocks/merge_operator.zig)
+worktrees: "m7.4-compaction-filter"
 test_command: "/home/ghpu/zig/zig build test"
-test_count: 309
+test_count: 327
 artifacts: "zig build -> zig-out/lib/libzrocks.a + zig-out/bin/zrocks (CLI). CLI verified end-to-end (put/get/scan/bench, durable across processes)."
 updated: 2026-05-28
 ---
@@ -65,10 +65,10 @@ RocksDB reference: https://github.com/facebook/rocksdb/wiki
 
 ### Phase 7 — RocksDB extensions (each independent on the core)
 - [ ] M7.0 Column Families
-- [~] M7.1 MergeOperator  <-- ACTIVE
+- [x] M7.1 MergeOperator                (src/rocks/merge_operator.zig)
 - [x] M7.2 Prefix bloom & prefix seek  (src/rocks/prefix.zig)
 - [ ] M7.3 Universal + FIFO compaction
-- [ ] M7.4 CompactionFilter
+- [~] M7.4 CompactionFilter  <-- ACTIVE
 - [ ] M7.5 DeleteRange (range tombstones)
 - [ ] M7.6 Transactions (optimistic + pessimistic)
 - [x] M7.7 Checkpoints                (src/rocks/checkpoint.zig)
