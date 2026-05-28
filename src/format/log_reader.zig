@@ -20,25 +20,160 @@ const crc32c = @import("../util/crc32c.zig");
 
 pub const Error = error{Corruption} || env.Error;
 
+const kBlockSize = format.kBlockSize;
+const kHeaderSize = format.kHeaderSize;
+
+/// Outcome of parsing one physical record from the current block buffer.
+const Fragment = union(enum) {
+    /// A well-formed fragment with a verified checksum.
+    ok: struct { record_type: format.RecordType, payload: []const u8 },
+    /// The current block has no more parseable records (trailer/short tail);
+    /// the caller should load the next block.
+    end_of_block,
+    /// Clean end of stream — no more data and nothing partial to report.
+    eof,
+};
+
 pub const Reader = struct {
     file: env.SequentialFile,
+    /// Backing store for the current physical block.
+    buf: [kBlockSize]u8 = undefined,
+    /// Number of valid bytes currently in `buf`.
+    buf_len: usize = 0,
+    /// Read cursor within `buf`.
+    pos: usize = 0,
+    /// True once a short (sub-block) read has been observed: the file has no
+    /// further blocks, so a fragment that runs past `buf_len` is a truncated
+    /// tail (clean EOF) rather than corruption.
+    eof_seen: bool = false,
 
     pub fn init(file: env.SequentialFile) Reader {
         return .{ .file = file };
     }
 
-    /// Read the next logical record. Returns the record bytes (owned by
-    /// `scratch` when reassembled from fragments, or a slice into the internal
-    /// block buffer for a `full` fragment) or `null` at clean end-of-stream.
+    /// Read the next logical record. For a `full` fragment the returned slice
+    /// points into the internal block buffer and is valid until the next
+    /// `readRecord` call; for a reassembled record the slice points into
+    /// `scratch`. Returns `null` at clean end-of-stream.
     pub fn readRecord(
         self: *Reader,
         gpa: std.mem.Allocator,
         scratch: *std.ArrayList(u8),
     ) Error!?[]const u8 {
-        _ = self;
-        _ = gpa;
-        _ = scratch;
-        return error.Corruption;
+        scratch.clearRetainingCapacity();
+        // `in_fragmented` tracks whether we are mid-way through a
+        // first/middle/last chain so we can detect out-of-order fragments.
+        var in_fragmented = false;
+
+        while (true) {
+            switch (try self.readPhysicalRecord()) {
+                .eof => {
+                    // Clean EOF. If we were mid-chain, the tail was truncated:
+                    // still a clean EOF under the default LevelDB policy.
+                    return null;
+                },
+                .end_of_block => {
+                    if (!try self.loadBlock()) return null;
+                },
+                .ok => |frag| switch (frag.record_type) {
+                    .full => {
+                        if (in_fragmented) return error.Corruption;
+                        return frag.payload;
+                    },
+                    .first => {
+                        if (in_fragmented) return error.Corruption;
+                        in_fragmented = true;
+                        try scratch.appendSlice(gpa, frag.payload);
+                    },
+                    .middle => {
+                        if (!in_fragmented) return error.Corruption;
+                        try scratch.appendSlice(gpa, frag.payload);
+                    },
+                    .last => {
+                        if (!in_fragmented) return error.Corruption;
+                        try scratch.appendSlice(gpa, frag.payload);
+                        return scratch.items;
+                    },
+                    .zero => return error.Corruption,
+                },
+            }
+        }
+    }
+
+    /// Fill `buf` with the next physical block (up to `kBlockSize` bytes).
+    /// Returns `false` if no bytes were available (clean EOF). A short read
+    /// marks `eof_seen` so the parser treats a later run-past-end as a
+    /// truncated tail rather than corruption.
+    fn loadBlock(self: *Reader) Error!bool {
+        self.pos = 0;
+        self.buf_len = 0;
+        // `SequentialFile.read` may return short; loop until the block is full
+        // or the file ends.
+        while (self.buf_len < kBlockSize) {
+            const n = try self.file.read(self.buf[self.buf_len..]);
+            if (n == 0) {
+                self.eof_seen = true;
+                break;
+            }
+            self.buf_len += n;
+        }
+        return self.buf_len > 0;
+    }
+
+    /// Parse one physical record at `pos` within the current block buffer.
+    fn readPhysicalRecord(self: *Reader) Error!Fragment {
+        // Lazily load the first block.
+        if (self.buf_len == 0 and self.pos == 0 and !self.eof_seen) {
+            if (!try self.loadBlock()) return .eof;
+        }
+
+        const remaining = self.buf_len - self.pos;
+        if (remaining < kHeaderSize) {
+            // Trailer zero-padding (or a short tail that can't hold a header).
+            if (self.eof_seen) {
+                // No further blocks. Any leftover < header is a clean tail.
+                return .eof;
+            }
+            // More blocks follow: skip this block's trailer.
+            return .end_of_block;
+        }
+
+        const header = self.buf[self.pos .. self.pos + kHeaderSize];
+        const stored_crc = std.mem.readInt(u32, header[0..4], .little);
+        const length: usize = std.mem.readInt(u16, header[4..6], .little);
+        const type_byte = header[6];
+
+        // A zero type with zero length at end-of-data is the canonical trailer
+        // marker; treat as end-of-block padding.
+        if (type_byte == @intFromEnum(format.RecordType.zero) and length == 0) {
+            if (self.eof_seen) return .eof;
+            return .end_of_block;
+        }
+
+        if (kHeaderSize + length > remaining) {
+            // The record claims more bytes than the block holds.
+            if (self.eof_seen) {
+                // Physical end of file in the middle of a record -> truncated
+                // tail -> clean EOF (default LevelDB behavior).
+                return .eof;
+            }
+            // A well-formed writer never lets a record's length exceed the
+            // block, so this is real corruption.
+            return error.Corruption;
+        }
+
+        if (type_byte > format.kMaxRecordType) return error.Corruption;
+        const record_type: format.RecordType = @enumFromInt(type_byte);
+
+        const payload = self.buf[self.pos + kHeaderSize .. self.pos + kHeaderSize + length];
+
+        // Verify checksum: unmask, recompute over [type] ++ payload, compare.
+        const want = crc32c.unmask(stored_crc);
+        const got = crc32c.extend(crc32c.value(&[_]u8{type_byte}), payload);
+        if (want != got) return error.Corruption;
+
+        self.pos += kHeaderSize + length;
+        return .{ .ok = .{ .record_type = record_type, .payload = payload } };
     }
 };
 
