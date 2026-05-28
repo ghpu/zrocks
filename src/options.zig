@@ -35,6 +35,12 @@ pub const Options = struct {
     level0_file_num_compaction_trigger: u32 = 4,
     level0_slowdown_writes_trigger: u32 = 20,
     level0_stop_writes_trigger: u32 = 36,
+    /// Byte budget for level 1 (the first leveled level); each deeper level's
+    /// budget is this times 10^(n-1).  Drives the size-based compaction score.
+    max_bytes_for_level_base: u64 = 10 * 1024 * 1024,
+    /// Target size of a single compaction-output SSTable; the compaction rolls
+    /// over to a fresh output file once the current one reaches this size.
+    target_file_size_base: u64 = 2 * 1024 * 1024,
 };
 
 // ---------------------------------------------------------------------------

@@ -51,6 +51,7 @@ const db_iter = @import("db_iter.zig");
 const snapshot_mod = @import("snapshot.zig");
 const recovery = @import("recovery.zig");
 const flush = @import("flush.zig");
+const compaction = @import("compaction.zig");
 
 const Options = options_mod.Options;
 const ReadOptions = options_mod.ReadOptions;
@@ -245,6 +246,47 @@ pub const DB = struct {
         // If the active memtable is now over budget, rotate it into an immutable
         // memtable + a fresh WAL and flush it to an L0 SST.
         try self.maybeFlush();
+
+        // A flush may have pushed a level over its compaction threshold; run any
+        // pending leveled compactions before returning.
+        try self.maybeScheduleCompaction();
+    }
+
+    /// Run leveled compactions until no level wants one (or a guard trips).
+    /// Synchronous + single-threaded for M6.2; uses the DB's latest sequence as
+    /// `smallest_snapshot` (no live-snapshot pinning yet — M6.3 wires the real
+    /// oldest snapshot).  TODO(perf): background compaction thread.
+    fn maybeScheduleCompaction(self: *DB) !void {
+        // Guard against a pathological loop: each compaction must make progress
+        // (it reduces a level's score by moving files down), so bound the number
+        // of iterations generously by the current file count.
+        var budget: usize = 0;
+        {
+            const v = self.versions.currentVersion();
+            for (&v.files) |level| budget += level.items.len;
+            budget = budget * 2 + 16;
+        }
+
+        while (budget > 0) : (budget -= 1) {
+            var c = (try compaction.pickCompaction(
+                self.gpa,
+                self.versions,
+                self.options.comparator,
+            )) orelse break;
+            defer c.deinit(self.gpa);
+
+            try compaction.doCompaction(
+                self.gpa,
+                self.env,
+                self.name,
+                self.options,
+                self.ikcmp.comparatorInterface(),
+                self.options.comparator,
+                self.versions,
+                &c,
+                self.last_sequence,
+            );
+        }
     }
 
     /// If the live memtable has exceeded `write_buffer_size`, rotate it out and
