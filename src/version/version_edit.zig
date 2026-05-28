@@ -62,59 +62,72 @@ pub const FileMetaData = struct {
 };
 
 // ---------------------------------------------------------------------------
-// VersionEdit — STUB (RED phase)
+// VersionEdit
 // ---------------------------------------------------------------------------
 
 pub const VersionEdit = struct {
-    comparator_name: ?[]const u8 = null,
+    // Optional scalar fields — only emitted when non-null.
+    comparator_name: ?[]const u8 = null, // owned (duped)
     log_number: ?u64 = null,
     prev_log_number: ?u64 = null,
     next_file_number: ?u64 = null,
     last_sequence: ?u64 = null,
+
+    // File mutation lists.
     deleted_files: std.ArrayListUnmanaged(DeletedFile) = .empty,
     new_files: std.ArrayListUnmanaged(NewFileEntry) = .empty,
 
+    // TODO(m5.1): compact_pointers (kCompactPointer tag=5) skipped for now.
+
     pub const DeletedFile = struct { level: u32, number: u64 };
     pub const NewFileEntry = struct { level: u32, meta: FileMetaData };
+
+    // -----------------------------------------------------------------------
+    // Lifecycle
+    // -----------------------------------------------------------------------
 
     pub fn init() VersionEdit {
         return .{};
     }
 
+    /// Free all owned memory.  Must be called exactly once.
     pub fn deinit(self: *VersionEdit, gpa: std.mem.Allocator) void {
-        _ = self;
-        _ = gpa;
-        // TODO: implement
+        if (self.comparator_name) |s| gpa.free(s);
+        for (self.new_files.items) |entry| {
+            gpa.free(entry.meta.smallest);
+            gpa.free(entry.meta.largest);
+        }
+        self.deleted_files.deinit(gpa);
+        self.new_files.deinit(gpa);
     }
 
+    // -----------------------------------------------------------------------
+    // Setters
+    // -----------------------------------------------------------------------
+
     pub fn setComparatorName(self: *VersionEdit, gpa: std.mem.Allocator, name: []const u8) !void {
-        _ = self;
-        _ = gpa;
-        _ = name;
-        // TODO: implement
+        if (self.comparator_name) |old| gpa.free(old);
+        self.comparator_name = try gpa.dupe(u8, name);
     }
 
     pub fn setLogNumber(self: *VersionEdit, v: u64) void {
-        _ = self;
-        _ = v;
-        // TODO: implement
+        self.log_number = v;
     }
 
     pub fn setPrevLogNumber(self: *VersionEdit, v: u64) void {
-        _ = self;
-        _ = v;
+        self.prev_log_number = v;
     }
 
     pub fn setNextFileNumber(self: *VersionEdit, v: u64) void {
-        _ = self;
-        _ = v;
+        self.next_file_number = v;
     }
 
     pub fn setLastSequence(self: *VersionEdit, v: u64) void {
-        _ = self;
-        _ = v;
+        self.last_sequence = v;
     }
 
+    /// Add a new SSTable file.  `smallest` and `largest` are duped into
+    /// edit-owned memory; the caller may release their copies afterwards.
     pub fn addFile(
         self: *VersionEdit,
         gpa: std.mem.Allocator,
@@ -124,45 +137,151 @@ pub const VersionEdit = struct {
         smallest: []const u8,
         largest: []const u8,
     ) !void {
-        _ = self;
-        _ = gpa;
-        _ = level;
-        _ = number;
-        _ = file_size;
-        _ = smallest;
-        _ = largest;
-        // TODO: implement
+        const s = try gpa.dupe(u8, smallest);
+        errdefer gpa.free(s);
+        const l = try gpa.dupe(u8, largest);
+        errdefer gpa.free(l);
+        try self.new_files.append(gpa, .{
+            .level = level,
+            .meta = .{
+                .number = number,
+                .file_size = file_size,
+                .smallest = s,
+                .largest = l,
+            },
+        });
     }
 
+    /// Mark a file as deleted.
     pub fn removeFile(
         self: *VersionEdit,
         gpa: std.mem.Allocator,
         level: u32,
         number: u64,
     ) !void {
-        _ = self;
-        _ = gpa;
-        _ = level;
-        _ = number;
-        // TODO: implement
+        try self.deleted_files.append(gpa, .{ .level = level, .number = number });
     }
 
+    // -----------------------------------------------------------------------
+    // Encoding
+    // -----------------------------------------------------------------------
+
+    /// Append the binary representation of this VersionEdit to `buf`.
+    /// Only non-null optional scalars are emitted.
     pub fn encodeTo(
         self: *const VersionEdit,
         buf: *std.ArrayListUnmanaged(u8),
         gpa: std.mem.Allocator,
     ) !void {
-        _ = self;
-        _ = buf;
-        _ = gpa;
-        // TODO: implement
+        // kComparator
+        if (self.comparator_name) |name| {
+            try coding.putVarint32(buf, gpa, Tag.kComparator);
+            try coding.putLengthPrefixedSlice(buf, gpa, name);
+        }
+        // kLogNumber
+        if (self.log_number) |v| {
+            try coding.putVarint32(buf, gpa, Tag.kLogNumber);
+            try coding.putVarint64(buf, gpa, v);
+        }
+        // kPrevLogNumber
+        if (self.prev_log_number) |v| {
+            try coding.putVarint32(buf, gpa, Tag.kPrevLogNumber);
+            try coding.putVarint64(buf, gpa, v);
+        }
+        // kNextFileNumber
+        if (self.next_file_number) |v| {
+            try coding.putVarint32(buf, gpa, Tag.kNextFileNumber);
+            try coding.putVarint64(buf, gpa, v);
+        }
+        // kLastSequence
+        if (self.last_sequence) |v| {
+            try coding.putVarint32(buf, gpa, Tag.kLastSequence);
+            try coding.putVarint64(buf, gpa, v);
+        }
+        // kDeletedFile entries
+        for (self.deleted_files.items) |df| {
+            try coding.putVarint32(buf, gpa, Tag.kDeletedFile);
+            try coding.putVarint32(buf, gpa, df.level);
+            try coding.putVarint64(buf, gpa, df.number);
+        }
+        // kNewFile entries
+        for (self.new_files.items) |nf| {
+            try coding.putVarint32(buf, gpa, Tag.kNewFile);
+            try coding.putVarint32(buf, gpa, nf.level);
+            try coding.putVarint64(buf, gpa, nf.meta.number);
+            try coding.putVarint64(buf, gpa, nf.meta.file_size);
+            try coding.putLengthPrefixedSlice(buf, gpa, nf.meta.smallest);
+            try coding.putLengthPrefixedSlice(buf, gpa, nf.meta.largest);
+        }
     }
 
+    // -----------------------------------------------------------------------
+    // Decoding
+    // -----------------------------------------------------------------------
+
+    /// Parse a VersionEdit from `data`.  All variable-length byte slices
+    /// (comparator_name, smallest, largest) are duped into edit-owned memory.
+    /// Returns error.Corruption on truncation or unknown tag.
     pub fn decodeFrom(gpa: std.mem.Allocator, data: []const u8) Error!VersionEdit {
-        _ = gpa;
-        _ = data;
-        // TODO: implement
-        return error.Corruption;
+        var edit = VersionEdit.init();
+        errdefer edit.deinit(gpa);
+
+        var input: []const u8 = data;
+        while (input.len > 0) {
+            const tag = try coding.getVarint32(&input);
+            switch (tag) {
+                Tag.kComparator => {
+                    const raw = try coding.getLengthPrefixedSlice(&input);
+                    if (edit.comparator_name) |old| gpa.free(old);
+                    edit.comparator_name = try gpa.dupe(u8, raw);
+                },
+                Tag.kLogNumber => {
+                    edit.log_number = try coding.getVarint64(&input);
+                },
+                Tag.kPrevLogNumber => {
+                    edit.prev_log_number = try coding.getVarint64(&input);
+                },
+                Tag.kNextFileNumber => {
+                    edit.next_file_number = try coding.getVarint64(&input);
+                },
+                Tag.kLastSequence => {
+                    edit.last_sequence = try coding.getVarint64(&input);
+                },
+                Tag.kCompactPointer => {
+                    // TODO(m5.1): store compact pointers when needed.
+                    // For now consume the fields so we don't error on them.
+                    _ = try coding.getVarint32(&input); // level
+                    _ = try coding.getLengthPrefixedSlice(&input); // internal key
+                },
+                Tag.kDeletedFile => {
+                    const level = try coding.getVarint32(&input);
+                    const number = try coding.getVarint64(&input);
+                    try edit.deleted_files.append(gpa, .{ .level = level, .number = number });
+                },
+                Tag.kNewFile => {
+                    const level = try coding.getVarint32(&input);
+                    const number = try coding.getVarint64(&input);
+                    const file_size = try coding.getVarint64(&input);
+                    const smallest_raw = try coding.getLengthPrefixedSlice(&input);
+                    const largest_raw = try coding.getLengthPrefixedSlice(&input);
+                    const smallest = try gpa.dupe(u8, smallest_raw);
+                    errdefer gpa.free(smallest);
+                    const largest = try gpa.dupe(u8, largest_raw);
+                    errdefer gpa.free(largest);
+                    try edit.new_files.append(gpa, .{
+                        .level = level,
+                        .meta = .{
+                            .number = number,
+                            .file_size = file_size,
+                            .smallest = smallest,
+                            .largest = largest,
+                        },
+                    });
+                },
+                else => return error.Corruption,
+            }
+        }
+        return edit;
     }
 };
 
@@ -220,6 +339,7 @@ test "empty edit encodes to empty and decodes to empty" {
 test "full round-trip" {
     const gpa = std.testing.allocator;
 
+    // Internal keys: user key + 8-byte sequence-number/type trailer.
     const smallest = "a" ++ [_]u8{0} ** 8;
     const largest = "z" ++ [_]u8{0} ** 8;
 
@@ -241,12 +361,14 @@ test "full round-trip" {
     var edit2 = try VersionEdit.decodeFrom(gpa, buf.items);
     defer edit2.deinit(gpa);
 
+    // Scalars
     try std.testing.expectEqualStrings("leveldb.BytewiseComparator", edit2.comparator_name.?);
     try std.testing.expectEqual(@as(u64, 5), edit2.log_number.?);
     try std.testing.expectEqual(@as(u64, 4), edit2.prev_log_number.?);
     try std.testing.expectEqual(@as(u64, 10), edit2.next_file_number.?);
     try std.testing.expectEqual(@as(u64, 100), edit2.last_sequence.?);
 
+    // New file
     try std.testing.expectEqual(@as(usize, 1), edit2.new_files.items.len);
     const nf = edit2.new_files.items[0];
     try std.testing.expectEqual(@as(u32, 1), nf.level);
@@ -255,6 +377,7 @@ test "full round-trip" {
     try std.testing.expectEqualSlices(u8, smallest, nf.meta.smallest);
     try std.testing.expectEqualSlices(u8, largest, nf.meta.largest);
 
+    // Deleted file
     try std.testing.expectEqual(@as(usize, 1), edit2.deleted_files.items.len);
     const df = edit2.deleted_files.items[0];
     try std.testing.expectEqual(@as(u32, 0), df.level);
@@ -296,22 +419,25 @@ test "multiple new and deleted files preserved in order" {
 
 test "corruption: truncated varint payload" {
     const gpa = std.testing.allocator;
+    // Tag 2 (kLogNumber) present but no varint64 following it.
     const data = [_]u8{0x02};
     try std.testing.expectError(error.Corruption, VersionEdit.decodeFrom(gpa, &data));
 }
 
 test "corruption: truncated length-prefixed string" {
     const gpa = std.testing.allocator;
+    // Tag 1 (kComparator) + length prefix 10 + only 3 bytes of payload.
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(gpa);
     try coding.putVarint32(&buf, gpa, Tag.kComparator);
-    try coding.putVarint32(&buf, gpa, 10);
-    try buf.appendSlice(gpa, "abc");
+    try coding.putVarint32(&buf, gpa, 10); // claims 10 bytes
+    try buf.appendSlice(gpa, "abc"); // only 3 bytes
     try std.testing.expectError(error.Corruption, VersionEdit.decodeFrom(gpa, buf.items));
 }
 
 test "corruption: unknown tag" {
     const gpa = std.testing.allocator;
+    // Tag 42 is not defined.
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(gpa);
     try coding.putVarint32(&buf, gpa, 42);
