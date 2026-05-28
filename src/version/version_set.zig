@@ -139,14 +139,45 @@ pub const Version = struct {
         user_key: []const u8,
         sequence: u64,
     ) !?GetResult {
-        // RED: LSM point lookup across levels not implemented yet.
-        _ = self;
-        _ = gpa;
-        _ = tc;
-        _ = user_cmp;
-        _ = user_key;
-        _ = sequence;
-        return error.NotImplemented;
+        // internal lookup key = user_key ++ fixed64(packSequenceAndType(seq, seek))
+        var lookup: std.ArrayListUnmanaged(u8) = .empty;
+        defer lookup.deinit(gpa);
+        try lookup.appendSlice(gpa, user_key);
+        const trailer = internal_key.packSequenceAndType(sequence, internal_key.kValueTypeForSeek);
+        var tbuf: [8]u8 = undefined;
+        coding.encodeFixed64(&tbuf, trailer);
+        try lookup.appendSlice(gpa, &tbuf);
+        const lookup_ikey = lookup.items;
+
+        // -- Level 0: overlapping; probe covering files newest-first ---------
+        // L0 is stored in insertion order (oldest first, newest last; see
+        // applyEdit), and file numbers increase with write recency, so iterating
+        // in reverse visits the newest files first.  The first covering hit is
+        // the newest version visible at the snapshot, so it wins.
+        {
+            const l0 = self.files[0].items;
+            var i = l0.len;
+            while (i > 0) {
+                i -= 1;
+                const f = l0[i];
+                if (!fileCovers(user_cmp, f, user_key)) continue;
+                if (try probeFile(gpa, tc, user_cmp, f, user_key, lookup_ikey)) |r| return r;
+            }
+        }
+
+        // -- Levels 1..N-1: sorted, non-overlapping; one covering file -------
+        var level: usize = 1;
+        while (level < kNumLevels) : (level += 1) {
+            const files = self.files[level].items;
+            for (files) |f| {
+                if (!fileCovers(user_cmp, f, user_key)) continue;
+                if (try probeFile(gpa, tc, user_cmp, f, user_key, lookup_ikey)) |r| return r;
+                // A non-overlapping level has at most one covering file; if it
+                // did not hold the key, no other file at this level can.
+                break;
+            }
+        }
+        return null;
     }
 
     /// Append one generic table iterator per file in this Version (all levels)
@@ -159,12 +190,14 @@ pub const Version = struct {
         tc: *TableCache,
         list: *std.ArrayListUnmanaged(iterator.Iterator),
     ) !void {
-        // RED: per-file table iterators not implemented yet.
-        _ = self;
-        _ = gpa;
-        _ = tc;
-        _ = list;
-        return error.NotImplemented;
+        var level: usize = 0;
+        while (level < kNumLevels) : (level += 1) {
+            for (self.files[level].items) |f| {
+                const it = try tc.newIterator(gpa, f.number, f.file_size);
+                errdefer it.deinit();
+                try list.append(gpa, it);
+            }
+        }
     }
 };
 

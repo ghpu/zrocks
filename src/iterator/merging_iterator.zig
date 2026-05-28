@@ -55,7 +55,7 @@ pub const MergingIterator = struct {
     /// the owned children buffer.  A child whose source registered no `deinit`
     /// is left untouched (the VectorIterator case in tests).
     pub fn deinit(self: *MergingIterator) void {
-        // RED: does not yet propagate deinit to children.
+        for (self.children) |child| child.deinit();
         self.gpa.free(self.children);
         self.* = undefined;
     }

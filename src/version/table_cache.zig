@@ -98,11 +98,38 @@ pub const TableCache = struct {
     /// use.  The returned pointer is owned by the cache and stays valid until
     /// `deinit`.
     pub fn findTable(self: *TableCache, file_number: u64, file_size: u64) !*Table {
-        // RED: not implemented yet (open + cache the SST reader).
-        _ = self;
-        _ = file_number;
-        _ = file_size;
-        return error.NotImplemented;
+        if (self.tables.get(file_number)) |entry| return &entry.table;
+
+        const path = try filename.tableFileName(self.gpa, self.dbname, file_number);
+        defer self.gpa.free(path);
+
+        const file = try self.env.newRandomAccessFile(self.gpa, path);
+        errdefer file.close() catch {};
+
+        const entry = try self.gpa.create(Entry);
+        errdefer self.gpa.destroy(entry);
+
+        // Open with the InternalKeyComparator (SSTs store internal keys).  The
+        // comparator's ctx points at `&self.ikcmp`, which is stable because the
+        // TableCache is pinned for its lifetime.
+        var table_opts = self.options;
+        table_opts.comparator = self.ikcmp.comparatorInterface();
+
+        entry.file = file;
+        entry.table = try Table.open(
+            self.gpa,
+            file,
+            file_size,
+            table_opts,
+            self.policy,
+            self.block_cache,
+            file_number, // cache_id — distinct per table
+        );
+        errdefer entry.table.deinit();
+
+        try self.tables.put(self.gpa, file_number, entry);
+        // TODO: bound by options.max_open_files (LRU eviction).
+        return &entry.table;
     }
 
     /// Point lookup against the SST `file_number` by EXACT user-or-internal key

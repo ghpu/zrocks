@@ -55,7 +55,10 @@ pub const TwoLevelIterator = struct {
     /// Tear down any currently-open second-level iterator and the index
     /// iterator.  After this the TwoLevelIterator must not be used again.
     pub fn deinit(self: *TwoLevelIterator) void {
-        // RED: does not yet release the open second-level iterator.
+        if (self.data_iter) |di| {
+            di.deinit();
+            self.data_iter = null;
+        }
         self.index_iter.deinit();
         self.* = undefined;
     }
@@ -106,8 +109,10 @@ pub const TwoLevelIterator = struct {
     /// reference.  Centralizes the deinit so no code path drops an open
     /// second-level iterator without freeing it.
     fn releaseData(self: *TwoLevelIterator) void {
-        // RED: does not yet deinit the second-level iterator before dropping it.
-        self.data_iter = null;
+        if (self.data_iter) |di| {
+            di.deinit();
+            self.data_iter = null;
+        }
     }
 
     /// When forward and the current data iterator is exhausted (or none is
