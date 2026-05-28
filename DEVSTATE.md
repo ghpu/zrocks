@@ -4,11 +4,11 @@ zig_binary: /home/ghpu/zig/zig
 stdlib: /home/ghpu/zig/lib/std
 target_rocksdb: "9.x line; block-based table format_version 5; legacy WAL/MANIFEST log (see docs/adr/000-target-format.md)"
 active_phase: P6
-active_milestone: "M6.0 SST read path (table_cache + Iterator.deinit + Version reads)"
-last_completed: M5.2 Recovery (Phase 5 COMPLETE — durable KV store)
-worktrees: "m6.0-sst-read"
+active_milestone: "M6.1 Flush (memtable → L0 SST)"
+last_completed: M6.0 SST read path
+worktrees: "m6.1-flush"
 test_command: "/home/ghpu/zig/zig build test"
-test_count: 264
+test_count: 276
 updated: 2026-05-28
 ---
 
@@ -56,8 +56,8 @@ RocksDB reference: https://github.com/facebook/rocksdb/wiki
 - [x] M5.2 Recovery  (src/db/recovery.zig + db.zig durable open; Env.newAppendableFile)
 
 ### Phase 6 — Compaction → full embedded KV store
-- [~] M6.0 SST read path (table_cache + Iterator.deinit + Version.get/iters; DB reads memtable+SSTs)  <-- ACTIVE
-- [ ] M6.1 Flush (immutable memtable → L0 SST + VersionEdit + log switch + write_buffer trigger)
+- [x] M6.0 SST read path (src/version/table_cache.zig + Iterator.deinit + Version.get/iters; DB reads memtable+SSTs)
+- [~] M6.1 Flush (immutable memtable → L0 SST + VersionEdit + log switch + write_buffer trigger)  <-- ACTIVE
 - [ ] M6.2 Leveled compaction (picker + job + tombstone drop below oldest snapshot)
 - [ ] M6.3 Snapshots (full SnapshotList; compaction respects oldest)
 - [ ] GATE: LevelDB-equivalent core complete (+ CLI in main.zig, randomized integration test)
@@ -91,7 +91,9 @@ Foundation · Env capability over std.Io (+MemEnv, append) · WAL (byte-compat) 
 
 ## Decision log (ADR pointers)
 - ADR-000: RocksDB format target pinned (format_version 5 SST, legacy WAL/MANIFEST, CRC32C mask). docs/adr/000-target-format.md
-- KNOWN GAP (from M4.0): the generic `iterator.Iterator` vtable has NO deinit/close. Memtable iters are arena-backed (no per-iter alloc) so the in-memory DB is fine, but table/SST iterators allocate block buffers — before merging SSTs into reads/compaction (Phase 5/6), add an optional `deinit: ?*const fn(ctx) void` to the Iterator vtable and have Merging/TwoLevel call it on children. TwoLevelIterator already documents that 2nd-level sources must own cleanup.
+- BLOCK COMPARATOR (from M6.0, fix in M6.1): `BlockBuilder.add` (src/format/block.zig:89-91) asserts BYTEWISE non-decreasing order. Internal-key SSTs are ordered by InternalKeyComparator (user asc, seq DESC) which is NOT bytewise — so flushing multi-version keys trips it. M6.1 must parameterize BlockBuilder/TableBuilder with the comparator (use IKC for internal-key SSTs) so the data-block order assertion + in-block binary search use IKC. SSTs must be BUILT and OPENED with the InternalKeyComparator (table_cache already opens with IKC). M6.0 sidestepped this by using one internal key per user key per SST.
+- RESOLVED (was M4.0 gap): the `iterator.Iterator` vtable now has optional `deinit` (M6.0); Merging/TwoLevel propagate it.
+- (historical) KNOWN GAP (from M4.0): the generic `iterator.Iterator` vtable has NO deinit/close. Memtable iters are arena-backed (no per-iter alloc) so the in-memory DB is fine, but table/SST iterators allocate block buffers — before merging SSTs into reads/compaction (Phase 5/6), add an optional `deinit: ?*const fn(ctx) void` to the Iterator vtable and have Merging/TwoLevel call it on children. TwoLevelIterator already documents that 2nd-level sources must own cleanup.
 - Interface convention (from M0.3): runtime vtable = `struct { ctx: *const anyopaque, vtable: *const VTable }` with thin method wrappers calling `self.vtable.fn(self.ctx, ...)`. Reuse this for all runtime-swappable capabilities (comparator, filter policy, env files, iterators). See src/util/comparator.zig.
 - Parallel-batch workflow validated: independent foundation milestones built in 5 concurrent worktrees, each adding only its own file (verified standalone via `zig test <file>`), root.zig wiring done once at integration. Branches merged without conflict.
 
