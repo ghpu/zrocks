@@ -51,6 +51,7 @@ pub const snapshot = @import("db/snapshot.zig");
 
 // RocksDB extensions (Phase 7).
 pub const checkpoint = @import("rocks/checkpoint.zig");
+pub const prefix = @import("rocks/prefix.zig");
 
 // Version / MANIFEST (Phase 5).
 pub const version_edit = @import("version/version_edit.zig");
