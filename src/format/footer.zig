@@ -21,17 +21,16 @@ pub const BlockHandle = struct {
 
     /// Append varint encoding of offset then size to buf.
     pub fn encodeTo(self: BlockHandle, buf: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator) !void {
-        _ = self;
-        _ = buf;
-        _ = gpa;
-        @panic("TODO: implement BlockHandle.encodeTo");
+        try coding.putVarint64(buf, gpa, self.offset);
+        try coding.putVarint64(buf, gpa, self.size);
     }
 
     /// Decode a BlockHandle from the front of input, advancing input past the consumed bytes.
     /// Returns error.Corruption on truncation or malformed varint.
     pub fn decodeFrom(input: *[]const u8) !BlockHandle {
-        _ = input;
-        @panic("TODO: implement BlockHandle.decodeFrom");
+        const offset = try coding.getVarint64(input);
+        const size = try coding.getVarint64(input);
+        return BlockHandle{ .offset = offset, .size = size };
     }
 };
 
@@ -50,6 +49,15 @@ pub const ChecksumType = enum(u8) {
     xxh3 = 4,
 };
 
+/// Convert a raw u8 to a ChecksumType, returning error.Corruption if unknown.
+/// Uses inline-for instead of std.meta.intToEnum (removed in Zig 0.16).
+fn checksumTypeFromInt(v: u8) error{Corruption}!ChecksumType {
+    inline for (std.meta.fields(ChecksumType)) |f| {
+        if (f.value == v) return @field(ChecksumType, f.name);
+    }
+    return error.Corruption;
+}
+
 // ---------------------------------------------------------------------------
 // Footer
 // ---------------------------------------------------------------------------
@@ -61,18 +69,70 @@ pub const Footer = struct {
     checksum_type: ChecksumType = .crc32c,
 
     /// Encode the footer to exactly 53 bytes, appended to buf.
+    /// Layout:
+    ///   [0]      checksum_type (u8)
+    ///   [1..41]  metaindex_handle ++ index_handle (varint), zero-padded to 40 bytes
+    ///   [41..45] format_version (fixed32 LE)
+    ///   [45..53] magic number (fixed64 LE)
     pub fn encodeTo(self: Footer, buf: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator) !void {
-        _ = self;
-        _ = buf;
-        _ = gpa;
-        @panic("TODO: implement Footer.encodeTo");
+        const start = buf.items.len;
+
+        // byte[0]: checksum type
+        try buf.append(gpa, @intFromEnum(self.checksum_type));
+
+        // bytes[1..41]: handles region (40 bytes, zero-padded)
+        const handles_start = buf.items.len;
+        try self.metaindex_handle.encodeTo(buf, gpa);
+        try self.index_handle.encodeTo(buf, gpa);
+        const handles_written = buf.items.len - handles_start;
+        // zero-pad to 40 bytes
+        const pad = 40 - handles_written;
+        try buf.appendNTimes(gpa, 0, pad);
+
+        // bytes[41..45]: format_version (fixed32 LE)
+        var fv_buf: [4]u8 = undefined;
+        coding.encodeFixed32(&fv_buf, self.format_version);
+        try buf.appendSlice(gpa, &fv_buf);
+
+        // bytes[45..53]: magic number (fixed64 LE)
+        var magic_buf: [8]u8 = undefined;
+        coding.encodeFixed64(&magic_buf, kBlockBasedTableMagicNumber);
+        try buf.appendSlice(gpa, &magic_buf);
+
+        std.debug.assert(buf.items.len - start == kEncodedLength);
     }
 
     /// Decode a Footer from data (must be >= kEncodedLength bytes).
     /// Reads the magic from the LAST 8 bytes; returns error.BadMagic if wrong.
+    /// Reads format_version from bytes[len-12..len-8].
+    /// Reads checksum_type from byte[0].
+    /// Parses the two handles from bytes[1..41].
     pub fn decodeFrom(data: []const u8) !Footer {
-        _ = data;
-        @panic("TODO: implement Footer.decodeFrom");
+        if (data.len < kEncodedLength) return error.Corruption;
+
+        // Verify magic from last 8 bytes
+        const magic_bytes: *const [8]u8 = data[data.len - 8 ..][0..8];
+        const magic = coding.decodeFixed64(magic_bytes);
+        if (magic != kBlockBasedTableMagicNumber) return error.BadMagic;
+
+        // Read format_version from bytes[len-12..len-8]
+        const fv_bytes: *const [4]u8 = data[data.len - 12 ..][0..4];
+        const format_version = coding.decodeFixed32(fv_bytes);
+
+        // Read checksum_type from byte[0]
+        const checksum_type = try checksumTypeFromInt(data[0]);
+
+        // Parse the two handles from bytes[1..41]
+        var handles_slice: []const u8 = data[1..41];
+        const metaindex_handle = try BlockHandle.decodeFrom(&handles_slice);
+        const index_handle = try BlockHandle.decodeFrom(&handles_slice);
+
+        return Footer{
+            .metaindex_handle = metaindex_handle,
+            .index_handle = index_handle,
+            .format_version = format_version,
+            .checksum_type = checksum_type,
+        };
     }
 };
 
