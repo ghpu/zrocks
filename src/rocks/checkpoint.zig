@@ -25,37 +25,113 @@ const db_mod = @import("../db/db.zig");
 const filename = @import("../version/filename.zig");
 
 // ---------------------------------------------------------------------------
-// Public API — RED stub (returns immediately without copying anything)
+// Public API
 // ---------------------------------------------------------------------------
 
 /// Create a consistent checkpoint of `db` in the directory `dest_dir`.
-/// (Stubbed — not yet implemented.)
+///
+/// Steps:
+///   1. Flush the active WAL so all committed writes are visible in the MemEnv.
+///   2. Create `dest_dir` via `db.env.makeDir`.
+///   3. Copy every live SST referenced by the current Version.
+///   4. Copy the current MANIFEST.
+///   5. Copy the active WAL (if it exists).
+///   6. Copy the CURRENT pointer file (its MANIFEST basename is unchanged in
+///      the dest because we copied the same MANIFEST with the same number).
+///
+/// The checkpoint can be opened as an independent DB with `DB.open`; it will
+/// replay the copied WAL to recover writes not yet flushed to SSTs.
 pub fn createCheckpoint(
     gpa: std.mem.Allocator,
     db: *db_mod.DB,
     dest_dir: []const u8,
 ) !void {
-    _ = gpa;
-    _ = db;
-    _ = dest_dir;
-    return error.NotImplemented;
+    // 1. Flush the WAL so MemEnv's in-memory buffer is committed to its
+    //    backing byte slice (the SequentialFile open below will see all bytes).
+    try db.wal_file.flush();
+
+    // 2. Create destination directory (no-op success if already exists on MemEnv).
+    try db.env.makeDir(dest_dir);
+
+    const e = db.env;
+    const src = db.name;
+
+    // 3. Copy every live SST across all levels.
+    const version = db.versions.currentVersion();
+    for (&version.files) |level| {
+        for (level.items) |file_meta| {
+            const src_path = try filename.tableFileName(gpa, src, file_meta.number);
+            defer gpa.free(src_path);
+            const dst_path = try filename.tableFileName(gpa, dest_dir, file_meta.number);
+            defer gpa.free(dst_path);
+            try copyFile(gpa, e, src_path, dst_path);
+        }
+    }
+
+    // 4. Copy the current MANIFEST.
+    {
+        const src_path = try filename.manifestFileName(gpa, src, db.versions.manifestFileNumber());
+        defer gpa.free(src_path);
+        const dst_path = try filename.manifestFileName(gpa, dest_dir, db.versions.manifestFileNumber());
+        defer gpa.free(dst_path);
+        try copyFile(gpa, e, src_path, dst_path);
+    }
+
+    // 5. Copy the active WAL (the file is always created by DB.open but may
+    //    be empty on a brand-new DB with no writes yet; guard with fileExists
+    //    to be safe, then copy unconditionally when it is there).
+    {
+        const src_path = try filename.logFileName(gpa, src, db.versions.logNumber());
+        defer gpa.free(src_path);
+        if (e.fileExists(src_path)) {
+            const dst_path = try filename.logFileName(gpa, dest_dir, db.versions.logNumber());
+            defer gpa.free(dst_path);
+            try copyFile(gpa, e, src_path, dst_path);
+        }
+    }
+
+    // 6. Copy CURRENT.  Its content ("MANIFEST-XXXXXX\n") names the same
+    //    MANIFEST number we just copied into dest, so it is valid as-is.
+    {
+        const src_path = try filename.currentFileName(gpa, src);
+        defer gpa.free(src_path);
+        const dst_path = try filename.currentFileName(gpa, dest_dir);
+        defer gpa.free(dst_path);
+        try copyFile(gpa, e, src_path, dst_path);
+    }
+    // TODO: hard-link via Env for space efficiency when src and dest share a
+    // filesystem — avoids byte-copying large SSTs.
 }
 
 // ---------------------------------------------------------------------------
-// Private helpers (stubs)
+// Private helpers
 // ---------------------------------------------------------------------------
 
+/// Copy every byte of `src_path` into `dest_path` using the provided `Env`.
+/// Opens `src_path` as a SequentialFile, reads in 32 KiB chunks, and appends
+/// each chunk to a newly created WritableFile at `dest_path`.  Both handles
+/// are flushed and closed on success; `src_path` is closed on any error.
 fn copyFile(
     gpa: std.mem.Allocator,
     e: env_mod.Env,
     src_path: []const u8,
     dest_path: []const u8,
 ) !void {
-    _ = gpa;
-    _ = e;
-    _ = src_path;
-    _ = dest_path;
-    return error.NotImplemented;
+    var src_file = try e.newSequentialFile(gpa, src_path);
+    defer src_file.close() catch {};
+
+    var dst_file = try e.newWritableFile(gpa, dest_path);
+    errdefer dst_file.close() catch {};
+
+    var buf: [32 * 1024]u8 = undefined;
+    while (true) {
+        const n = try src_file.read(&buf);
+        if (n == 0) break; // EOF
+        try dst_file.append(buf[0..n]);
+    }
+
+    try dst_file.flush();
+    try dst_file.close();
 }
 
 // ===========================================================================
@@ -96,14 +172,15 @@ test "checkpoint: round-trip — SST + WAL data visible in checkpoint DB" {
         try testing.expect(total_sst >= 1);
     }
 
-    // Create checkpoint — must fail with NotImplemented in RED.
+    // Create checkpoint.
     try createCheckpoint(gpa, src_db, "ckpt");
 
     // Open the checkpoint as a fully independent DB.
     const ckpt_db = try DB.open(gpa, e, "ckpt", .{});
     defer ckpt_db.close();
 
-    // Every key must be readable in the checkpoint.
+    // Every key must be readable in the checkpoint (both SST-flushed and
+    // WAL-only data recovered via WAL replay on ckpt open).
     i = 0;
     while (i < n) : (i += 1) {
         var kbuf: [16]u8 = undefined;
@@ -127,7 +204,7 @@ test "checkpoint: source-unaffected — new source writes absent from checkpoint
 
     try src_db.put(.{}, "before", "v1");
 
-    // Create checkpoint — must fail with NotImplemented in RED.
+    // Create checkpoint — captures the state with only "before".
     try createCheckpoint(gpa, src_db, "ckpt2");
 
     // Write a NEW key into the source AFTER the checkpoint.
@@ -166,7 +243,7 @@ test "checkpoint: expected files exist in dest dir" {
     const src_db = try DB.open(gpa, e, "srcdb3", .{ .write_buffer_size = 512 });
     defer src_db.close();
 
-    // Write enough to trigger at least one flush.
+    // Write enough to trigger at least one flush (ensures SST + MANIFEST + WAL + CURRENT).
     var i: usize = 0;
     while (i < 32) : (i += 1) {
         var kbuf: [16]u8 = undefined;
@@ -176,31 +253,30 @@ test "checkpoint: expected files exist in dest dir" {
         try src_db.put(.{}, k, v);
     }
 
-    // Create checkpoint — must fail with NotImplemented in RED.
     try createCheckpoint(gpa, src_db, "ckpt3");
 
-    // CURRENT must exist.
+    // CURRENT must exist in the checkpoint dir.
     {
         const p = try filename.currentFileName(gpa, "ckpt3");
         defer gpa.free(p);
         try testing.expect(e.fileExists(p));
     }
 
-    // MANIFEST must exist.
+    // The MANIFEST must exist.
     {
         const p = try filename.manifestFileName(gpa, "ckpt3", src_db.versions.manifestFileNumber());
         defer gpa.free(p);
         try testing.expect(e.fileExists(p));
     }
 
-    // Active WAL must exist.
+    // The active WAL must exist.
     {
         const p = try filename.logFileName(gpa, "ckpt3", src_db.versions.logNumber());
         defer gpa.free(p);
         try testing.expect(e.fileExists(p));
     }
 
-    // At least one SST must exist (the L0 flush happened).
+    // Every live SST must exist in the checkpoint dir.
     {
         const ver = src_db.versions.currentVersion();
         var found_sst = false;
