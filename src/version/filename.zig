@@ -30,6 +30,13 @@ pub fn tempFileName(gpa: std.mem.Allocator, dbname: []const u8, number: u64) ![]
     return std.fmt.allocPrint(gpa, "{s}/{d:0>6}.dbtmp", .{ dbname, number });
 }
 
+/// `<dbroot>/CF_LIST` — the column-family registry (M7.0): a line-oriented
+/// `<id> <name>` mapping rewritten on each create/drop so a reopen knows which
+/// column families exist and at which subdirectory.
+pub fn cfListFileName(gpa: std.mem.Allocator, dbroot: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "{s}/CF_LIST", .{dbroot});
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================

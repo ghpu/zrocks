@@ -63,6 +63,52 @@ pub fn insertBatch(mem: *MemTable, batch: *const WriteBatch, first_sequence: u64
     try batch.iterate(&inserter);
 }
 
+/// CF-aware WriteBatch handler (M7.0): walks a (possibly CF-tagged) batch,
+/// advancing the sequence for EVERY record so cross-CF ordering matches RocksDB
+/// (record i of the batch → first_sequence + i, regardless of which CF it
+/// targets), but only INSERTS the records whose cf id equals `target_cf` into
+/// `mem`.  Records for other CFs still consume a sequence slot (so the shared
+/// sequence space stays consistent across families) but are skipped here.
+pub const CfMemTableInserter = struct {
+    mem: *MemTable,
+    target_cf: u32,
+    /// Sequence to assign to the NEXT record in the batch (advances for ALL
+    /// records, matched or not).
+    sequence: u64,
+
+    pub fn init(mem: *MemTable, target_cf: u32, first_sequence: u64) CfMemTableInserter {
+        return .{ .mem = mem, .target_cf = target_cf, .sequence = first_sequence };
+    }
+
+    pub fn putCF(self: *CfMemTableInserter, cf_id: u32, key: []const u8, value: []const u8) !void {
+        if (cf_id == self.target_cf) try self.mem.add(self.sequence, .value, key, value);
+        self.sequence += 1;
+    }
+
+    pub fn deleteCF(self: *CfMemTableInserter, cf_id: u32, key: []const u8) !void {
+        if (cf_id == self.target_cf) try self.mem.add(self.sequence, .deletion, key, "");
+        self.sequence += 1;
+    }
+
+    pub fn mergeCF(self: *CfMemTableInserter, cf_id: u32, key: []const u8, value: []const u8) !void {
+        if (cf_id == self.target_cf) try self.mem.add(self.sequence, .merge, key, value);
+        self.sequence += 1;
+    }
+
+    pub fn deleteRangeCF(self: *CfMemTableInserter, cf_id: u32, begin: []const u8, end: []const u8) !void {
+        if (cf_id == self.target_cf) try self.mem.add(self.sequence, .range_deletion, begin, end);
+        self.sequence += 1;
+    }
+};
+
+/// Insert into `mem` ONLY the records of `batch` that target column family
+/// `target_cf`, assigning per-record sequences from the shared space starting at
+/// `first_sequence` (record i of the WHOLE batch → first_sequence + i).
+pub fn insertBatchForCf(mem: *MemTable, batch: *const WriteBatch, target_cf: u32, first_sequence: u64) !void {
+    var inserter = CfMemTableInserter.init(mem, target_cf, first_sequence);
+    try batch.iterate(&inserter);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

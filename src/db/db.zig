@@ -84,6 +84,11 @@ pub const DB = struct {
     wal_file: env.WritableFile,
     wal: log_writer.Writer,
     last_sequence: u64,
+    /// Whether this DB owns + manages its own WAL (M7.0).  A normal single-CF DB
+    /// owns its WAL (true).  A per-column-family sub-LSM opened via `openCf` does
+    /// NOT — the multi-CF `CfDB` owns ONE shared WAL across all families — so
+    /// `wal_file`/`wal` are left undefined and `close`/`write` never touch them.
+    owns_wal: bool = true,
     /// Live point-in-time snapshots.  Their oldest sequence bounds what
     /// compaction may discard (M6.3 snapshot pinning).
     snapshots: SnapshotList,
@@ -109,6 +114,7 @@ pub const DB = struct {
         self.env = e;
         self.options = options;
         self.last_sequence = 0;
+        self.owns_wal = true;
         // ikcmp must live at a stable address (the memtable's entry comparator
         // points at it); `self` is heap-allocated so &self.ikcmp is stable.
         self.ikcmp = .{ .user = options.comparator };
@@ -194,11 +200,100 @@ pub const DB = struct {
         return self;
     }
 
+    /// Open a per-column-family sub-LSM rooted at directory `name` WITHOUT a WAL
+    /// of its own (M7.0).  Used by `CfDB`: the multi-CF database owns ONE shared
+    /// WAL across all families and replays it into each CF's memtable, so a
+    /// ColumnFamily only needs {memtable, imm, VersionSet (own MANIFEST/CURRENT),
+    /// table_cache, flush, compaction} — everything the existing `DB` already
+    /// provides MINUS the WAL.
+    ///
+    /// On an existing CF directory the per-CF VersionSet is recovered from its
+    /// MANIFEST (restoring its SST files + last_sequence); the memtable is left
+    /// EMPTY (the caller replays the shared WAL into it).  On a fresh CF
+    /// directory a MANIFEST/CURRENT is created.  No `.log` file is ever opened.
+    ///
+    /// The returned `*DB` has `owns_wal = false`: `close` will not touch the WAL,
+    /// and `write` must NOT be called on it (use `applyBatchNoWal`).  Caller
+    /// `close`s it.
+    pub fn openCf(gpa: std.mem.Allocator, e: env.Env, name: []const u8, options: Options) !*DB {
+        const self = try gpa.create(DB);
+        errdefer gpa.destroy(self);
+
+        self.gpa = gpa;
+        self.env = e;
+        self.options = options;
+        self.last_sequence = 0;
+        self.owns_wal = false;
+        self.ikcmp = .{ .user = options.comparator };
+
+        self.name = try gpa.dupe(u8, name);
+        errdefer gpa.free(self.name);
+
+        try e.makeDir(name);
+
+        self.mem = try MemTable.init(gpa, options.comparator);
+        errdefer self.mem.deinit();
+        self.imm = null;
+
+        const vs = try gpa.create(version_set.VersionSet);
+        errdefer gpa.destroy(vs);
+        vs.* = try version_set.VersionSet.init(gpa, e, name, options);
+        errdefer vs.deinit();
+        self.versions = vs;
+
+        self.table_cache = table_cache_mod.TableCache.init(gpa, e, self.name, options, null);
+        errdefer self.table_cache.deinit();
+
+        self.snapshots = SnapshotList.init(gpa);
+        errdefer self.snapshots.deinit();
+
+        const current_path = try filename.currentFileName(gpa, name);
+        defer gpa.free(current_path);
+
+        if (e.fileExists(current_path)) {
+            // Recover the per-CF VersionSet (SST files + sequences).  The shared
+            // WAL replay (done by CfDB) repopulates the memtable; we do NOT touch
+            // any per-CF `.log` file (there is none in the CF design).
+            try vs.recover();
+            self.last_sequence = vs.lastSequence();
+        } else {
+            // Fresh CF: write an initial MANIFEST/CURRENT.  No log file.
+            var edit = version_edit.VersionEdit.init();
+            defer edit.deinit(gpa);
+            try edit.setComparatorName(gpa, options.comparator.name());
+            edit.setNextFileNumber(vs.nextFileNumber());
+            edit.setLastSequence(0);
+            try vs.logAndApply(&edit);
+            self.last_sequence = 0;
+        }
+
+        // wal_file / wal are intentionally left undefined: owns_wal == false means
+        // no code path on this DB reads them.
+        return self;
+    }
+
+    /// Apply the records of `batch` that target column family `cf_id` into this
+    /// CF's memtable WITHOUT any WAL append (M7.0).  The CfDB has already appended
+    /// the (CF-tagged) batch to the SHARED WAL exactly once and stamped the shared
+    /// sequence; here we insert only this CF's records (each consuming a slot in
+    /// the shared sequence space starting at `first_sequence`) and advance
+    /// flush/compaction.  `set_last_sequence` is the DB-wide last sequence after
+    /// the batch, recorded onto this CF so its reads/snapshots and any flush use
+    /// the shared sequence space.
+    pub fn applyBatchNoWal(self: *DB, batch: *const WriteBatch, cf_id: u32, first_sequence: u64, set_last_sequence: u64) !void {
+        try write_path.insertBatchForCf(self.mem, batch, cf_id, first_sequence);
+        self.last_sequence = set_last_sequence;
+        try self.maybeFlush();
+        try self.maybeScheduleCompaction();
+    }
+
     /// Flush+close the WAL, deinit the table cache + VersionSet + MemTable,
     /// free the DB.
     pub fn close(self: *DB) void {
         const gpa = self.gpa;
-        self.wal_file.close() catch {};
+        // Only close the WAL we own.  A per-CF sub-LSM (openCf) shares the
+        // CfDB's WAL and must not close it here.
+        if (self.owns_wal) self.wal_file.close() catch {};
         // Free any snapshots the client never released.
         self.snapshots.deinit();
         self.table_cache.deinit();
@@ -387,28 +482,38 @@ pub const DB = struct {
         if (self.imm != null) return; // a flush is already pending.
         if (self.mem.approximateMemoryUsage() < self.options.write_buffer_size) return;
 
-        // 1. Rotate the WAL: allocate a new log number and open a fresh WAL.
+        // 1. Allocate a new log number.  When this DB owns its WAL, also open a
+        //    fresh WAL and swap it in (the classic single-CF flush).  A per-CF
+        //    sub-LSM (owns_wal == false) shares the CfDB's single WAL and must NOT
+        //    touch any per-CF log file — the new_log_number is still recorded in
+        //    its MANIFEST for consistency but no `.log` is created/rotated.
         const new_log_number = self.versions.newFileNumber();
-        const new_log_path = try filename.logFileName(self.gpa, self.name, new_log_number);
-        defer self.gpa.free(new_log_path);
-
-        var new_wal_file = try self.env.newWritableFile(self.gpa, new_log_path);
-        errdefer new_wal_file.close() catch {};
 
         // 2. Rotate the memtable: the full one becomes immutable; install a new
         //    empty one for subsequent writes.
         const new_mem = try MemTable.init(self.gpa, self.options.comparator);
         errdefer new_mem.deinit();
 
-        self.imm = self.mem;
-        self.mem = new_mem;
+        if (self.owns_wal) {
+            const new_log_path = try filename.logFileName(self.gpa, self.name, new_log_number);
+            defer self.gpa.free(new_log_path);
 
-        // Swap in the new WAL (close the old one — its data is going into the
-        // SST and will not be replayed once logAndApply records the new log).
-        const old_wal_file = self.wal_file;
-        self.wal_file = new_wal_file;
-        self.wal = log_writer.Writer.init(self.wal_file);
-        old_wal_file.close() catch {};
+            var new_wal_file = try self.env.newWritableFile(self.gpa, new_log_path);
+            errdefer new_wal_file.close() catch {};
+
+            self.imm = self.mem;
+            self.mem = new_mem;
+
+            // Swap in the new WAL (close the old one — its data is going into the
+            // SST and will not be replayed once logAndApply records the new log).
+            const old_wal_file = self.wal_file;
+            self.wal_file = new_wal_file;
+            self.wal = log_writer.Writer.init(self.wal_file);
+            old_wal_file.close() catch {};
+        } else {
+            self.imm = self.mem;
+            self.mem = new_mem;
+        }
 
         // 3. Flush the immutable memtable to an L0 SST (records the SST + the
         //    rotated log number in a VersionEdit).
