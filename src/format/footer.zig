@@ -38,8 +38,12 @@ pub const BlockHandle = struct {
 // Footer constants
 // ---------------------------------------------------------------------------
 
+/// Total size of an encoded footer in bytes.
 pub const kEncodedLength: usize = 53;
+/// RocksDB block-based table magic number (identifies file type).
 pub const kBlockBasedTableMagicNumber: u64 = 0x88e241b785f4cff7;
+/// Width of the handles region within the footer (bytes[1..41]).
+const kHandlesRegionSize: usize = 40;
 
 pub const ChecksumType = enum(u8) {
     none = 0,
@@ -47,16 +51,16 @@ pub const ChecksumType = enum(u8) {
     xxhash = 2,
     xxhash64 = 3,
     xxh3 = 4,
-};
 
-/// Convert a raw u8 to a ChecksumType, returning error.Corruption if unknown.
-/// Uses inline-for instead of std.meta.intToEnum (removed in Zig 0.16).
-fn checksumTypeFromInt(v: u8) error{Corruption}!ChecksumType {
-    inline for (std.meta.fields(ChecksumType)) |f| {
-        if (f.value == v) return @field(ChecksumType, f.name);
+    /// Parse from a raw byte; returns error.Corruption for unknown values.
+    /// Uses inline-for because std.meta.intToEnum was removed in Zig 0.16.
+    pub fn fromInt(v: u8) error{Corruption}!ChecksumType {
+        inline for (std.meta.fields(ChecksumType)) |f| {
+            if (f.value == v) return @field(ChecksumType, f.name);
+        }
+        return error.Corruption;
     }
-    return error.Corruption;
-}
+};
 
 // ---------------------------------------------------------------------------
 // Footer
@@ -85,8 +89,8 @@ pub const Footer = struct {
         try self.metaindex_handle.encodeTo(buf, gpa);
         try self.index_handle.encodeTo(buf, gpa);
         const handles_written = buf.items.len - handles_start;
-        // zero-pad to 40 bytes
-        const pad = 40 - handles_written;
+        // zero-pad to kHandlesRegionSize bytes
+        const pad = kHandlesRegionSize - handles_written;
         try buf.appendNTimes(gpa, 0, pad);
 
         // bytes[41..45]: format_version (fixed32 LE)
@@ -120,10 +124,10 @@ pub const Footer = struct {
         const format_version = coding.decodeFixed32(fv_bytes);
 
         // Read checksum_type from byte[0]
-        const checksum_type = try checksumTypeFromInt(data[0]);
+        const checksum_type = try ChecksumType.fromInt(data[0]);
 
-        // Parse the two handles from bytes[1..41]
-        var handles_slice: []const u8 = data[1..41];
+        // Parse the two handles from bytes[1..1+kHandlesRegionSize]
+        var handles_slice: []const u8 = data[1 .. 1 + kHandlesRegionSize];
         const metaindex_handle = try BlockHandle.decodeFrom(&handles_slice);
         const index_handle = try BlockHandle.decodeFrom(&handles_slice);
 
