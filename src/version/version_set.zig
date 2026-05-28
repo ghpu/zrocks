@@ -1,6 +1,21 @@
 //! version_set.zig — Version / VersionSet / MANIFEST (LevelDB-style metadata).
 //!
-//! RED stub: signatures only.  Implemented in the GREEN phase.
+//! A `Version` is an immutable-by-convention snapshot of which SST files live
+//! at which level.  A `VersionSet` owns the live (current) Version and a
+//! MANIFEST log: every `logAndApply` builds a new current Version and appends
+//! the encoded `VersionEdit` to the MANIFEST so the layout can be reconstructed
+//! on `recover`.  A `CURRENT` pointer file names the live MANIFEST.
+//!
+//! Ownership model
+//! ---------------
+//! Each `Version` DEEP-OWNS the byte slices (smallest / largest internal keys)
+//! of every `FileMetaData` it holds; `Version.deinit` frees them.  When
+//! `logAndApply` carries a file forward from the previous Version, or adds one
+//! from a `VersionEdit`, the bytes are duped into the new Version so the two
+//! Versions never alias.  This is intentionally simple — files are tiny
+//! metadata records.
+//! TODO(perf): share FileMetaData via refcount across Versions.
+
 const std = @import("std");
 const version_edit = @import("version_edit.zig");
 const log_writer = @import("../format/log_writer.zig");
@@ -11,76 +26,457 @@ const coding = @import("../util/coding.zig");
 const options = @import("../options.zig");
 const filename = @import("filename.zig");
 
+const FileMetaData = version_edit.FileMetaData;
+const VersionEdit = version_edit.VersionEdit;
+
 pub const kNumLevels = 7;
 
-pub const Version = struct {
-    files: [kNumLevels]std.ArrayListUnmanaged(version_edit.FileMetaData),
+// ---------------------------------------------------------------------------
+// Version
+// ---------------------------------------------------------------------------
 
+/// An immutable snapshot of the per-level SST file layout.  Owns the byte
+/// slices of every FileMetaData it holds.
+pub const Version = struct {
+    files: [kNumLevels]std.ArrayListUnmanaged(FileMetaData),
+
+    /// An empty Version (no files at any level).
+    pub fn initEmpty() Version {
+        return .{ .files = [_]std.ArrayListUnmanaged(FileMetaData){.empty} ** kNumLevels };
+    }
+
+    /// Free every owned FileMetaData byte slice and the per-level lists.
     pub fn deinit(self: *Version, gpa: std.mem.Allocator) void {
-        _ = self;
-        _ = gpa;
+        for (&self.files) |*level| {
+            for (level.items) |f| {
+                gpa.free(f.smallest);
+                gpa.free(f.largest);
+            }
+            level.deinit(gpa);
+        }
+    }
+
+    /// Append a deep copy of `meta` to `level` (the Version takes ownership of
+    /// the duped key bytes).  On error nothing is added and no bytes leak.
+    fn addFileOwned(self: *Version, gpa: std.mem.Allocator, level: usize, meta: FileMetaData) !void {
+        const s = try gpa.dupe(u8, meta.smallest);
+        errdefer gpa.free(s);
+        const l = try gpa.dupe(u8, meta.largest);
+        errdefer gpa.free(l);
+        try self.files[level].append(gpa, .{
+            .number = meta.number,
+            .file_size = meta.file_size,
+            .smallest = s,
+            .largest = l,
+        });
     }
 };
 
+// ---------------------------------------------------------------------------
+// VersionSet
+// ---------------------------------------------------------------------------
+
 pub const VersionSet = struct {
+    gpa: std.mem.Allocator,
+    env: env.Env,
+    dbname: []u8, // owned
+    options: options.Options,
+    cmp: comparator.Comparator,
+
+    current: Version,
+
+    next_file_number: u64,
+    manifest_file_number: u64,
+    last_sequence: u64,
+    log_number: u64,
+    prev_log_number: u64,
+
+    // Open MANIFEST descriptor log (lazily created on the first logAndApply).
+    descriptor_file: ?env.WritableFile,
+    descriptor_log: ?log_writer.Writer,
+
     pub fn init(
         gpa: std.mem.Allocator,
         e: env.Env,
         dbname: []const u8,
         opts: options.Options,
     ) !VersionSet {
-        _ = gpa;
-        _ = e;
-        _ = dbname;
-        _ = opts;
-        return error.Unimplemented;
+        const owned = try gpa.dupe(u8, dbname);
+        return .{
+            .gpa = gpa,
+            .env = e,
+            .dbname = owned,
+            .options = opts,
+            .cmp = opts.comparator,
+            .current = Version.initEmpty(),
+            .next_file_number = 2, // 1 is reserved for the first MANIFEST.
+            .manifest_file_number = 0,
+            .last_sequence = 0,
+            .log_number = 0,
+            .prev_log_number = 0,
+            .descriptor_file = null,
+            .descriptor_log = null,
+        };
     }
 
     pub fn deinit(self: *VersionSet) void {
-        _ = self;
+        if (self.descriptor_file) |f| f.close() catch {};
+        self.descriptor_file = null;
+        self.descriptor_log = null;
+        self.current.deinit(self.gpa);
+        self.gpa.free(self.dbname);
+        self.* = undefined;
     }
 
     pub fn newFileNumber(self: *VersionSet) u64 {
-        _ = self;
-        return 0;
+        const n = self.next_file_number;
+        self.next_file_number += 1;
+        return n;
     }
 
-    pub fn logAndApply(self: *VersionSet, edit: *version_edit.VersionEdit) !void {
-        _ = self;
-        _ = edit;
-        return error.Unimplemented;
+    /// Ensure `next_file_number` will not hand out `number` again.
+    fn markFileNumberUsed(self: *VersionSet, number: u64) void {
+        if (self.next_file_number <= number) self.next_file_number = number + 1;
     }
 
-    pub fn recover(self: *VersionSet) !void {
-        _ = self;
-        return error.Unimplemented;
-    }
+    // -- accessors -------------------------------------------------------
 
     pub fn currentVersion(self: *const VersionSet) *const Version {
-        _ = self;
-        unreachable;
+        return &self.current;
     }
 
     pub fn lastSequence(self: *const VersionSet) u64 {
-        _ = self;
-        return 0;
+        return self.last_sequence;
     }
 
     pub fn logNumber(self: *const VersionSet) u64 {
-        _ = self;
-        return 0;
+        return self.log_number;
+    }
+
+    pub fn prevLogNumber(self: *const VersionSet) u64 {
+        return self.prev_log_number;
     }
 
     pub fn manifestFileNumber(self: *const VersionSet) u64 {
-        _ = self;
-        return 0;
+        return self.manifest_file_number;
+    }
+
+    pub fn nextFileNumber(self: *const VersionSet) u64 {
+        return self.next_file_number;
     }
 
     pub fn setLastSequence(self: *VersionSet, v: u64) void {
-        _ = self;
-        _ = v;
+        self.last_sequence = v;
+    }
+
+    pub fn setLogNumber(self: *VersionSet, v: u64) void {
+        self.log_number = v;
+    }
+
+    // -- apply / log -----------------------------------------------------
+
+    /// Build a new current Version = apply(edit, current), append the encoded
+    /// edit to the MANIFEST, install the new Version, and free the old one.
+    pub fn logAndApply(self: *VersionSet, edit: *VersionEdit) !void {
+        // 1. Build the new Version from the current one + the edit.
+        var next = try self.buildNextVersion(edit);
+        errdefer next.deinit(self.gpa);
+
+        // 2. Ensure a MANIFEST exists; on the very first call create it and
+        //    write CURRENT to point at it.
+        if (self.descriptor_log == null) {
+            try self.createDescriptor();
+        }
+
+        // 3. Encode and append the edit as one MANIFEST record.
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(self.gpa);
+        try edit.encodeTo(&buf, self.gpa);
+        try self.descriptor_log.?.addRecord(self.gpa, buf.items);
+        try self.descriptor_file.?.flush();
+
+        // 4. Update bookkeeping scalars from the edit.
+        self.applyScalars(edit);
+
+        // 5. Install the new Version and free the old one.
+        var old = self.current;
+        self.current = next;
+        old.deinit(self.gpa);
+    }
+
+    /// Apply only the scalar fields of `edit` to the VersionSet bookkeeping.
+    fn applyScalars(self: *VersionSet, edit: *const VersionEdit) void {
+        if (edit.log_number) |v| self.log_number = v;
+        if (edit.prev_log_number) |v| self.prev_log_number = v;
+        if (edit.next_file_number) |v| self.markFileNumberUsed(v -| 1);
+        if (edit.last_sequence) |v| self.last_sequence = v;
+        // Files referenced by the edit must not be reallocated.
+        for (edit.new_files.items) |nf| self.markFileNumberUsed(nf.meta.number);
+    }
+
+    /// Compute the next Version by applying `edit` to `self.current`:
+    /// carry forward every surviving file (minus edit.deleted_files), add
+    /// edit.new_files, then sort levels >= 1 by smallest internal key.
+    fn buildNextVersion(self: *VersionSet, edit: *const VersionEdit) !Version {
+        var next = Version.initEmpty();
+        errdefer next.deinit(self.gpa);
+
+        var level: usize = 0;
+        while (level < kNumLevels) : (level += 1) {
+            // Carry forward surviving files from the current Version.
+            for (self.current.files[level].items) |f| {
+                if (isDeleted(edit, level, f.number)) continue;
+                try next.addFileOwned(self.gpa, level, f);
+            }
+            // Add new files targeting this level.
+            for (edit.new_files.items) |nf| {
+                if (nf.level != level) continue;
+                if (isDeleted(edit, level, nf.meta.number)) continue;
+                try next.addFileOwned(self.gpa, level, nf.meta);
+            }
+            // Levels >= 1 are non-overlapping and kept sorted by smallest key.
+            // Level 0 keeps insertion order (overlapping ranges, newest last).
+            if (level >= 1) sortLevel(&next.files[level], self.cmp);
+        }
+        return next;
+    }
+
+    fn isDeleted(edit: *const VersionEdit, level: usize, number: u64) bool {
+        for (edit.deleted_files.items) |df| {
+            if (df.level == level and df.number == number) return true;
+        }
+        return false;
+    }
+
+    /// Sort a level by smallest internal key (ties broken by file number).
+    fn sortLevel(level: *std.ArrayListUnmanaged(FileMetaData), cmp: comparator.Comparator) void {
+        const Ctx = struct {
+            c: comparator.Comparator,
+            fn lessThan(ctx: @This(), a: FileMetaData, b: FileMetaData) bool {
+                return switch (ctx.c.compare(a.smallest, b.smallest)) {
+                    .lt => true,
+                    .gt => false,
+                    .eq => a.number < b.number,
+                };
+            }
+        };
+        std.mem.sort(FileMetaData, level.items, Ctx{ .c = cmp }, Ctx.lessThan);
+    }
+
+    // -- MANIFEST / CURRENT ----------------------------------------------
+
+    /// Create a fresh MANIFEST descriptor log and point CURRENT at it.  The
+    /// freshly created MANIFEST opens with a snapshot record describing the
+    /// current Version so a recovery that starts here is self-contained.
+    fn createDescriptor(self: *VersionSet) !void {
+        const number = self.newFileNumber();
+        self.manifest_file_number = number;
+
+        const path = try filename.manifestFileName(self.gpa, self.dbname, number);
+        defer self.gpa.free(path);
+
+        var wf = try self.env.newWritableFile(self.gpa, path);
+        errdefer wf.close() catch {};
+        var writer = log_writer.Writer.init(wf);
+
+        // Write a snapshot of the current state as the first record so the
+        // MANIFEST is self-contained even though new edits will follow.
+        try self.writeSnapshot(&writer, wf);
+
+        self.descriptor_file = wf;
+        self.descriptor_log = writer;
+
+        // Atomically point CURRENT at the new MANIFEST.
+        try self.setCurrentFile(number);
+    }
+
+    /// Emit a VersionEdit capturing the full current state into the descriptor
+    /// log (comparator name, bookkeeping scalars, and every live file).
+    fn writeSnapshot(self: *VersionSet, writer: *log_writer.Writer, wf: env.WritableFile) !void {
+        var edit = VersionEdit.init();
+        defer edit.deinit(self.gpa);
+
+        try edit.setComparatorName(self.gpa, self.cmp.name());
+        if (self.log_number != 0) edit.setLogNumber(self.log_number);
+        if (self.prev_log_number != 0) edit.setPrevLogNumber(self.prev_log_number);
+        edit.setNextFileNumber(self.next_file_number);
+        edit.setLastSequence(self.last_sequence);
+
+        var level: usize = 0;
+        while (level < kNumLevels) : (level += 1) {
+            for (self.current.files[level].items) |f| {
+                try edit.addFile(self.gpa, @intCast(level), f.number, f.file_size, f.smallest, f.largest);
+            }
+        }
+
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(self.gpa);
+        try edit.encodeTo(&buf, self.gpa);
+        try writer.addRecord(self.gpa, buf.items);
+        try wf.flush();
+    }
+
+    /// Write `"MANIFEST-<n>\n"` to a temp file and rename it onto CURRENT.
+    fn setCurrentFile(self: *VersionSet, manifest_number: u64) !void {
+        // The CURRENT file holds the MANIFEST's basename (no directory part)
+        // plus a trailing newline, matching LevelDB.
+        const manifest_path = try filename.manifestFileName(self.gpa, self.dbname, manifest_number);
+        defer self.gpa.free(manifest_path);
+        const basename = std.fs.path.basename(manifest_path);
+
+        const tmp = try filename.tempFileName(self.gpa, self.dbname, manifest_number);
+        defer self.gpa.free(tmp);
+
+        {
+            var wf = try self.env.newWritableFile(self.gpa, tmp);
+            errdefer wf.close() catch {};
+            try wf.append(basename);
+            try wf.append("\n");
+            try wf.flush();
+            try wf.close();
+        }
+        errdefer self.env.deleteFile(tmp) catch {};
+
+        const current_path = try filename.currentFileName(self.gpa, self.dbname);
+        defer self.gpa.free(current_path);
+        try self.env.renameFile(tmp, current_path);
+    }
+
+    // -- recovery --------------------------------------------------------
+
+    /// Reconstruct the VersionSet from CURRENT -> MANIFEST.  Reads every record
+    /// (each an encoded VersionEdit), accumulates the layout into the current
+    /// Version, and restores bookkeeping scalars.
+    pub fn recover(self: *VersionSet) !void {
+        // 1. Read CURRENT to learn the MANIFEST basename.
+        const current_path = try filename.currentFileName(self.gpa, self.dbname);
+        defer self.gpa.free(current_path);
+
+        const current_contents = try readWholeFile(self.env, self.gpa, current_path);
+        defer self.gpa.free(current_contents);
+
+        // Strip the trailing newline.
+        var basename: []const u8 = current_contents;
+        if (basename.len > 0 and basename[basename.len - 1] == '\n') {
+            basename = basename[0 .. basename.len - 1];
+        }
+        if (basename.len == 0) return error.Corruption;
+
+        const manifest_path = try std.fmt.allocPrint(self.gpa, "{s}/{s}", .{ self.dbname, basename });
+        defer self.gpa.free(manifest_path);
+
+        // 2. Replay the MANIFEST records, accumulating layout + scalars.
+        var sf = try self.env.newSequentialFile(self.gpa, manifest_path);
+        defer sf.close() catch {};
+        var reader = log_reader.Reader.init(sf);
+
+        var scratch: std.ArrayList(u8) = .empty;
+        defer scratch.deinit(self.gpa);
+
+        // Accumulate into a working Version, replacing self.current at the end.
+        var built = Version.initEmpty();
+        errdefer built.deinit(self.gpa);
+
+        var have_next_file = false;
+        var have_log = false;
+        var have_prev_log = false;
+        var have_last_seq = false;
+        var next_file: u64 = 0;
+        var last_seq: u64 = 0;
+        var log_num: u64 = 0;
+        var prev_log_num: u64 = 0;
+
+        while (try reader.readRecord(self.gpa, &scratch)) |record| {
+            var edit = try VersionEdit.decodeFrom(self.gpa, record);
+            defer edit.deinit(self.gpa);
+
+            built = try applyEditToVersion(self.gpa, built, &edit, self.cmp);
+
+            if (edit.log_number) |v| {
+                log_num = v;
+                have_log = true;
+            }
+            if (edit.prev_log_number) |v| {
+                prev_log_num = v;
+                have_prev_log = true;
+            }
+            if (edit.next_file_number) |v| {
+                next_file = v;
+                have_next_file = true;
+            }
+            if (edit.last_sequence) |v| {
+                last_seq = v;
+                have_last_seq = true;
+            }
+            for (edit.new_files.items) |nf| {
+                if (!have_next_file or next_file <= nf.meta.number)
+                    self.markFileNumberUsed(nf.meta.number);
+            }
+        }
+
+        // 3. Install the recovered scalars and Version.
+        if (have_log) self.log_number = log_num;
+        if (have_prev_log) self.prev_log_number = prev_log_num;
+        if (have_last_seq) self.last_sequence = last_seq;
+        if (have_next_file) self.markFileNumberUsed(next_file -| 1);
+        // Ensure every recovered file number is reserved.
+        for (&built.files) |*level| {
+            for (level.items) |f| self.markFileNumberUsed(f.number);
+        }
+
+        var old = self.current;
+        self.current = built;
+        old.deinit(self.gpa);
+    }
+
+    /// Apply `edit` to `base`, returning the new Version (and freeing `base`).
+    /// On error `base` is left intact and ownership stays with the caller.
+    fn applyEditToVersion(
+        gpa: std.mem.Allocator,
+        base: Version,
+        edit: *const VersionEdit,
+        cmp: comparator.Comparator,
+    ) !Version {
+        var next = Version.initEmpty();
+        errdefer next.deinit(gpa);
+
+        var level: usize = 0;
+        while (level < kNumLevels) : (level += 1) {
+            for (base.files[level].items) |f| {
+                if (isDeleted(edit, level, f.number)) continue;
+                try next.addFileOwned(gpa, level, f);
+            }
+            for (edit.new_files.items) |nf| {
+                if (nf.level != level) continue;
+                if (isDeleted(edit, level, nf.meta.number)) continue;
+                try next.addFileOwned(gpa, level, nf.meta);
+            }
+            if (level >= 1) sortLevel(&next.files[level], cmp);
+        }
+        var b = base;
+        b.deinit(gpa);
+        return next;
     }
 };
+
+// ---------------------------------------------------------------------------
+// Small file helper
+// ---------------------------------------------------------------------------
+
+/// Read an entire (small) file into a freshly-allocated buffer (caller frees).
+fn readWholeFile(e: env.Env, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
+    var sf = try e.newSequentialFile(gpa, path);
+    defer sf.close() catch {};
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var chunk: [256]u8 = undefined;
+    while (true) {
+        const n = try sf.read(&chunk);
+        if (n == 0) break;
+        try out.appendSlice(gpa, chunk[0..n]);
+    }
+    return out.toOwnedSlice(gpa);
+}
 
 // ===========================================================================
 // Tests
@@ -111,6 +507,7 @@ test "init: empty version, next_file_number starts at 2" {
     while (lvl < kNumLevels) : (lvl += 1) {
         try testing.expectEqual(@as(usize, 0), levelFileCount(&vs, lvl));
     }
+    try testing.expectEqual(@as(u64, 2), vs.nextFileNumber());
 }
 
 test "newFileNumber is monotonic starting at 2" {
@@ -134,7 +531,7 @@ test "logAndApply: files land in their levels" {
     var vs = try VersionSet.init(gpa, me.env(), "db", .{});
     defer vs.deinit();
 
-    var edit = version_edit.VersionEdit.init();
+    var edit = VersionEdit.init();
     defer edit.deinit(gpa);
     try edit.addFile(gpa, 0, 10, 100, ikey("a"), ikey("b"));
     try edit.addFile(gpa, 0, 11, 100, ikey("c"), ikey("d"));
@@ -154,7 +551,7 @@ test "logAndApply: delete then add updates layout" {
     defer vs.deinit();
 
     {
-        var edit = version_edit.VersionEdit.init();
+        var edit = VersionEdit.init();
         defer edit.deinit(gpa);
         try edit.addFile(gpa, 1, 20, 200, ikey("m"), ikey("n"));
         try edit.addFile(gpa, 1, 21, 200, ikey("p"), ikey("q"));
@@ -163,7 +560,7 @@ test "logAndApply: delete then add updates layout" {
     try testing.expectEqual(@as(usize, 2), levelFileCount(&vs, 1));
 
     {
-        var edit = version_edit.VersionEdit.init();
+        var edit = VersionEdit.init();
         defer edit.deinit(gpa);
         try edit.removeFile(gpa, 1, 20);
         try edit.addFile(gpa, 1, 22, 200, ikey("a"), ikey("c"));
@@ -194,7 +591,7 @@ test "logAndApply: levels >= 1 stay sorted by smallest key" {
     var vs = try VersionSet.init(gpa, me.env(), "db", .{});
     defer vs.deinit();
 
-    var edit = version_edit.VersionEdit.init();
+    var edit = VersionEdit.init();
     defer edit.deinit(gpa);
     // Add out of order; expect sorted by smallest internal key on level 1.
     try edit.addFile(gpa, 1, 30, 100, ikey("m"), ikey("n"));
@@ -219,7 +616,7 @@ test "MANIFEST round-trip: recover reproduces identical state" {
         var vs = try VersionSet.init(gpa, me.env(), "db", .{});
         defer vs.deinit();
 
-        var edit = version_edit.VersionEdit.init();
+        var edit = VersionEdit.init();
         defer edit.deinit(gpa);
         try edit.setComparatorName(gpa, "leveldb.BytewiseComparator");
         edit.setLogNumber(5);
@@ -276,7 +673,7 @@ test "recover across multiple edits accumulates layout" {
         defer vs.deinit();
 
         {
-            var edit = version_edit.VersionEdit.init();
+            var edit = VersionEdit.init();
             defer edit.deinit(gpa);
             edit.setLastSequence(10);
             try edit.addFile(gpa, 1, 20, 200, ikey("e"), ikey("g"));
@@ -284,7 +681,7 @@ test "recover across multiple edits accumulates layout" {
             try vs.logAndApply(&edit);
         }
         {
-            var edit = version_edit.VersionEdit.init();
+            var edit = VersionEdit.init();
             defer edit.deinit(gpa);
             edit.setLastSequence(20);
             try edit.removeFile(gpa, 1, 20);
