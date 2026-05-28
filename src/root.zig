@@ -59,6 +59,7 @@ pub const transaction = @import("rocks/txn/transaction.zig");
 pub const optimistic_txn = @import("rocks/txn/optimistic.zig");
 pub const pessimistic_txn = @import("rocks/txn/pessimistic.zig");
 pub const lock_manager = @import("rocks/txn/lock_manager.zig");
+pub const column_family = @import("rocks/column_family.zig");
 
 // Version / MANIFEST (Phase 5).
 pub const version_edit = @import("version/version_edit.zig");

@@ -3,12 +3,12 @@ project: zrocks
 zig_binary: /home/ghpu/zig/zig
 stdlib: /home/ghpu/zig/lib/std
 target_rocksdb: "9.x line; block-based table format_version 5; legacy WAL/MANIFEST log (see docs/adr/000-target-format.md)"
-active_phase: P7
-active_milestone: "M7.0 Column Families (final Phase-7 milestone)"
-last_completed: M7.6 Transactions (src/rocks/txn/*)
-worktrees: "m7.0-column-families"
+active_phase: "DONE — Phases 0-7 complete"
+active_milestone: "PROJECT SCOPE COMPLETE: full LevelDB core + all 8 RocksDB extensions"
+last_completed: M7.0 Column Families (Phase 7 COMPLETE)
+worktrees: "(none — clean)"
 test_command: "/home/ghpu/zig/zig build test"
-test_count: 369
+test_count: 378
 artifacts: "zig build -> zig-out/lib/libzrocks.a + zig-out/bin/zrocks (CLI). CLI verified end-to-end (put/get/scan/bench, durable across processes)."
 updated: 2026-05-29
 ---
@@ -64,7 +64,7 @@ RocksDB reference: https://github.com/facebook/rocksdb/wiki
 - [x] GATE: LevelDB-equivalent core COMPLETE — durable, crash-recoverable, leveled-compacting LSM KV store + CLI
 
 ### Phase 7 — RocksDB extensions (each independent on the core)
-- [~] M7.0 Column Families  <-- ACTIVE (final milestone)
+- [x] M7.0 Column Families             (src/rocks/column_family.zig)
 - [x] M7.1 MergeOperator                (src/rocks/merge_operator.zig)
 - [x] M7.2 Prefix bloom & prefix seek  (src/rocks/prefix.zig)
 - [x] M7.3 Universal + FIFO compaction  (src/options.zig + db/compaction.zig + db.zig)
