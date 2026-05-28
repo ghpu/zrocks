@@ -388,16 +388,13 @@ pub const Block = struct {
                 }
             }
 
-            // Linear scan from restart point `left`.
+            // Linear scan from restart point `left`: stop at the first entry
+            // with key >= target. next() invalidates the iterator when it runs
+            // off the end, so a target greater than every key leaves us invalid.
             self.seekToRestartPoint(left);
-            while (self.err == null and self.valid()) {
+            while (self.valid()) {
                 if (self.cmp.compare(self.key_buf.items, target) != .lt) {
                     // key >= target -> found.
-                    return;
-                }
-                if (self.next_offset >= self.block.restart_offset) {
-                    // Reached the end without finding key >= target.
-                    self.current = invalidOffset(self.block);
                     return;
                 }
                 self.next();
@@ -689,4 +686,72 @@ test "currentSizeEstimate grows with entries" {
 
 test "Block.init rejects too-small data" {
     try testing.expectError(error.Corruption, Block.init(std.testing.allocator, &.{ 0x00, 0x01 }));
+}
+
+test "byte-exact: single-entry block golden vector" {
+    const gpa = testing.allocator;
+    var b = BlockBuilder.init(gpa, 2);
+    defer b.deinit();
+    try b.add("a", "v");
+    const got = b.finish();
+
+    // entry: shared=0 non_shared=1 value_len=1 'a' 'v'
+    // restart array: [0] ; restart count: 1
+    const want = [_]u8{
+        0x00, 0x01, 0x01, 'a', 'v', // entry (offsets 0..4)
+        0x00, 0x00, 0x00, 0x00, // restart offset 0
+        0x01, 0x00, 0x00, 0x00, // num_restarts = 1
+    };
+    try testing.expectEqualSlices(u8, &want, got);
+}
+
+test "byte-exact: prefix-compressed two-entry block golden vector" {
+    const gpa = testing.allocator;
+    // restart_interval large enough that both entries are in one restart region.
+    var b = BlockBuilder.init(gpa, 10);
+    defer b.deinit();
+    try b.add("ab", "x");
+    try b.add("abc", "y"); // shares "ab" with previous
+    const got = b.finish();
+
+    const want = [_]u8{
+        0x00, 0x02, 0x01, 'a', 'b', 'x', // entry1: shared=0 non_shared=2 vlen=1
+        0x02, 0x01, 0x01, 'c', 'y', // entry2: shared=2 non_shared=1 vlen=1 delta='c'
+        0x00, 0x00, 0x00, 0x00, // restart offset 0
+        0x01, 0x00, 0x00, 0x00, // num_restarts = 1
+    };
+    try testing.expectEqualSlices(u8, &want, got);
+}
+
+test "iterate handles empty values and many restarts" {
+    const gpa = testing.allocator;
+    const pairs = [_]KV{
+        .{ .k = "k1", .v = "" },
+        .{ .k = "k2", .v = "" },
+        .{ .k = "k3", .v = "value3" },
+        .{ .k = "k4", .v = "" },
+    };
+    const data = try buildBlock(gpa, 1, &pairs); // restart_interval=1 -> every entry a restart
+    defer gpa.free(data);
+
+    const block = try Block.init(gpa, data);
+    try testing.expectEqual(@as(u32, 4), block.num_restarts);
+
+    var iter = block.iterator(comparator.bytewise);
+    defer iter.deinit();
+
+    var i: usize = 0;
+    iter.seekToFirst();
+    while (iter.valid()) : (iter.next()) {
+        try testing.expectEqualStrings(pairs[i].k, iter.key());
+        try testing.expectEqualStrings(pairs[i].v, iter.value());
+        i += 1;
+    }
+    try testing.expectEqual(pairs.len, i);
+
+    // seek with every-entry-a-restart still works via binary search.
+    iter.seek("k3");
+    try testing.expect(iter.valid());
+    try testing.expectEqualStrings("k3", iter.key());
+    try testing.expectEqualStrings("value3", iter.value());
 }
