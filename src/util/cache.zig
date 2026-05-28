@@ -136,16 +136,23 @@ const Shard = struct {
         }
     }
 
-    /// Detach `e` from the hash table and LRU list, drop usage and the in-cache
-    /// reference. The storage is freed once the last handle (if any) is gone.
-    fn removeFromCache(self: *Shard, e: *Entry) void {
+    /// Finish detaching an entry that is ALREADY removed from the hash table:
+    /// unlink it from the LRU list (if present), drop the shard usage, clear
+    /// `in_cache`, and drop the in-cache reference. The storage is freed once
+    /// the last outstanding handle (if any) is released.
+    fn detach(self: *Shard, e: *Entry) void {
         std.debug.assert(e.in_cache);
-        // Remove from LRU list only if it is currently on it (refs == 1).
+        // On the LRU list only when evictable (refs == 1).
         if (e.refs == 1) self.lruRemove(e);
-        _ = self.table.remove(e.key);
         self.usage -= e.charge;
         e.in_cache = false;
         self.unref(e); // drop the in-cache reference
+    }
+
+    /// Remove `e` from the hash table and detach it.
+    fn removeFromCache(self: *Shard, e: *Entry) void {
+        _ = self.table.remove(e.key);
+        self.detach(e);
     }
 
     fn insert(self: *Shard, key: []const u8, val: []u8, charge: usize) !*Entry {
@@ -167,13 +174,7 @@ const Shard = struct {
 
         // If an entry already exists under this key, evict it first so the new
         // value wins (LevelDB does the same).
-        if (self.table.fetchRemove(key)) |old| {
-            const old_e = old.value;
-            if (old_e.refs == 1) self.lruRemove(old_e);
-            self.usage -= old_e.charge;
-            old_e.in_cache = false;
-            self.unref(old_e);
-        }
+        if (self.table.fetchRemove(key)) |old| self.detach(old.value);
 
         try self.table.put(self.gpa, key_dup, e);
         self.usage += charge;
