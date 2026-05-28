@@ -4,13 +4,13 @@ zig_binary: /home/ghpu/zig/zig
 stdlib: /home/ghpu/zig/lib/std
 target_rocksdb: "9.x line; block-based table format_version 5; legacy WAL/MANIFEST log (see docs/adr/000-target-format.md)"
 active_phase: P7
-active_milestone: "M7.5 DeleteRange (range tombstones, sequential)"
-last_completed: M7.3 Universal + FIFO compaction
-worktrees: "m7.5-delete-range"
+active_milestone: "M7.6 Transactions (optimistic + pessimistic, sequential)"
+last_completed: M7.5 DeleteRange (range tombstones)
+worktrees: "m7.6-transactions"
 test_command: "/home/ghpu/zig/zig build test"
-test_count: 338
+test_count: 356
 artifacts: "zig build -> zig-out/lib/libzrocks.a + zig-out/bin/zrocks (CLI). CLI verified end-to-end (put/get/scan/bench, durable across processes)."
-updated: 2026-05-28
+updated: 2026-05-29
 ---
 
 # zrocks Development State
@@ -69,8 +69,8 @@ RocksDB reference: https://github.com/facebook/rocksdb/wiki
 - [x] M7.2 Prefix bloom & prefix seek  (src/rocks/prefix.zig)
 - [x] M7.3 Universal + FIFO compaction  (src/options.zig + db/compaction.zig + db.zig)
 - [x] M7.4 CompactionFilter             (src/rocks/compaction_filter.zig)
-- [~] M7.5 DeleteRange (range tombstones)  <-- ACTIVE
-- [ ] M7.6 Transactions (optimistic + pessimistic)
+- [x] M7.5 DeleteRange (range tombstones)  (src/rocks/delete_range.zig + multi-file)
+- [~] M7.6 Transactions (optimistic + pessimistic)  <-- ACTIVE
 - [x] M7.7 Checkpoints                (src/rocks/checkpoint.zig)
 - [ ] (revisit) RocksDB real-DB read-interop gate (now feasible: SST read path + manifest exist; needs RocksDB kNewFile4 manifest tag + full-filter format)
 
