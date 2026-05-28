@@ -645,3 +645,102 @@ test "table reader: single small block round-trips" {
     }
     try testing.expectEqual(pairs.len, idx);
 }
+
+const cache_mod = @import("../util/cache.zig");
+
+test "table reader: optional block cache yields identical results and hits on reread" {
+    const gpa = testing.allocator;
+
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    const opts = options_mod.Options{ .block_size = 200, .block_restart_interval = 4 };
+    const policy = bloom.BloomFilterPolicy.init(10);
+
+    var entries = try makeSortedEntries(gpa, 50);
+    defer freeEntries(gpa, &entries);
+
+    try buildTable(gpa, e, "cache.sst", opts, policy, entries.items);
+
+    const file_size = try e.getFileSize("cache.sst");
+
+    // ---- Baseline: no-cache reference results (full scan) ----------------
+    var ref: std.ArrayListUnmanaged(KV) = .empty;
+    defer {
+        for (ref.items) |kv| {
+            gpa.free(kv.k);
+            gpa.free(kv.v);
+        }
+        ref.deinit(gpa);
+    }
+    {
+        var raf = try e.newRandomAccessFile(gpa, "cache.sst");
+        defer raf.close() catch {};
+        var table = try Table.open(gpa, raf, file_size, opts, policy, null, 0);
+        defer table.deinit();
+        var it = table.iterator(gpa);
+        defer it.deinit();
+        it.seekToFirst();
+        while (it.valid()) : (it.next()) {
+            try ref.append(gpa, .{
+                .k = try gpa.dupe(u8, it.key()),
+                .v = try gpa.dupe(u8, it.value()),
+            });
+        }
+        try testing.expect(it.status() == null);
+    }
+
+    // ---- Cached: same results, and hits on reread ------------------------
+    var cache = cache_mod.Cache.init(gpa, 1 << 20);
+    defer cache.deinit();
+
+    var raf = try e.newRandomAccessFile(gpa, "cache.sst");
+    defer raf.close() catch {};
+    var table = try Table.open(gpa, raf, file_size, opts, policy, &cache, 7);
+    defer table.deinit();
+
+    // First scan: populates the cache (misses).
+    {
+        var it = table.iterator(gpa);
+        defer it.deinit();
+        var idx: usize = 0;
+        it.seekToFirst();
+        while (it.valid()) : (it.next()) {
+            try testing.expect(idx < ref.items.len);
+            try testing.expectEqualStrings(ref.items[idx].k, it.key());
+            try testing.expectEqualStrings(ref.items[idx].v, it.value());
+            idx += 1;
+        }
+        try testing.expectEqual(ref.items.len, idx);
+        try testing.expect(it.status() == null);
+    }
+    try testing.expect(cache.totalCharge() > 0);
+
+    const hits_before = cache.hits;
+
+    // Second scan: same blocks -> cache hits, identical results.
+    {
+        var it = table.iterator(gpa);
+        defer it.deinit();
+        var idx: usize = 0;
+        it.seekToFirst();
+        while (it.valid()) : (it.next()) {
+            try testing.expectEqualStrings(ref.items[idx].k, it.key());
+            try testing.expectEqualStrings(ref.items[idx].v, it.value());
+            idx += 1;
+        }
+        try testing.expectEqual(ref.items.len, idx);
+    }
+    try testing.expect(cache.hits > hits_before);
+
+    // Point gets from the same blocks also identical + serviced from cache.
+    const hits_before_get = cache.hits;
+    for (entries.items) |kv| {
+        const got = try table.get(gpa, kv.k);
+        try testing.expect(got != null);
+        defer gpa.free(got.?);
+        try testing.expectEqualStrings(kv.v, got.?);
+    }
+    try testing.expect(cache.hits > hits_before_get);
+}
