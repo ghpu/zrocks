@@ -1,9 +1,13 @@
-//! db.zig — the in-memory embedded key/value store (M4.1).
+//! db.zig — the embedded key/value store (M4.1 store + M5.2 durability).
 //!
 //! Ties the building blocks into a usable DB: a single MemTable behind a
 //! write-ahead log, with snapshot-aware point lookups and a tombstone-hiding
-//! forward iterator.  No persistence/recovery (Phase 5) and no flush to SST /
-//! compaction (Phase 6) yet.
+//! forward iterator.  `open` recovers durable state: a VersionSet reconstructs
+//! the MANIFEST/CURRENT and the active WAL is replayed into the MemTable, then
+//! that SAME log is reused for new appends so committed writes survive reopen
+//! (the "reuse-logs" design).  No flush to SST / immutable memtable / compaction
+//! (Phase 6) yet — recovered data lives in the single MemTable kept durable by
+//! the reused log.
 //!
 //! Single source for reads (the live MemTable).  `newIterator` wraps the
 //! memtable's internal iterator behind the generic `iterator.Iterator` and then
