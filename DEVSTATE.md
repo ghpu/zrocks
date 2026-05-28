@@ -3,13 +3,12 @@ project: zrocks
 zig_binary: /home/ghpu/zig/zig
 stdlib: /home/ghpu/zig/lib/std
 target_rocksdb: "9.x line; block-based table format_version 5; legacy WAL/MANIFEST log (see docs/adr/000-target-format.md)"
-active_phase: P1
-active_milestone: M1.0
-last_completed: M0.0–M0.6 (Phase 0 foundation COMPLETE)
-branch: milestone/m1.0-env
-worktree: /home/ghpu/projets/zig/zrocks-wt/m1.0-env
+active_phase: P2
+active_milestone: "M2.0 InternalKey, M2.2 WAL, M2.3 Skiplist (parallel wave 1)"
+last_completed: M1.0 Env (Phase 1 COMPLETE)
+worktrees: "m2.0-internal-key, m2.2-wal, m2.3-skiplist (see `git worktree list`)"
 test_command: "/home/ghpu/zig/zig build test"
-test_count: 98
+test_count: 100
 updated: 2026-05-28
 ---
 
@@ -30,7 +29,7 @@ RocksDB reference: https://github.com/facebook/rocksdb/wiki
 - [x] M0.6 CRC32C                     (merged 352d647)
 
 ### Phase 1 — Environment
-- [~] M1.0 Env over std.Io (+ MemEnv)  <-- ACTIVE
+- [x] M1.0 Env over std.Io (+ MemEnv)  (merged; src/env/{env,real_env,mem_env}.zig)
 
 ### Phase 2 — Write durability core
 - [ ] M2.0 InternalKey
@@ -72,20 +71,16 @@ RocksDB reference: https://github.com/facebook/rocksdb/wiki
 - [ ] M7.6 Transactions (optimistic + pessimistic)
 - [ ] M7.7 Checkpoints
 
-## Active milestone: M1.0 — Env (filesystem over std.Io) + MemEnv
-- TDD state: in progress (Opus subagent in worktree milestone/m1.0-env)
-- Files in flight: src/env/env.zig (+ possibly src/env/mem_env.zig)
-- Architectural: isolates ALL 0.16 std.Io filesystem churn behind one capability interface
-  (Env + WritableFile/SequentialFile/RandomAccessFile vtable handles); real OS env + MemEnv
-  test double share one contract test.
-- Acceptance checklist:
-  - [ ] MemEnv passes the env contract (write/sync/read seq+random/rename/delete/size/notfound)
-  - [ ] RealEnv passes the same contract against a temp dir, via std.Io.Threaded io
-  - [ ] all FS through std.Io (no std.fs.*); zero leaks
+## Active: Phase 2 — Write durability core (wave 1, parallel)
+- M2.0 InternalKey (S) — depends on coding + comparator. New: src/format/internal_key.zig.
+- M2.2 WAL (O) — depends on Env + crc32c + coding. New: src/format/log_format.zig, log_writer.zig, log_reader.zig. Byte-compatible legacy log (see docs/format/wal.md).
+- M2.3 Skiplist (O) — depends on Arena + Comparator. New: src/memtable/skiplist.zig.
+- These three are independent (distinct files); run in parallel worktrees, each verifying standalone via `zig test <file>`, root.zig wired at merge.
 
 ## Next steps (ordered)
-1. Integrate M1.0 when the subagent finishes: merge → wire src/env into root.zig → `zig build test` → update this file → remove worktree. Capture the exact std.Io/Dir/File signatures it used into the gotchas list below for reuse.
-2. Phase 2 — Write durability core. Likely-parallel batch: M2.0 InternalKey (S) and M2.1 WriteBatch (S, depends on M2.0) on coding; M2.2 WAL (O, depends on Env+crc32c); M2.3 Skiplist (O, depends on Arena+Comparator); M2.4 MemTable (O, depends on Skiplist+InternalKey). Order: M2.0→M2.1 serial; M2.2/M2.3 can parallel after Env; M2.4 after M2.3+M2.0.
+1. Dispatch wave 1 {M2.0, M2.2, M2.3}; integrate as each lands.
+2. Wave 2 (after M2.0 + M2.3 merged): M2.1 WriteBatch (S, needs M2.0), M2.4 MemTable (O, needs M2.3 + M2.0). Parallel with each other.
+3. Phase 2 done → Phase 3 (block-based SST table).
 
 ## Decision log (ADR pointers)
 - ADR-000: RocksDB format target pinned (format_version 5 SST, legacy WAL/MANIFEST, CRC32C mask). docs/adr/000-target-format.md
@@ -103,3 +98,11 @@ RocksDB reference: https://github.com/facebook/rocksdb/wiki
 8. Build module-first: addExecutable/addTest/addLibrary take root_module: *Module. .zon .name & .fingerprint are enum literals.
 9. CRC32C = std.hash.crc.Crc32Iscsi (not Crc32) + RocksDB mask.
 10. std.Io.Reader/Writer have no takeInt/writeInt — combine with std.mem. Varint hand-rolled (NOT std.leb128).
+
+### std.Io filesystem signatures (verified in M1.0 — use via the Env capability, src/env/env.zig)
+- Obtain io: `std.Io.Threaded.init(gpa, opts)` then `.io()`; `.deinit()` to tear down. Tests: global `std.testing.io` + `std.testing.tmpDir(.{})` (cleanup with `defer tmp.cleanup()`).
+- Dir (io is 2nd arg EXCEPT rename): `Dir.cwd()`; `createFile(dir, io, sub_path, CreateFileOptions{.truncate=true,...})`; `openFile(dir, io, sub_path, OpenFileOptions{.mode=.read_only|.write_only|.read_write})`; `openDir/createDir/createDirPath(dir, io, sub_path, ...)`; `deleteFile(dir, io, sub_path)`; `statFile(dir, io, sub_path, .{}) -> Stat{.size:u64}` (error.FileNotFound); `deleteTree(dir, io, sub_path)`.
+- **`Dir.rename(old_dir, old_sub_path, new_dir, new_sub_path, io)` — io is the LAST arg (gotcha). Same-dir atomic rename: pass root for both dirs.**
+- File positional I/O (no pread/pwrite/fsync): `writePositionalAll(file, io, bytes, offset)`; `readPositionalAll(file, io, buf, offset) -> usize` (short/0 read = EOF); `sync(file, io)` (fsync); `close(file, io)`; `stat(file, io)`. Lower-level `read/writePositional` take iovec `[]const []u8`.
+- Errors are large platform unions (OpenError ~25, RenameError ~18) — map down via small switches. Env maps to `env.Error{NotFound,AlreadyExists,IoError,PermissionDenied,NotSupported} || Allocator.Error`.
+- Env interface convention: file handles are vtable structs `{ptr,vtable}` (WritableFile.append/flush/sync/close, SequentialFile.read/skip/close, RandomAccessFile.readAt/close). NOTE for WAL: RealWritable.append currently does one writePositionalAll per call with no userspace buffer (flush is a no-op) — WAL layer should buffer 32KB blocks itself.

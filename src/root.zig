@@ -14,6 +14,9 @@ pub const arena = @import("util/arena.zig");
 pub const crc32c = @import("util/crc32c.zig");
 pub const options = @import("options.zig");
 
+// Environment / filesystem capability (Phase 1).
+pub const env = @import("env/env.zig");
+
 test "version constant" {
     try std.testing.expectEqualStrings("0.0.0", version);
 }
