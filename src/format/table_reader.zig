@@ -836,6 +836,93 @@ test "table reader: prefix bloom — no false negatives, prunes absent prefixes,
     }
 }
 
+// ===========================================================================
+// M7.5 — range-del meta block: builder writes it, reader parses it back.
+// ===========================================================================
+
+test "M7.5: range tombstones round-trip through the SST range-del meta block" {
+    const gpa = testing.allocator;
+
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    var ikc = internal_key.InternalKeyComparator{ .user = comparator.bytewise };
+    const opts = options_mod.Options{ .comparator = ikc.comparatorInterface() };
+    const policy = bloom.BloomFilterPolicy.init(10);
+
+    // Build a table with a couple of point keys AND two range tombstones.
+    {
+        var wf = try e.newWritableFile(gpa, "rd.sst");
+        errdefer wf.close() catch {};
+        var tb = try TableBuilder.init(gpa, opts, wf, policy);
+        defer tb.deinit();
+
+        const a = try encodeIkey(gpa, "a", 1);
+        defer gpa.free(a);
+        const m = try encodeIkey(gpa, "m", 2);
+        defer gpa.free(m);
+        try tb.add(a, "av");
+        try tb.add(m, "mv");
+
+        try tb.addRangeTombstone("b", "d", 10);
+        try tb.addRangeTombstone("f", "h", 20);
+
+        try tb.finish();
+        try wf.close();
+    }
+
+    const file_size = try e.getFileSize("rd.sst");
+    var raf = try e.newRandomAccessFile(gpa, "rd.sst");
+    defer raf.close() catch {};
+
+    var table = try Table.open(gpa, raf, file_size, opts, policy, null, 0);
+    defer table.deinit();
+
+    var rtl = try table.rangeTombstones(gpa);
+    defer rtl.deinit();
+    try testing.expectEqual(@as(usize, 2), rtl.count());
+    try testing.expectEqualStrings("b", rtl.tombstones.items[0].begin);
+    try testing.expectEqualStrings("d", rtl.tombstones.items[0].end);
+    try testing.expectEqual(@as(u64, 10), rtl.tombstones.items[0].seq);
+    try testing.expectEqualStrings("f", rtl.tombstones.items[1].begin);
+    try testing.expectEqualStrings("h", rtl.tombstones.items[1].end);
+    try testing.expectEqual(@as(u64, 20), rtl.tombstones.items[1].seq);
+
+    // The point keys still read back normally.
+    {
+        const ik = try encodeIkey(gpa, "a", 1);
+        defer gpa.free(ik);
+        const got = try table.get(gpa, ik) orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings("av", got);
+    }
+}
+
+test "M7.5: a table with no range tombstones returns an empty list" {
+    const gpa = testing.allocator;
+
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    const opts = options_mod.Options{};
+    const policy = bloom.BloomFilterPolicy.init(10);
+
+    const pairs = [_]KV{ .{ .k = "alpha", .v = "1" }, .{ .k = "beta", .v = "2" } };
+    try buildTable(gpa, e, "nordsst.sst", opts, policy, &pairs);
+
+    const file_size = try e.getFileSize("nordsst.sst");
+    var raf = try e.newRandomAccessFile(gpa, "nordsst.sst");
+    defer raf.close() catch {};
+    var table = try Table.open(gpa, raf, file_size, opts, policy, null, 0);
+    defer table.deinit();
+
+    var rtl = try table.rangeTombstones(gpa);
+    defer rtl.deinit();
+    try testing.expect(rtl.isEmpty());
+}
+
 test "table reader: optional block cache yields identical results and hits on reread" {
     const gpa = testing.allocator;
 

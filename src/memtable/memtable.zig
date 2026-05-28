@@ -456,6 +456,30 @@ test "golden: entry encoding for (seq=1, value, foo, bar)" {
     try testing.expectEqualStrings("bar", it.value());
 }
 
+test "M7.5: add with range_deletion records a tombstone (key=begin, value=end)" {
+    const gpa = testing.allocator;
+    const mt = try MemTable.init(gpa, comparator.bytewise);
+    defer mt.deinit();
+
+    try mt.add(7, .range_deletion, "b", "d");
+
+    try testing.expectEqual(@as(usize, 1), mt.range_tombstones.count());
+    const t = mt.range_tombstones.tombstones.items[0];
+    try testing.expectEqualStrings("b", t.begin);
+    try testing.expectEqualStrings("d", t.end);
+    try testing.expectEqual(@as(u64, 7), t.seq);
+
+    // A range tombstone does NOT create a point entry in the skiplist; an
+    // unrelated point put is the only skiplist entry.
+    try mt.add(8, .value, "c", "cv");
+    {
+        var lk = try LookupKey.init(gpa, "c", 100);
+        defer lk.deinit(gpa);
+        const r = mt.get(lk) orelse return error.TestExpectedFound;
+        try testing.expectEqualStrings("cv", r.found);
+    }
+}
+
 test "LookupKey: layout — memtableKey, internalKey, userKey" {
     const gpa = testing.allocator;
     var lk = try LookupKey.init(gpa, "foo", 5);

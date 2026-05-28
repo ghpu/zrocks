@@ -438,3 +438,59 @@ test "byteSize reflects rep length" {
     // header(12) + type(1) + varint(1)+'k'(1) + varint(1)+'v'(1) = 17
     try std.testing.expectEqual(@as(usize, 17), wb.byteSize());
 }
+
+// ---------------------------------------------------------------------------
+// M7.5 — DeleteRange (range tombstones)
+// ---------------------------------------------------------------------------
+
+test "M7.5 golden bytes: deleteRange(b, d) produces type 0x0F wire encoding" {
+    const gpa = std.testing.allocator;
+    var wb = try WriteBatch.init(gpa);
+    defer wb.deinit(gpa);
+
+    try wb.deleteRange(gpa, "b", "d");
+
+    // seq=0 (8B), count=1 (4B), 0x0F, varint32(1)+"b", varint32(1)+"d".
+    const expected = [_]u8{
+        0, 0, 0, 0, 0, 0, 0, 0, // seq=0 fixed64 LE
+        1, 0, 0, 0, // count=1 fixed32 LE
+        0x0F, // ValueType.range_deletion
+        0x01, 'b',
+        0x01, 'd',
+    };
+    try std.testing.expectEqualSlices(u8, &expected, wb.contents());
+}
+
+test "M7.5 iterate: deleteRange handler called with begin + end" {
+    const gpa = std.testing.allocator;
+    var wb = try WriteBatch.init(gpa);
+    defer wb.deinit(gpa);
+
+    try wb.put(gpa, "p", "pv");
+    try wb.deleteRange(gpa, "b", "d");
+
+    const Handler = struct {
+        n_put: usize = 0,
+        n_range: usize = 0,
+        last_begin: []const u8 = "",
+        last_end: []const u8 = "",
+
+        pub fn put(self: *@This(), _: []const u8, _: []const u8) !void {
+            self.n_put += 1;
+        }
+        pub fn delete(_: *@This(), _: []const u8) !void {}
+        pub fn merge(_: *@This(), _: []const u8, _: []const u8) !void {}
+        pub fn deleteRange(self: *@This(), begin: []const u8, end: []const u8) !void {
+            self.n_range += 1;
+            self.last_begin = begin;
+            self.last_end = end;
+        }
+    };
+
+    var h = Handler{};
+    try wb.iterate(&h);
+    try std.testing.expectEqual(@as(usize, 1), h.n_put);
+    try std.testing.expectEqual(@as(usize, 1), h.n_range);
+    try std.testing.expectEqualStrings("b", h.last_begin);
+    try std.testing.expectEqualStrings("d", h.last_end);
+}

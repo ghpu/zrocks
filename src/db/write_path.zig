@@ -96,3 +96,38 @@ test "insertBatch assigns per-record sequences and applies puts/deletes" {
         try std.testing.expectEqualStrings("1", r.found);
     }
 }
+
+test "M7.5 insertBatch records a range tombstone in the memtable's list" {
+    const gpa = std.testing.allocator;
+    const mem = try MemTable.init(gpa, comparator.bytewise);
+    defer mem.deinit();
+
+    var wb = try WriteBatch.init(gpa);
+    defer wb.deinit(gpa);
+    try wb.put(gpa, "a", "1"); // seq 10
+    try wb.deleteRange(gpa, "b", "d"); // seq 11
+    try wb.put(gpa, "e", "5"); // seq 12
+
+    try insertBatch(mem, &wb, 10);
+
+    // The tombstone landed in the memtable's range-tombstone list at seq 11.
+    try std.testing.expectEqual(@as(usize, 1), mem.range_tombstones.count());
+    const t = mem.range_tombstones.tombstones.items[0];
+    try std.testing.expectEqualStrings("b", t.begin);
+    try std.testing.expectEqualStrings("d", t.end);
+    try std.testing.expectEqual(@as(u64, 11), t.seq);
+
+    // Point puts still applied with their own sequences.
+    {
+        var lk = try LookupKey.init(gpa, "a", 100);
+        defer lk.deinit(gpa);
+        const r = mem.get(lk) orelse return error.TestExpectedFound;
+        try std.testing.expectEqualStrings("1", r.found);
+    }
+    {
+        var lk = try LookupKey.init(gpa, "e", 100);
+        defer lk.deinit(gpa);
+        const r = mem.get(lk) orelse return error.TestExpectedFound;
+        try std.testing.expectEqualStrings("5", r.found);
+    }
+}
