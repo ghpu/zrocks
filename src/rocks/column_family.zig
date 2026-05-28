@@ -162,7 +162,7 @@ pub const CfDB = struct {
         } else {
             // ----- fresh multi-CF database ---------------------------------
             // 1. Create the default CF (id 0) sub-LSM + persist CF_LIST.
-            try self.addCf("default"); // assigns id 0
+            try self.addCf("default", 0); // the default CF is always id 0
             try self.writeCfList(cf_list_path);
 
             // 2. Open a fresh shared WAL.
@@ -203,30 +203,12 @@ pub const CfDB = struct {
         return std.fmt.allocPrint(self.gpa, "{s}/{s}", .{ self.dbroot, name });
     }
 
-    /// Create + register a new CF named `name`, opening its sub-LSM `*DB` rooted
-    /// at `<dbroot>/<name>/` (recovering it if its MANIFEST already exists).
-    /// Assigns the next id.  Does NOT persist CF_LIST (callers batch that).
-    fn addCf(self: *CfDB, name: []const u8) !void {
-        const owned_name = try self.gpa.dupe(u8, name);
-        errdefer self.gpa.free(owned_name);
-
-        const dir = try self.cfDir(name);
-        defer self.gpa.free(dir);
-
-        const sub = try DB.openCf(self.gpa, self.env, dir, self.options);
-        errdefer sub.close();
-
-        const cf = try self.gpa.create(ColumnFamily);
-        errdefer self.gpa.destroy(cf);
-        cf.* = .{ .id = self.next_cf_id, .name = owned_name, .db = sub };
-
-        try self.cfs.put(self.gpa, owned_name, cf);
-        self.next_cf_id += 1;
-    }
-
-    /// Register a CF with an explicit id (used by CF_LIST reload so ids round-trip
-    /// exactly).  Bumps `next_cf_id` past `id`.
-    fn addCfWithId(self: *CfDB, name: []const u8, id: u32) !void {
+    /// Create + register a CF named `name` with id `id`, opening its sub-LSM
+    /// `*DB` rooted at `<dbroot>/<name>/` (recovering it if its MANIFEST already
+    /// exists).  Bumps `next_cf_id` past `id`.  Does NOT persist CF_LIST (callers
+    /// batch that).  `createColumnFamily` passes the next free id; the CF_LIST
+    /// reload passes the persisted id so ids round-trip exactly.
+    fn addCf(self: *CfDB, name: []const u8, id: u32) !void {
         const owned_name = try self.gpa.dupe(u8, name);
         errdefer self.gpa.free(owned_name);
 
@@ -251,11 +233,8 @@ pub const CfDB = struct {
         _ = options; // per-CF options divergence is a non-goal for M7.0.
         if (self.cfs.contains(name)) return error.ColumnFamilyExists;
 
-        try self.addCf(name);
-
-        const cf_list_path = try filename.cfListFileName(self.gpa, self.dbroot);
-        defer self.gpa.free(cf_list_path);
-        try self.writeCfList(cf_list_path);
+        try self.addCf(name, self.next_cf_id);
+        try self.persistCfList();
 
         const cf = self.cfs.get(name).?;
         return cf.handle();
@@ -275,9 +254,7 @@ pub const CfDB = struct {
         self.gpa.free(cf.name);
         self.gpa.destroy(cf);
 
-        const cf_list_path = try filename.cfListFileName(self.gpa, self.dbroot);
-        defer self.gpa.free(cf_list_path);
-        try self.writeCfList(cf_list_path);
+        try self.persistCfList();
     }
 
     /// The always-present default column family (id 0, name "default").
@@ -305,6 +282,13 @@ pub const CfDB = struct {
     // space, name).  The default CF is always present.  Rewritten on each
     // create/drop.  (RocksDB tracks CF identity in its single MANIFEST; we keep a
     // separate sidecar file because our per-CF MANIFESTs are independent.)
+
+    /// Rewrite `<dbroot>/CF_LIST` from the live CF map (after a create/drop).
+    fn persistCfList(self: *CfDB) !void {
+        const path = try filename.cfListFileName(self.gpa, self.dbroot);
+        defer self.gpa.free(path);
+        try self.writeCfList(path);
+    }
 
     fn writeCfList(self: *CfDB, path: []const u8) !void {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -353,7 +337,7 @@ pub const CfDB = struct {
             const id = std.fmt.parseInt(u32, trimmed[0..sp], 10) catch return error.Corruption;
             const name = std.mem.trim(u8, trimmed[sp + 1 ..], " \t\r");
             if (name.len == 0) return error.Corruption;
-            try self.addCfWithId(name, id);
+            try self.addCf(name, id);
         }
 
         // The default CF must always exist after a reload.
