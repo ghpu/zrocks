@@ -746,10 +746,15 @@ test "table builder: multi-block round-trip via Table.open (RocksDB-form), trail
         it.seek("rocksdb.properties");
         try testing.expect(it.valid());
         try testing.expectEqualStrings("rocksdb.properties", it.key());
-        // No legacy block-based filter entry: filters are not written here.
+        // No legacy block-based filter entry: the block-based bloom WRITE path
+        // is dropped (filter-rocksdb-only).  A FastLocalBloom full filter is
+        // written instead, under "fullfilter."++policy.name().
         it.seek("filter.leveldb.BuiltinBloomFilter2");
-        const has_filter = it.valid() and comparator.bytewise.compare(it.key(), "filter.leveldb.BuiltinBloomFilter2") == .eq;
-        try testing.expect(!has_filter);
+        const has_block_filter = it.valid() and comparator.bytewise.compare(it.key(), "filter.leveldb.BuiltinBloomFilter2") == .eq;
+        try testing.expect(!has_block_filter);
+        it.seek("fullfilter.leveldb.BuiltinBloomFilter2");
+        const has_full_filter = it.valid() and comparator.bytewise.compare(it.key(), "fullfilter.leveldb.BuiltinBloomFilter2") == .eq;
+        try testing.expect(has_full_filter);
     }
 
     // ---- Round-trip every entry + a full ordered scan through Table.open --
@@ -776,6 +781,78 @@ test "table builder: multi-block round-trip via Table.open (RocksDB-form), trail
         idx += 1;
     }
     try testing.expectEqual(entries.items.len, idx);
+}
+
+test "table builder: every SST carries a functional FastLocalBloom full filter (no false negatives)" {
+    // filter-rocksdb-only: `finish` writes a FastLocalBloom full filter under
+    // "fullfilter."++policy.name() in EVERY SST, regardless of the (now-removed)
+    // filter_mode.  The filter must report may-match for every inserted internal
+    // key (no false negatives) and prune at least one obviously-absent key.
+    const gpa = testing.allocator;
+
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    var ikc = internal_key.InternalKeyComparator{ .user = comparator.bytewise };
+    const opts = options_mod.Options{
+        .comparator = ikc.comparatorInterface(),
+        .block_size = 64, // several data blocks
+        .block_restart_interval = 4,
+    };
+    const policy = bloom.BloomFilterPolicy.init(10);
+
+    const users = [_][]const u8{ "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel" };
+    var ikeys: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (ikeys.items) |k| gpa.free(k);
+        ikeys.deinit(gpa);
+    }
+    {
+        var wf = try e.newWritableFile(gpa, "ff.sst");
+        errdefer wf.close() catch {};
+        var tb = try TableBuilder.init(gpa, opts, wf, policy);
+        defer tb.deinit();
+        for (users) |u| {
+            const ik = try gpa.alloc(u8, u.len + 8);
+            @memcpy(ik[0..u.len], u);
+            coding.encodeFixed64(ik[u.len..][0..8], internal_key.packSequenceAndType(1, .value));
+            try ikeys.append(gpa, ik);
+            try tb.add(ik, u);
+        }
+        try tb.finish();
+        try wf.close();
+    }
+
+    const file = try readAllFile(e, gpa, "ff.sst");
+    defer gpa.free(file);
+    const footer = try Footer.decodeFrom(file[file.len - footer_mod.kEncodedLength ..]);
+
+    // Locate the "fullfilter."++name metaindex entry, read the filter block, and
+    // verify the full-filter reader sees every inserted internal key.
+    const meta_contents = try readVerifiedBlock(file, footer.metaindex_handle);
+    const meta_blk = try block.Block.init(gpa, meta_contents);
+    var it = meta_blk.iterator(comparator.bytewise);
+    defer it.deinit();
+    it.seek("fullfilter.leveldb.BuiltinBloomFilter2");
+    try testing.expect(it.valid());
+    try testing.expectEqualStrings("fullfilter.leveldb.BuiltinBloomFilter2", it.key());
+
+    var hv: []const u8 = it.value();
+    const filter_handle = try BlockHandle.decodeFrom(&hv);
+    const filter_payload = try readVerifiedBlock(file, filter_handle);
+    var fr = full_filter.FullFilterReader.init(filter_payload);
+    try testing.expect(fr.valid);
+
+    for (ikeys.items) |ik| {
+        try testing.expect(fr.keyMayMatch(ik)); // no false negatives
+    }
+    // An obviously-absent internal key is pruned (not a hard guarantee, but the
+    // FP rate is ~1%, so a single distinctive key reliably prunes).
+    var absent: [13]u8 = undefined;
+    @memcpy(absent[0..5], "zzzzz");
+    coding.encodeFixed64(absent[5..][0..8], internal_key.packSequenceAndType(1, .value));
+    try testing.expect(!fr.keyMayMatch(&absent));
 }
 
 test "table builder: snappy data blocks — kSnappy trailer, CRC over compressed, handle = compressed size, decompresses to entries" {
