@@ -19,9 +19,13 @@
 //!   printf 'test { _ = @import("rocks/delete_range.zig"); }' > src/_verify.zig \
 //!     && zig test src/_verify.zig && rm src/_verify.zig
 //!
-//! TODO(perf): fragmented tombstone iterator (RocksDB's
-//! FragmentedRangeTombstoneList).  We keep whole, unfragmented tombstones and
-//! re-scan them linearly per query (correctness-first).
+//! `FragmentedRangeTombstoneList` (this file) is the perf read-side aggregator
+//! (frag-tombstone milestone): it fragments a possibly-overlapping set of
+//! tombstones into a sorted vector of NON-overlapping intervals, each carrying
+//! the descending list of seqs of the tombstones covering it.  A read then
+//! binary-searches for the fragment containing `user_key` (O(log n)) instead of
+//! re-scanning every tombstone (O(n)).  `covered`/`maxCoveringSeq` carry the
+//! same half-open / shadowing / visibility semantics as the linear list.
 
 const std = @import("std");
 
@@ -156,6 +160,177 @@ pub const RangeTombstoneList = struct {
     }
 };
 
+/// A single non-overlapping fragment of the tombstone landscape: the half-open
+/// user-key interval `[start, end)` plus the seqs (DESCENDING) of every original
+/// tombstone that covers this whole interval.
+pub const Fragment = struct {
+    /// Inclusive lower bound (user key).  Owned (duped) by the
+    /// FragmentedRangeTombstoneList so it is self-contained — the source
+    /// `RangeTombstoneList` may be freed after construction.
+    start: []const u8,
+    /// Exclusive upper bound (user key).  Owned like `start`.
+    end: []const u8,
+    /// Descending seqs of the tombstones covering `[start, end)`.  Index 0 is the
+    /// largest (newest) seq.  Owned by the FragmentedRangeTombstoneList.
+    seqs: []u64,
+};
+
+/// The fragmented, binary-searchable read-side aggregator (frag-tombstone).
+///
+/// Construction (`fromList`) sweeps all distinct boundary points of the input
+/// tombstones in user-key order; between two adjacent boundaries the covering
+/// set is constant, yielding one fragment per non-empty gap.  Fragments are
+/// stored sorted ascending by `start`, so `covered`/`maxCoveringSeq` binary
+/// search for the (unique) fragment whose interval contains the query key.
+///
+/// Self-contained: the per-fragment `start`/`end` key bytes and `seqs` arrays
+/// are all OWNED (allocated here, freed in `deinit`), so the source
+/// `RangeTombstoneList` may be freed immediately after `fromList` returns.
+pub const FragmentedRangeTombstoneList = struct {
+    gpa: std.mem.Allocator,
+    fragments: []Fragment,
+
+    /// Build the fragmented view from a (possibly overlapping) tombstone set.
+    /// Only tombstones with a non-degenerate `begin < end` (under `user_cmp`)
+    /// contribute.  The resulting fragments borrow `src`'s key bytes.
+    pub fn fromList(
+        gpa: std.mem.Allocator,
+        src: *const RangeTombstoneList,
+        user_cmp: comparator.Comparator,
+    ) !FragmentedRangeTombstoneList {
+        // 1. Collect every distinct boundary point (begin/end) of a valid range.
+        var points: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer points.deinit(gpa);
+        for (src.tombstones.items) |t| {
+            if (user_cmp.compare(t.begin, t.end) != .lt) continue; // degenerate
+            try points.append(gpa, t.begin);
+            try points.append(gpa, t.end);
+        }
+        if (points.items.len == 0) {
+            return .{ .gpa = gpa, .fragments = &[_]Fragment{} };
+        }
+
+        const Less = struct {
+            cmp: comparator.Comparator,
+            fn lessThan(ctx: @This(), a: []const u8, b: []const u8) bool {
+                return ctx.cmp.compare(a, b) == .lt;
+            }
+        };
+        std.mem.sort([]const u8, points.items, Less{ .cmp = user_cmp }, Less.lessThan);
+
+        // 2. For each adjacent distinct boundary pair [p_i, p_{i+1}) gather the
+        //    covering tombstones' seqs (descending).  Skip gaps no tombstone
+        //    covers (the covering set is empty between disjoint ranges).
+        var frags: std.ArrayListUnmanaged(Fragment) = .empty;
+        errdefer {
+            for (frags.items) |f| {
+                gpa.free(f.start);
+                gpa.free(f.end);
+                gpa.free(f.seqs);
+            }
+            frags.deinit(gpa);
+        }
+
+        var i: usize = 0;
+        while (i + 1 < points.items.len) : (i += 1) {
+            const lo = points.items[i];
+            const hi = points.items[i + 1];
+            if (user_cmp.compare(lo, hi) == .eq) continue; // duplicate boundary
+
+            var seqs: std.ArrayListUnmanaged(u64) = .empty;
+            errdefer seqs.deinit(gpa);
+            for (src.tombstones.items) |t| {
+                if (user_cmp.compare(t.begin, t.end) != .lt) continue;
+                // t covers [lo,hi) iff t.begin <= lo and hi <= t.end.
+                if (user_cmp.compare(t.begin, lo) == .gt) continue;
+                if (user_cmp.compare(hi, t.end) == .gt) continue;
+                try seqs.append(gpa, t.seq);
+            }
+            if (seqs.items.len == 0) {
+                seqs.deinit(gpa);
+                continue; // a hole — no tombstone here.
+            }
+            std.mem.sort(u64, seqs.items, {}, std.sort.desc(u64));
+            const owned_seqs = try seqs.toOwnedSlice(gpa);
+            errdefer gpa.free(owned_seqs);
+            // Own the boundary bytes so the source list may be freed afterwards.
+            const start = try gpa.dupe(u8, lo);
+            errdefer gpa.free(start);
+            const end = try gpa.dupe(u8, hi);
+            errdefer gpa.free(end);
+            try frags.append(gpa, .{ .start = start, .end = end, .seqs = owned_seqs });
+        }
+
+        return .{ .gpa = gpa, .fragments = try frags.toOwnedSlice(gpa) };
+    }
+
+    pub fn deinit(self: *FragmentedRangeTombstoneList) void {
+        for (self.fragments) |f| {
+            self.gpa.free(f.start);
+            self.gpa.free(f.end);
+            self.gpa.free(f.seqs);
+        }
+        self.gpa.free(self.fragments);
+    }
+
+    pub fn isEmpty(self: *const FragmentedRangeTombstoneList) bool {
+        return self.fragments.len == 0;
+    }
+
+    /// Number of non-overlapping fragments.
+    pub fn count(self: *const FragmentedRangeTombstoneList) usize {
+        return self.fragments.len;
+    }
+
+    /// Binary-search the fragment whose `[start, end)` contains `user_key`, or
+    /// null when no fragment covers it.
+    fn find(self: *const FragmentedRangeTombstoneList, user_key: []const u8, user_cmp: comparator.Comparator) ?*const Fragment {
+        var lo: usize = 0;
+        var hi: usize = self.fragments.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const f = &self.fragments[mid];
+            if (user_cmp.compare(user_key, f.start) == .lt) {
+                hi = mid; // key is left of this fragment.
+            } else if (user_cmp.compare(user_key, f.end) != .lt) {
+                lo = mid + 1; // key >= end → right of this fragment.
+            } else {
+                return f; // start <= key < end.
+            }
+        }
+        return null;
+    }
+
+    /// THE aggregator query (fragmented equivalent of
+    /// `RangeTombstoneList.covered`).  True iff the fragment containing
+    /// `user_key` holds a tombstone seq `s` with `value_seq < s <= snapshot`.
+    pub fn covered(
+        self: *const FragmentedRangeTombstoneList,
+        user_key: []const u8,
+        value_seq: u64,
+        snapshot: u64,
+        user_cmp: comparator.Comparator,
+    ) bool {
+        return self.maxCoveringSeq(user_key, snapshot, user_cmp) > value_seq;
+    }
+
+    /// The largest tombstone seq (visible at `snapshot`) covering `user_key`, or
+    /// 0 when none.  Fragmented equivalent of `RangeTombstoneList.maxCoveringSeq`.
+    pub fn maxCoveringSeq(
+        self: *const FragmentedRangeTombstoneList,
+        user_key: []const u8,
+        snapshot: u64,
+        user_cmp: comparator.Comparator,
+    ) u64 {
+        const f = self.find(user_key, user_cmp) orelse return 0;
+        // seqs is descending; the first <= snapshot is the largest visible one.
+        for (f.seqs) |s| {
+            if (s <= snapshot) return s;
+        }
+        return 0;
+    }
+};
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -253,4 +428,160 @@ test "covered: multiple tombstones, newest applicable wins coverage" {
     try testing.expect(list.covered("d", 19, 100, comparator.bytewise));
     // "d" with value seq 25 NOT covered.
     try testing.expect(!list.covered("d", 25, 100, comparator.bytewise));
+}
+
+// ---------------------------------------------------------------------------
+// FragmentedRangeTombstoneList
+// ---------------------------------------------------------------------------
+
+test "fragmented: empty list is empty, covers nothing" {
+    const gpa = testing.allocator;
+    var list = RangeTombstoneList.init(gpa);
+    defer list.deinit();
+
+    var frag = try FragmentedRangeTombstoneList.fromList(gpa, &list, comparator.bytewise);
+    defer frag.deinit();
+    try testing.expect(frag.isEmpty());
+    try testing.expect(!frag.covered("a", 0, 100, comparator.bytewise));
+    try testing.expectEqual(@as(u64, 0), frag.maxCoveringSeq("a", 100, comparator.bytewise));
+}
+
+test "fragmented: single tombstone, half-open coverage matches linear" {
+    const gpa = testing.allocator;
+    var list = RangeTombstoneList.init(gpa);
+    defer list.deinit();
+    try list.add("b", "d", 10);
+
+    var frag = try FragmentedRangeTombstoneList.fromList(gpa, &list, comparator.bytewise);
+    defer frag.deinit();
+
+    try testing.expectEqual(@as(usize, 1), frag.count());
+    try testing.expect(!frag.covered("a", 5, 100, comparator.bytewise)); // before begin
+    try testing.expect(frag.covered("b", 5, 100, comparator.bytewise)); // == begin
+    try testing.expect(frag.covered("c", 5, 100, comparator.bytewise)); // inside
+    try testing.expect(!frag.covered("d", 5, 100, comparator.bytewise)); // == end (exclusive)
+    try testing.expect(!frag.covered("e", 5, 100, comparator.bytewise)); // after end
+}
+
+test "fragmented: value-seq precedence and snapshot visibility" {
+    const gpa = testing.allocator;
+    var list = RangeTombstoneList.init(gpa);
+    defer list.deinit();
+    try list.add("a", "z", 10);
+
+    var frag = try FragmentedRangeTombstoneList.fromList(gpa, &list, comparator.bytewise);
+    defer frag.deinit();
+
+    try testing.expect(frag.covered("m", 9, 100, comparator.bytewise)); // 9 < 10
+    try testing.expect(!frag.covered("m", 10, 100, comparator.bytewise)); // ==10
+    try testing.expect(!frag.covered("m", 11, 100, comparator.bytewise)); // >10
+    try testing.expect(!frag.covered("m", 5, 9, comparator.bytewise)); // tomb not visible
+    try testing.expect(frag.covered("m", 5, 10, comparator.bytewise)); // visible at 10
+}
+
+test "fragmented: overlapping tombstones split into non-overlapping fragments" {
+    const gpa = testing.allocator;
+    var list = RangeTombstoneList.init(gpa);
+    defer list.deinit();
+    // [a,e)@5 and [c,g)@20 overlap on [c,e).  Boundaries: a c e g →
+    // fragments [a,c)@{5}, [c,e)@{20,5}, [e,g)@{20}.
+    try list.add("a", "e", 5);
+    try list.add("c", "g", 20);
+
+    var frag = try FragmentedRangeTombstoneList.fromList(gpa, &list, comparator.bytewise);
+    defer frag.deinit();
+
+    try testing.expectEqual(@as(usize, 3), frag.count());
+
+    // In the overlap, the newest covering seq (20) wins.
+    try testing.expectEqual(@as(u64, 20), frag.maxCoveringSeq("c", 100, comparator.bytewise));
+    try testing.expectEqual(@as(u64, 20), frag.maxCoveringSeq("d", 100, comparator.bytewise));
+    // Left-only fragment: only seq 5.
+    try testing.expectEqual(@as(u64, 5), frag.maxCoveringSeq("b", 100, comparator.bytewise));
+    // Right-only fragment: only seq 20.
+    try testing.expectEqual(@as(u64, 20), frag.maxCoveringSeq("f", 100, comparator.bytewise));
+    // Outside everything.
+    try testing.expectEqual(@as(u64, 0), frag.maxCoveringSeq("z", 100, comparator.bytewise));
+
+    // Snapshot below the newer tombstone in the overlap falls back to the older.
+    try testing.expectEqual(@as(u64, 5), frag.maxCoveringSeq("d", 10, comparator.bytewise));
+    try testing.expectEqual(@as(u64, 0), frag.maxCoveringSeq("f", 10, comparator.bytewise)); // 20 not visible
+}
+
+test "fragmented: disjoint ranges leave a hole (no spurious coverage)" {
+    const gpa = testing.allocator;
+    var list = RangeTombstoneList.init(gpa);
+    defer list.deinit();
+    try list.add("a", "c", 5);
+    try list.add("e", "g", 7);
+
+    var frag = try FragmentedRangeTombstoneList.fromList(gpa, &list, comparator.bytewise);
+    defer frag.deinit();
+
+    // Only [a,c) and [e,g) become fragments; [c,e) is a hole.
+    try testing.expectEqual(@as(usize, 2), frag.count());
+    try testing.expect(frag.covered("b", 0, 100, comparator.bytewise));
+    try testing.expect(!frag.covered("d", 0, 100, comparator.bytewise)); // in the hole
+    try testing.expect(frag.covered("f", 0, 100, comparator.bytewise));
+}
+
+test "fragmented: degenerate range (begin >= end) contributes nothing" {
+    const gpa = testing.allocator;
+    var list = RangeTombstoneList.init(gpa);
+    defer list.deinit();
+    try list.add("d", "b", 9); // degenerate
+    try list.add("b", "d", 10); // valid
+
+    var frag = try FragmentedRangeTombstoneList.fromList(gpa, &list, comparator.bytewise);
+    defer frag.deinit();
+    try testing.expectEqual(@as(usize, 1), frag.count());
+    try testing.expectEqual(@as(u64, 10), frag.maxCoveringSeq("c", 100, comparator.bytewise));
+}
+
+test "fragmented: random agreement with linear RangeTombstoneList" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xF7A6_70_B511);
+    const rand = prng.random();
+
+    var trial: usize = 0;
+    while (trial < 200) : (trial += 1) {
+        var list = RangeTombstoneList.init(gpa);
+        defer list.deinit();
+
+        const n = rand.uintLessThan(usize, 8);
+        var t: usize = 0;
+        while (t < n) : (t += 1) {
+            var a = rand.uintLessThan(u8, 16);
+            var b = rand.uintLessThan(u8, 16);
+            if (a > b) {
+                const tmp = a;
+                a = b;
+                b = tmp;
+            }
+            // Sometimes leave a == b degenerate to exercise the skip path.
+            const bb: [1]u8 = .{'a' + a};
+            const eb: [1]u8 = .{'a' + b};
+            const seq = 1 + rand.uintLessThan(u64, 30);
+            try list.add(&bb, &eb, seq);
+        }
+
+        var frag = try FragmentedRangeTombstoneList.fromList(gpa, &list, comparator.bytewise);
+        defer frag.deinit();
+
+        // Probe every user key and a spread of (value_seq, snapshot) pairs.
+        var k: u8 = 0;
+        while (k < 18) : (k += 1) {
+            const key: [1]u8 = .{'a' + k};
+            const snap = rand.uintLessThan(u64, 32);
+            const vseq = rand.uintLessThan(u64, 32);
+            try testing.expectEqual(
+                list.maxCoveringSeq(&key, snap, comparator.bytewise),
+                frag.maxCoveringSeq(&key, snap, comparator.bytewise),
+            );
+            try testing.expectEqual(
+                list.covered(&key, vseq, snap, comparator.bytewise),
+                frag.covered(&key, vseq, snap, comparator.bytewise),
+            );
+        }
+    }
 }
