@@ -137,8 +137,9 @@ pub const DB = struct {
 
         // SST reader cache for the current Version's files.  `self.name` is the
         // borrowed DB directory; `self` is pinned (heap-allocated) so the cache's
-        // internal comparator address stays stable.  No block cache wired yet.
-        self.table_cache = table_cache_mod.TableCache.init(gpa, e, self.name, options, null);
+        // internal comparator address stays stable.  Block cache is optional and
+        // is taken from Options.block_cache (may be null).
+        self.table_cache = table_cache_mod.TableCache.init(gpa, e, self.name, options, options.block_cache);
         errdefer self.table_cache.deinit();
 
         // Live snapshots start empty; populated by getSnapshot/releaseSnapshot.
@@ -241,7 +242,7 @@ pub const DB = struct {
         errdefer vs.deinit();
         self.versions = vs;
 
-        self.table_cache = table_cache_mod.TableCache.init(gpa, e, self.name, options, null);
+        self.table_cache = table_cache_mod.TableCache.init(gpa, e, self.name, options, options.block_cache);
         errdefer self.table_cache.deinit();
 
         self.snapshots = SnapshotList.init(gpa);
