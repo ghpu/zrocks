@@ -85,8 +85,8 @@ pub const ColumnFamilyHandle = struct {
 };
 
 /// Per-family LSM state: a stable id, an owned name, and the per-CF sub-LSM
-/// `*DB` rooted at `<dbroot>/<name>/` (opened via `DB.openCf`, sharing the
-/// CfDB's WAL + sequence space).
+/// `*DB` rooted at `<dbroot>/<name>/` (opened via `DB.openCfShared`, sharing
+/// the CfDB's WAL, sequence space, and ONE MANIFEST).
 const ColumnFamily = struct {
     id: u32,
     name: []u8, // owned
