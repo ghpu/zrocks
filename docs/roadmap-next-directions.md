@@ -31,3 +31,6 @@ Milestones touching any of **db.zig / compaction.zig / version_set.zig / write_b
 File: `src/version/table_cache.zig` only (no core-contended files, zero deps, effort S). Unblocks all obsolete-file GC.
 - Add `pub fn evict(self: *TableCache, file_number: u64) void`: `fetchRemove(file_number)` → on hit `entry.value.table.deinit(); entry.value.file.close() catch {}; gpa.destroy(entry.value);` (exact teardown order from the deinit loop); miss = no-op. Don't touch `findTable` insertion.
 - TDD: open 2 SSTs → evict one → count drops → re-`findTable` re-opens cleanly (no dangling state); evict-then-deleteFile → `findTable` returns `error.FileNotFound`; evict-uncached = no-op; zero leaks; full ~378-test suite stays green.
+
+## Execution result (2026-05-29)
+Executed via a gated sequential workflow: **26/27 milestones landed, suite 378 -> 508 tests, main always green**. The XL concurrency keystone (background flush+compaction workers, imm pinning, write stalls), shared-MANIFEST multi-CF, FastLocalBloom full-filter, XXPH3 hash, kNewFile4, Snappy, GC, and the interop self-consistency gate all merged. ONLY DEFERRED: `partitioned-idx` (Wave 9, explicitly OPTIONAL) — declined because byte-exact RocksDB fv5 partitioned index needs an out-of-scope base single-level-index format rework first; a self-consistent (non-byte-exact) two-level index remains possible later.
