@@ -49,6 +49,12 @@ const snappy = @import("../util/snappy.zig");
 
 const BlockHandle = footer_mod.BlockHandle;
 const Footer = footer_mod.Footer;
+const ChecksumType = footer_mod.ChecksumType;
+
+/// XOR multiplier RocksDB uses to fold the last (compression-type) byte into an
+/// XXH3 block checksum without a streaming digest (table/format.cc
+/// ModifyChecksumForLastByte).
+const kXXH3LastByteRandomPrime: u32 = 0x6b9083d9;
 const Block = block.Block;
 const FilterBlockReader = filter_block.FilterBlockReader;
 const FullFilterReader = full_filter.FullFilterReader;
@@ -105,6 +111,11 @@ pub const Table = struct {
     /// on demand for the range-del entry, M7.5).
     metaindex_handle: BlockHandle,
 
+    /// Per-block trailer checksum algorithm, taken from the footer.  zrocks's
+    /// own tables use crc32c; real RocksDB v11 defaults to xxh3.  Every block
+    /// read verifies its 5-byte trailer with this algorithm.
+    checksum_type: ChecksumType,
+
     /// Open a table from a random-access file of `file_size` bytes. Reads and
     /// validates the footer, the index block, and (if present) the filter
     /// block. The caller retains ownership of `file` and must keep it alive for
@@ -131,9 +142,27 @@ pub const Table = struct {
         try readFully(file, file_size - footer_mod.kEncodedLength, &footer_buf);
         const footer = try Footer.decodeFrom(&footer_buf);
 
+        // ---- Detect on-disk provenance ----------------------------------
+        // A real RocksDB SST carries a `rocksdb.properties` metaindex entry and
+        // encodes its index block in RocksDB's native shape (user-key
+        // separators + bare BlockHandle values, no per-entry value length).
+        // zrocks's OWN tables never write `rocksdb.properties` and use the
+        // LevelDB index shape (internal-key separators + value-length-prefixed
+        // handles).  We use that entry as the format discriminator so existing
+        // zrocks SSTs read byte-identically.
+        const is_rocksdb = try metaindexHasRocksDbProperties(gpa, file, footer.metaindex_handle, footer.checksum_type, block_cache, cache_id);
+
         // ---- Index block ------------------------------------------------
-        var index_contents = try readBlockCached(gpa, file, footer.index_handle, block_cache, cache_id);
+        var index_contents = try readBlockCached(gpa, file, footer.index_handle, footer.checksum_type, block_cache, cache_id);
         errdefer index_contents.release(gpa, block_cache);
+
+        if (is_rocksdb) {
+            // Transcode the RocksDB index into a zrocks-native index block so the
+            // rest of the reader (index seek, data-handle cursor) is unchanged.
+            const transcoded = try transcodeRocksDbIndex(gpa, index_contents.bytes);
+            index_contents.release(gpa, block_cache);
+            index_contents = .{ .bytes = transcoded, .owner = .{ .owned = transcoded } };
+        }
         const index_block = try Block.init(gpa, index_contents.bytes);
 
         var self = Table{
@@ -151,6 +180,7 @@ pub const Table = struct {
             .block_cache = block_cache,
             .cache_id = cache_id,
             .metaindex_handle = footer.metaindex_handle,
+            .checksum_type = footer.checksum_type,
         };
 
         // ---- Metaindex block -> index-type tag + filter block -----------
@@ -170,7 +200,7 @@ pub const Table = struct {
     /// buffer (no/failed cache) or borrows it behind a pinned cache handle. The
     /// caller MUST `release` the result with `self.gpa` and `self.block_cache`.
     fn readBlockContents(self: *Table, handle: BlockHandle) !BlockContents {
-        return readBlockCached(self.gpa, self.file, handle, self.block_cache, self.cache_id);
+        return readBlockCached(self.gpa, self.file, handle, self.checksum_type, self.block_cache, self.cache_id);
     }
 
     /// Read the `"rocksdb.index_type"` metaindex tag (partitioned-idx) and set
@@ -732,6 +762,7 @@ fn readBlockCached(
     gpa: std.mem.Allocator,
     file: env.RandomAccessFile,
     handle: BlockHandle,
+    checksum_type: ChecksumType,
     block_cache: ?*cache_mod.Cache,
     cache_id: u64,
 ) !BlockContents {
@@ -743,7 +774,7 @@ fn readBlockCached(
         }
     }
 
-    const owned = try readBlockRaw(gpa, file, handle);
+    const owned = try readBlockRaw(gpa, file, handle, checksum_type);
     if (block_cache) |bc| {
         // Hand the decoded buffer to the cache (it takes ownership), then borrow
         // it back behind the returned pinned handle — no copy on either side.
@@ -765,7 +796,151 @@ fn readBlockCached(
 ///
 /// `handle.size` is the on-disk payload length — for a compressed block that is
 /// the COMPRESSED length, so the read window is sized off it directly.
-fn readBlockRaw(gpa: std.mem.Allocator, file: env.RandomAccessFile, handle: BlockHandle) ![]u8 {
+/// Verify a block's 5-byte trailer checksum against `payload ++ [comp_byte]`,
+/// matching RocksDB's `ComputeBuiltinChecksumWithLastByte` (table/format.cc):
+///   * crc32c   — masked crc32c over payload extended by the compression byte
+///                (this is what zrocks's own TableBuilder writes);
+///   * xxh3     — Lower32of64(XXH3_64bits(payload)) XOR (comp_byte * prime),
+///                folding the last byte without a streaming digest;
+///   * none     — no checksum stored (always accepted).
+/// kxxHash / kxxHash64 are not produced by zrocks or this fixture and are
+/// rejected as unsupported.
+fn verifyBlockChecksum(
+    checksum_type: ChecksumType,
+    payload: []const u8,
+    comp_byte: u8,
+    stored: u32,
+) !void {
+    switch (checksum_type) {
+        .none => return,
+        .crc32c => {
+            const expected = crc32c.extend(crc32c.value(payload), &[_]u8{comp_byte});
+            if (crc32c.unmask(stored) != expected) return error.Corruption;
+        },
+        .xxh3 => {
+            // Final XXH3_64bits with seed 0 (RocksDB's kXXH3 checksum).  zrocks's
+            // util/xxph3.zig is the *experimental* XXPH3 snapshot used for bloom
+            // hashing and is NOT byte-equal to final XXH3, so we use the standard
+            // library's XxHash3 here, which matches RocksDB's XXH3_64bits exactly.
+            const lower32: u32 = @truncate(std.hash.XxHash3.hash(0, payload));
+            const expected = lower32 ^ (@as(u32, comp_byte) *% kXXH3LastByteRandomPrime);
+            if (stored != expected) return error.Corruption;
+        },
+        .xxhash, .xxhash64 => return error.NotSupported,
+    }
+}
+
+// ===========================================================================
+// Real-RocksDB index interop
+// ===========================================================================
+
+/// Scan the metaindex block for the `rocksdb.properties` entry, the marker that
+/// identifies a genuine RocksDB SST (zrocks's own tables never write it).  The
+/// metaindex itself is a standard LevelDB block (value-length-prefixed), so it
+/// is read with the normal `Block` reader regardless of provenance.
+fn metaindexHasRocksDbProperties(
+    gpa: std.mem.Allocator,
+    file: env.RandomAccessFile,
+    metaindex_handle: BlockHandle,
+    checksum_type: ChecksumType,
+    block_cache: ?*cache_mod.Cache,
+    cache_id: u64,
+) !bool {
+    var meta_contents = try readBlockCached(gpa, file, metaindex_handle, checksum_type, block_cache, cache_id);
+    defer meta_contents.release(gpa, block_cache);
+    const meta_block = try Block.init(gpa, meta_contents.bytes);
+
+    var it = meta_block.iterator(comparator.bytewise);
+    defer it.deinit();
+    it.seek("rocksdb.properties");
+    return it.valid() and comparator.bytewise.compare(it.key(), "rocksdb.properties") == .eq;
+}
+
+/// Transcode a real RocksDB block-based-table INDEX block into zrocks's native
+/// (LevelDB) index-block layout, returning a freshly `gpa`-allocated buffer the
+/// caller owns.
+///
+/// RocksDB's default index (BlockBasedTableOptions kBinarySearch,
+/// index_block_restart_interval=1, format_version 5) stores, per entry:
+///   * a USER-key separator (no 8-byte internal trailer); and
+///   * a bare two-varint `BlockHandle` value with NO per-entry value length —
+///     the value simply runs to the start of the next entry (every entry is its
+///     own restart, so entry boundaries are exactly the restart offsets).
+///
+/// zrocks's index reader expects INTERNAL-key separators (so the internal-key
+/// comparator orders them) and value-length-prefixed handles.  We rebuild an
+/// equivalent block via `BlockBuilder`, padding each separator with the seek
+/// trailer `(kMaxSequenceNumber, kValueTypeForSeek)` — exactly how RocksDB pads
+/// user-key index separators internally — and re-emitting the handle as the
+/// entry value.  The result is byte-shaped like a zrocks index block.
+fn transcodeRocksDbIndex(gpa: std.mem.Allocator, raw: []const u8) ![]u8 {
+    if (raw.len < @sizeOf(u32)) return error.Corruption;
+
+    // Restart array: last u32 is the count; the count*u32 before it are the
+    // byte offsets of each entry (restart_interval==1 ⇒ one restart per entry).
+    const num_restarts = coding.decodeFixed32(raw[raw.len - 4 ..][0..4]);
+    const restart_bytes = (@as(usize, num_restarts) + 1) * @sizeOf(u32);
+    if (restart_bytes > raw.len) return error.Corruption;
+    const restart_array_off = raw.len - restart_bytes;
+
+    var restarts = try gpa.alloc(u32, num_restarts);
+    defer gpa.free(restarts);
+    for (0..num_restarts) |i| {
+        restarts[i] = coding.decodeFixed32(raw[restart_array_off + i * 4 ..][0..4]);
+    }
+
+    var builder = block.BlockBuilder.init(gpa, comparator.bytewise, 1);
+    defer builder.deinit();
+
+    // Reusable scratch for the padded internal-key separator.
+    var sep: std.ArrayList(u8) = .empty;
+    defer sep.deinit(gpa);
+
+    // The original separators are USER keys (no trailer) that RocksDB compares
+    // with the USER comparator.  zrocks seeks the index with the INTERNAL-key
+    // comparator using the full lookup internal key, so we must pad each
+    // separator with the trailer that makes it sort AFTER every real internal
+    // key sharing that user key — i.e. the MINIMUM trailer (sequence 0).  Under
+    // the internal comparator, equal user keys order by DECREASING sequence, so
+    // a sequence-0 trailer is the largest internal key for that user key; the
+    // "first separator >= target" seek then correctly lands on the block whose
+    // last user key is >= the lookup user key (including the final block).
+    const seek_trailer: u64 = 0;
+
+    for (0..num_restarts) |i| {
+        const start = restarts[i];
+        const end = if (i + 1 < num_restarts) restarts[i + 1] else restart_array_off;
+        if (start > end or end > raw.len) return error.Corruption;
+
+        var entry: []const u8 = raw[start..end];
+        // At a restart point shared==0, so the stored key is the full separator.
+        const shared = try coding.getVarint32(&entry);
+        const non_shared = try coding.getVarint32(&entry);
+        if (shared != 0) return error.Corruption; // restart entries are unshared
+        if (non_shared > entry.len) return error.Corruption;
+        const user_sep = entry[0..non_shared];
+        var value_bytes: []const u8 = entry[non_shared..];
+
+        // Validate the value parses as a BlockHandle (offset,size); we re-emit
+        // its exact bytes so the downstream reader decodes the same handle.
+        const handle = try BlockHandle.decodeFrom(&value_bytes);
+        _ = handle;
+        const handle_bytes = entry[non_shared..];
+
+        // Pad the user-key separator into an internal key with the seek trailer.
+        sep.clearRetainingCapacity();
+        try sep.appendSlice(gpa, user_sep);
+        var tbuf: [8]u8 = undefined;
+        coding.encodeFixed64(&tbuf, seek_trailer);
+        try sep.appendSlice(gpa, &tbuf);
+
+        try builder.add(sep.items, handle_bytes);
+    }
+
+    return gpa.dupe(u8, builder.finish());
+}
+
+fn readBlockRaw(gpa: std.mem.Allocator, file: env.RandomAccessFile, handle: BlockHandle, checksum_type: ChecksumType) ![]u8 {
     const size: usize = @intCast(handle.size);
 
     // Read the on-disk payload plus the 5-byte trailer in one positional read.
@@ -776,12 +951,12 @@ fn readBlockRaw(gpa: std.mem.Allocator, file: env.RandomAccessFile, handle: Bloc
     const payload = raw[0..size];
     const trailer = raw[size..][0..kBlockTrailerSize];
 
-    // trailer[0] = compression type; trailer[1..5] = fixed32_LE(masked crc32c).
-    // The CRC always covers the on-disk (possibly compressed) payload.
+    // trailer[0] = compression type; trailer[1..5] = fixed32_LE(stored checksum).
+    // The checksum always covers the on-disk (possibly compressed) payload plus
+    // the 1-byte compression type, using the table's footer-declared algorithm.
     const compression_type = trailer[0];
-    const stored_masked = coding.decodeFixed32(trailer[1..5]);
-    const expected = crc32c.extend(crc32c.value(payload), &[_]u8{compression_type});
-    if (crc32c.unmask(stored_masked) != expected) return error.Corruption;
+    const stored = coding.decodeFixed32(trailer[1..5]);
+    try verifyBlockChecksum(checksum_type, payload, compression_type, stored);
 
     return switch (compression_type) {
         kNoCompression => try gpa.dupe(u8, payload),
@@ -1777,4 +1952,84 @@ test "table reader: optional block cache yields identical results and hits on re
         try testing.expectEqualStrings(kv.v, got.?);
     }
     try testing.expect(cache.hitCount() > hits_before_get);
+}
+
+// ---------------------------------------------------------------------------
+// Real-RocksDB index transcoding (Wave B)
+// ---------------------------------------------------------------------------
+
+/// Hand-build a real-RocksDB-shaped index block: kBinarySearch with
+/// restart_interval=1, USER-key separators (no trailer), bare two-varint
+/// BlockHandle values (no per-entry value length), every entry its own restart.
+fn buildRocksDbStyleIndex(
+    gpa: std.mem.Allocator,
+    seps: []const []const u8,
+    handles: []const BlockHandle,
+) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    var restarts: std.ArrayListUnmanaged(u32) = .empty;
+    defer restarts.deinit(gpa);
+
+    for (seps, handles) |sep, h| {
+        try restarts.append(gpa, @intCast(buf.items.len));
+        try coding.putVarint32(&buf, gpa, 0); // shared
+        try coding.putVarint32(&buf, gpa, @intCast(sep.len)); // non_shared
+        try buf.appendSlice(gpa, sep); // user-key separator
+        try h.encodeTo(&buf, gpa); // bare handle, no length prefix
+    }
+    for (restarts.items) |r| {
+        var b: [4]u8 = undefined;
+        coding.encodeFixed32(&b, r);
+        try buf.appendSlice(gpa, &b);
+    }
+    var cnt: [4]u8 = undefined;
+    coding.encodeFixed32(&cnt, @intCast(restarts.items.len));
+    try buf.appendSlice(gpa, &cnt);
+    return buf.toOwnedSlice(gpa);
+}
+
+test "transcodeRocksDbIndex: RocksDB index becomes a seekable zrocks index" {
+    const gpa = std.testing.allocator;
+
+    const seps = [_][]const u8{ "key010", "key021", "key099" };
+    const handles = [_]BlockHandle{
+        .{ .offset = 0, .size = 245 },
+        .{ .offset = 250, .size = 245 },
+        .{ .offset = 2241, .size = 34 },
+    };
+
+    const raw = try buildRocksDbStyleIndex(gpa, &seps, &handles);
+    defer gpa.free(raw);
+
+    const transcoded = try transcodeRocksDbIndex(gpa, raw);
+    defer gpa.free(transcoded);
+
+    var blk = try Block.init(gpa, transcoded);
+    var ikc = internal_key.InternalKeyComparator{ .user = comparator.bytewise };
+    const cmp = ikc.comparatorInterface();
+    var it = blk.iterator(cmp);
+    defer it.deinit();
+
+    // Seeking a lookup internal key must land on the FIRST block whose last
+    // user key is >= the lookup user key — including the final block (key099).
+    const cases = [_]struct { user: []const u8, want_off: u64 }{
+        .{ .user = "key000", .want_off = 0 }, // covered by block ending key010
+        .{ .user = "key010", .want_off = 0 },
+        .{ .user = "key011", .want_off = 250 }, // next block (ends key021)
+        .{ .user = "key099", .want_off = 2241 }, // the final block
+    };
+    for (cases) |c| {
+        var lookup: [32]u8 = undefined;
+        @memcpy(lookup[0..c.user.len], c.user);
+        coding.encodeFixed64(
+            lookup[c.user.len..][0..8],
+            internal_key.packSequenceAndType(50, .value),
+        );
+        it.seek(lookup[0 .. c.user.len + 8]);
+        try testing.expect(it.valid());
+        var hv: []const u8 = it.value();
+        const h = try BlockHandle.decodeFrom(&hv);
+        try testing.expectEqual(c.want_off, h.offset);
+    }
 }
