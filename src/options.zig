@@ -84,8 +84,24 @@ pub const Options = struct {
 
     max_file_size: usize = 2 * 1024 * 1024,
     level0_file_num_compaction_trigger: u32 = 4,
+    /// Write-stall (L0 throttling, D2a-4) soft trigger.  Once the L0 file count
+    /// reaches this, each subsequent write is SLOWED DOWN (delayed by
+    /// `write_stall_slowdown_delay_us`) so writers cannot outrun
+    /// flush/compaction.  A value of 0 disables the slowdown band.  Must be
+    /// <= `level0_stop_writes_trigger` for the bands to layer correctly.
     level0_slowdown_writes_trigger: u32 = 20,
+    /// Write-stall (L0 throttling, D2a-4) HARD trigger.  Once the L0 file count
+    /// reaches this, a write STALLS: it force-drains L0 (a leveled L0->L1
+    /// compaction, run regardless of the normal score trigger) until the L0
+    /// count is back below this threshold, then proceeds.  A value of 0 disables
+    /// the stop stall entirely (L0 may grow without bound).
     level0_stop_writes_trigger: u32 = 36,
+    /// How long (microseconds) a single write is delayed when it lands in the
+    /// slowdown band (L0 >= `level0_slowdown_writes_trigger` but below the stop
+    /// trigger), D2a-4.  Mirrors RocksDB's `delayed_write_rate`-derived sleep,
+    /// kept as a fixed per-write delay here.  0 means "count the slowdown but do
+    /// not actually sleep" (used by tests for determinism).  Default 1000us.
+    write_stall_slowdown_delay_us: u64 = 1000,
     /// Byte budget for level 1 (the first leveled level); each deeper level's
     /// budget is this times 10^(n-1).  Drives the size-based compaction score.
     max_bytes_for_level_base: u64 = 10 * 1024 * 1024,
