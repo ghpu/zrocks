@@ -79,7 +79,7 @@ pub const DBIterator = struct {
     /// (value_seq < tomb.seq <= snapshot, begin <= key < end) is HIDDEN — the
     /// scan treats the key as deleted and skips its older versions.  Owned by the
     /// DBIterator (built by DB.newIterator); `deinit` frees it.
-    range_aggregator: ?*delete_range.RangeTombstoneList = null,
+    range_aggregator: ?*delete_range.FragmentedRangeTombstoneList = null,
 
     pub fn init(
         gpa: std.mem.Allocator,

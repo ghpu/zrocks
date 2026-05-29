@@ -1088,15 +1088,17 @@ pub const DB = struct {
     }
 
     /// The largest range-tombstone sequence (visible at `snapshot`) that covers
-    /// `key`, or 0 if none.  Builds the snapshot-scoped aggregator (live MemTable
-    /// + imm + every SST's range-del block) and folds its covering tombstones
-    /// into one effective deletion sequence.
+    /// `key`, or 0 if none.  Builds a snapshot-scoped aggregator (live MemTable
+    /// + imm + only the SSTs whose key range can cover `key`) and folds its
+    /// covering tombstones into one effective deletion sequence.
     /// D3a-M1 fast path: skip the aggregator entirely when no source carries any
     /// range tombstone.
-    /// TODO(perf): prune by file key-range overlap; cache per-Version aggregation.
+    /// frag-tombstone: per-file pruning — `key` is passed as `prune_key` so an SST
+    /// whose user-key range cannot contain `key` is skipped (no metaindex /
+    /// range-del block read), replacing the old all-files-every-get re-scan.
     fn maxCoveringTombstoneSeq(self: *DB, key: []const u8, snapshot: u64) !u64 {
         if (!self.hasAnyRangeTombstones()) return 0;
-        var agg = try self.buildRangeAggregator(self.gpa, snapshot);
+        var agg = try self.buildRangeAggregator(self.gpa, snapshot, key);
         defer agg.deinit();
         return agg.maxCoveringSeq(key, snapshot, self.options.comparator);
     }
@@ -1242,9 +1244,14 @@ pub const DB = struct {
         // any range tombstone — `range_aggregator` stays null and the DBIterator
         // treats a null aggregator as "no tombstones, nothing hidden".
         if (self.hasAnyRangeTombstones()) {
-            const agg = try gpa.create(delete_range.RangeTombstoneList);
+            // A full scan covers the whole key space, so no per-file pruning
+            // (prune_key = null).  The gathered linear list is fragmented into a
+            // sorted, binary-searchable aggregator for O(log n) per-key coverage.
+            var linear = try self.buildRangeAggregator(gpa, seq, null);
+            defer linear.deinit();
+            const agg = try gpa.create(delete_range.FragmentedRangeTombstoneList);
             errdefer gpa.destroy(agg);
-            agg.* = try self.buildRangeAggregator(gpa, seq);
+            agg.* = try delete_range.FragmentedRangeTombstoneList.fromList(gpa, &linear, self.options.comparator);
             dbit.range_aggregator = agg;
         }
         // M7.2: thread the prefix extractor + prefix-bounded scan flag so a
@@ -1325,15 +1332,28 @@ pub const DB = struct {
 
     /// Build a snapshot-scoped range-tombstone aggregator (M7.5): collect every
     /// range tombstone visible at `snapshot` (`tomb.seq <= snapshot`) from the
-    /// live MemTable, the immutable MemTable being flushed (if any), and every SST
+    /// live MemTable, the immutable MemTable being flushed (if any), and the SSTs
     /// in the current Version.  The caller OWNS the returned list (`deinit`s it).
     ///
-    /// Correctness-first: we gather tombstones from ALL SSTs (no range-overlap
-    /// pruning) and re-scan them linearly per query.
-    /// TODO(perf): prune by file key-range overlap + a fragmented tombstone iter.
-    fn buildRangeAggregator(self: *DB, gpa: std.mem.Allocator, snapshot: u64) !delete_range.RangeTombstoneList {
+    /// frag-tombstone per-file pruning: when `prune_key` is non-null (the point
+    /// get path), an SST is consulted ONLY if its user-key range can contain a
+    /// tombstone covering `prune_key` — i.e. `smallest_user <= prune_key <=
+    /// largest_user`.  A flush records each tombstone's begin/end internal key in
+    /// the file's smallest/largest bounds, so a `prune_key` strictly below the
+    /// file's smallest user key (below every tombstone `begin`) or strictly above
+    /// its largest user key (at/above every tombstone `end`, which is exclusive)
+    /// can never be covered by a tombstone in that file — skipping it avoids the
+    /// metaindex + range-del block read entirely.  `prune_key = null` (the full
+    /// iterator scan) consults every file.
+    fn buildRangeAggregator(
+        self: *DB,
+        gpa: std.mem.Allocator,
+        snapshot: u64,
+        prune_key: ?[]const u8,
+    ) !delete_range.RangeTombstoneList {
         var agg = delete_range.RangeTombstoneList.init(gpa);
         errdefer agg.deinit();
+        const user_cmp = self.options.comparator;
 
         // 1. Live MemTable tombstones.
         for (self.mem.range_tombstones.tombstones.items) |t| {
@@ -1345,10 +1365,14 @@ pub const DB = struct {
                 if (t.seq <= snapshot) try agg.add(t.begin, t.end, t.seq);
             }
         }
-        // 2. Every SST in the current Version.
+        // 2. SSTs in the current Version (pruned by key range for a point get).
         const v = self.versions.currentVersion();
         for (&v.files) |level| {
             for (level.items) |f| {
+                if (!f.has_range_tombstones) continue; // no tombstones here.
+                if (prune_key) |pk| {
+                    if (!fileMayCoverKey(f, pk, user_cmp)) continue;
+                }
                 const table = try self.table_cache.findTable(f.number, f.file_size);
                 var rtl = try table.rangeTombstones(gpa);
                 defer rtl.deinit();
@@ -1358,6 +1382,25 @@ pub const DB = struct {
             }
         }
         return agg;
+    }
+
+    /// Per-file pruning predicate: can a range tombstone stored in `f` cover the
+    /// user key `pk`?  False (safe to skip the file) iff `pk` lies strictly
+    /// outside the file's `[smallest_user, largest_user]` user-key range.  The
+    /// `largest` boundary is treated inclusively (it may be a real point key
+    /// equal to `pk`); a tombstone `end` is exclusive so a `pk == largest_user`
+    /// that only equals an `end` boundary is still correctly excluded by the
+    /// `covered` check downstream — pruning never produces a false negative.
+    fn fileMayCoverKey(
+        f: version_edit.FileMetaData,
+        pk: []const u8,
+        user_cmp: comparator.Comparator,
+    ) bool {
+        const smallest_user = internal_key.extractUserKey(f.smallest);
+        const largest_user = internal_key.extractUserKey(f.largest);
+        if (user_cmp.compare(pk, smallest_user) == .lt) return false; // pk < smallest
+        if (user_cmp.compare(pk, largest_user) == .gt) return false; // pk > largest
+        return true;
     }
 
     /// DBIterator ownership hook: tear down the merging iterator (which deinits
@@ -2974,6 +3017,83 @@ test "M7.5: randomized deleteRange gate vs reference map (get + scan + reopen)" 
         const db = try DB.open(gpa, e, "rangefuzz", opts);
         defer db.close();
         try verifyAgainstRangeRef(gpa, db, &ref, key_space);
+    }
+}
+
+// ===========================================================================
+// frag-tombstone — per-file range pruning on the point-get path.
+// ===========================================================================
+
+test "frag-tombstone: fileMayCoverKey prunes files outside the key range" {
+    // smallest/largest are INTERNAL keys (user key ++ 8-byte trailer); the
+    // predicate compares the user-key portion, which extractUserKey strips out.
+    const f = version_edit.FileMetaData{
+        .number = 1,
+        .file_size = 100,
+        // user "d"/"k" (1 byte) + an 8-byte trailer that extractUserKey strips.
+        .smallest = "d\x00\x00\x00\x00\x00\x00\x00\x00",
+        .largest = "k\x00\x00\x00\x00\x00\x00\x00\x00",
+    };
+
+    // Strictly below smallest user key → pruned.
+    try testing.expect(!DB.fileMayCoverKey(f, "a", comparator.bytewise));
+    try testing.expect(!DB.fileMayCoverKey(f, "c", comparator.bytewise));
+    // Strictly above largest user key → pruned.
+    try testing.expect(!DB.fileMayCoverKey(f, "l", comparator.bytewise));
+    try testing.expect(!DB.fileMayCoverKey(f, "z", comparator.bytewise));
+    // Inside or on a boundary → consulted (never a false negative).
+    try testing.expect(DB.fileMayCoverKey(f, "d", comparator.bytewise));
+    try testing.expect(DB.fileMayCoverKey(f, "g", comparator.bytewise));
+    try testing.expect(DB.fileMayCoverKey(f, "k", comparator.bytewise));
+}
+
+test "frag-tombstone: point-get aggregator prunes the non-overlapping SST" {
+    // Build two disjoint L0 SSTs: a tombstone-free file in the LOW key range and
+    // a range-tombstone-carrying file in the HIGH key range.  A get of a LOW key
+    // must NOT pull the HIGH file's tombstones into its aggregator (per-file
+    // pruning), while the unpruned (iterator-scan) build still sees them.
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    const db = try DB.open(gpa, e, "fragprune", .{ .write_buffer_size = 1 });
+    defer db.close();
+
+    // L0 file #1: only LOW keys, no tombstone.  (write_buffer_size=1 → each
+    // returning write has flushed + committed its own L0 SST.)
+    try db.put(.{}, "a000", "v");
+    try db.put(.{}, "a001", "v");
+    // L0 file #2: a range tombstone over a disjoint HIGH key range.
+    try db.deleteRange(.{}, "z000", "z999");
+
+    const snap = db.last_sequence;
+
+    // Pruned build for a LOW key: the HIGH tombstone file is skipped → empty.
+    {
+        var pruned = try db.buildRangeAggregator(gpa, snap, "a000");
+        defer pruned.deinit();
+        try testing.expect(pruned.isEmpty());
+    }
+    // A get over the HIGH range DOES see the tombstone (sanity: pruning is
+    // key-directed, not a blanket skip).
+    {
+        var pruned = try db.buildRangeAggregator(gpa, snap, "z500");
+        defer pruned.deinit();
+        try testing.expect(!pruned.isEmpty());
+        try testing.expectEqual(@as(u64, 1), pruned.count());
+    }
+    // The unpruned (full iterator scan) build gathers the tombstone regardless.
+    {
+        var full = try db.buildRangeAggregator(gpa, snap, null);
+        defer full.deinit();
+        try testing.expectEqual(@as(usize, 1), full.count());
+    }
+    // End-to-end: a LOW key is unaffected and the HIGH-key delete still applies.
+    {
+        const got = try db.get(.{}, "a000") orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings("v", got);
     }
 }
 
