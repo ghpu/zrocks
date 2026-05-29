@@ -566,7 +566,11 @@ pub const DB = struct {
         // With a merge operator configured, route through the merge-aware path:
         // the newest entries for the key may be a run of merge operands on top of
         // an optional Put/Delete that the fast point-lookup path cannot combine.
-        // TODO(perf): GetContext operand accumulation instead of a full re-scan.
+        // The single MergingIterator over memtable+imm+SSTs accumulates the whole
+        // operand run in one forward pass; the per-file SST accumulation it relies
+        // on (operands gathered across files, not discarded) is the version_set
+        // `GetContext` / forward-scanning `probeFile` introduced for getcontext —
+        // see Version.getMerge.
         if (self.options.merge_operator != null) {
             return self.mergeGet(key, seq);
         }

@@ -28,6 +28,7 @@ const filename = @import("filename.zig");
 const internal_key = @import("../format/internal_key.zig");
 const iterator = @import("../iterator/iterator.zig");
 const table_cache = @import("table_cache.zig");
+const merge_operator = @import("../rocks/merge_operator.zig");
 
 const FileMetaData = version_edit.FileMetaData;
 const VersionEdit = version_edit.VersionEdit;
@@ -40,6 +41,115 @@ pub const kNumLevels = 7;
 pub const GetResult = union(enum) {
     found: []const u8,
     deleted,
+};
+
+/// Operand-accumulating point-lookup context (the LSM "GetContext").
+///
+/// A single `GetContext` is threaded through a newest-first probe of the
+/// Version's files (and, in the DB layer, the memtables ahead of them).  Each
+/// source feeds its newest-visible run of entries for the user key into the
+/// context via `addEntry`; the context gathers `.merge` operands (newest-first)
+/// until it meets a terminating base (`.value` → `found_value`, the put becomes
+/// the merge base) or a deletion (`.deletion`/`.single_deletion` →
+/// `found_deleted`, the base is empty).  Once `isTerminal()` is true no later
+/// (older) source can change the answer, so the probe stops.
+///
+/// This replaces the previous one-shot `probeFile` (which discarded `.merge`
+/// entries) AND the DB layer's separate full-Version re-scan: a merge read now
+/// accumulates operands across files in a single forward pass.
+pub const GetContext = struct {
+    pub const State = enum { not_found, found_value, found_deleted };
+
+    gpa: std.mem.Allocator,
+    user_cmp: comparator.Comparator,
+    merge_op: ?merge_operator.MergeOperator,
+
+    state: State = .not_found,
+    /// The merge base (a `.value` put), owned; null until a base is reached.
+    base: ?[]u8 = null,
+    /// Accumulated `.merge` operands, NEWEST-first; each entry owned by `gpa`.
+    operands: std.ArrayListUnmanaged([]u8) = .empty,
+
+    pub fn init(
+        gpa: std.mem.Allocator,
+        user_cmp: comparator.Comparator,
+        merge_op: ?merge_operator.MergeOperator,
+    ) GetContext {
+        return .{ .gpa = gpa, .user_cmp = user_cmp, .merge_op = merge_op };
+    }
+
+    pub fn deinit(self: *GetContext) void {
+        if (self.base) |b| self.gpa.free(b);
+        self.base = null;
+        for (self.operands.items) |op| self.gpa.free(op);
+        self.operands.deinit(self.gpa);
+        self.* = undefined;
+    }
+
+    /// True once a base value or a deletion has been reached: no older source
+    /// can change the merged result, so the probe may stop.
+    pub fn isTerminal(self: *const GetContext) bool {
+        return self.state != .not_found;
+    }
+
+    /// Feed one entry (already known to match the user key and be visible at the
+    /// snapshot).  Returns `true` when the context becomes terminal (the caller
+    /// then stops feeding further entries from this and later sources).
+    /// `val` is copied (the context owns its copies).
+    fn addEntry(self: *GetContext, t: internal_key.ValueType, val: []const u8) !bool {
+        switch (t) {
+            .merge => {
+                try self.operands.append(self.gpa, try self.gpa.dupe(u8, val));
+                return false; // keep gathering older entries for a base
+            },
+            .value => {
+                self.base = try self.gpa.dupe(u8, val);
+                self.state = .found_value;
+                return true;
+            },
+            .deletion, .single_deletion, .range_deletion => {
+                self.state = .found_deleted;
+                return true;
+            },
+        }
+    }
+
+    /// Resolve the accumulated state into a final `GetResult` (or null when the
+    /// key is absent / a bare tombstone / fullMerge fails with no base).
+    ///
+    /// With operands present the merge operator combines them (OLDEST-first)
+    /// over the optional base.  The returned `.found` bytes are gpa-allocated and
+    /// owned by the CALLER.  After this call the context still owns `base`/the
+    /// operand copies (freed by `deinit`); the returned value is a fresh copy.
+    /// `user_key` is forwarded to `fullMerge` (some operators key off it).
+    pub fn finish(self: *GetContext, user_key: []const u8) !?GetResult {
+        if (self.operands.items.len == 0) {
+            return switch (self.state) {
+                .not_found => null,
+                .found_value => .{ .found = try self.gpa.dupe(u8, self.base.?) },
+                .found_deleted => .deleted,
+            };
+        }
+
+        // Operands present → require a merge operator to combine them.
+        const merge_op = self.merge_op orelse return error.MergeOperatorNotConfigured;
+
+        // Operands were gathered newest-first; the operator wants OLDEST-first.
+        const view = try self.gpa.alloc([]const u8, self.operands.items.len);
+        defer self.gpa.free(view);
+        const n = self.operands.items.len;
+        for (self.operands.items, 0..) |op, i| view[n - 1 - i] = op;
+
+        const existing: ?[]const u8 = if (self.state == .found_value) self.base.? else null;
+        const merged = (try merge_op.fullMerge(user_key, existing, view, self.gpa)) orelse {
+            // Operator declined: fall back to the base value, or not-found.
+            return switch (self.state) {
+                .found_value => .{ .found = try self.gpa.dupe(u8, self.base.?) },
+                else => null,
+            };
+        };
+        return .{ .found = merged };
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -94,36 +204,64 @@ pub const Version = struct {
     }
 
     /// Probe a single SST file for `user_key` at `lookup_ikey` (an internal key
-    /// `user_key ++ trailer(sequence, seek)`).  Opens a table iterator via the
-    /// cache, seeks, and on an exact user-key hit returns the parsed result
-    /// (value duped with `gpa`, or `.deleted`).  Returns null when the file does
-    /// not contain `user_key`.  The iterator is always deinited.
+    /// `user_key ++ trailer(sequence, seek)`), feeding every entry for the key
+    /// that is visible at `sequence` into `ctx` (NEWEST-first within the file).
+    ///
+    /// A per-file FORWARD-ACCUMULATING scan (the LSM "GetContext" loop): after
+    /// the seek lands at/before the newest qualifying entry, the loop walks
+    /// forward over the consecutive same-user-key entries, handing each to
+    /// `ctx.addEntry` — so a run of `.merge` operands is gathered across files
+    /// rather than discarded as the old one-shot seek did.  The scan stops at the
+    /// first base value / deletion (the context becomes terminal) or when the
+    /// user key changes / the file ends.
+    ///
+    /// Returns `true` when `ctx` became terminal (a base or deletion was met) so
+    /// the caller stops probing older files.  `seq_out` (when non-null) receives
+    /// the sequence of the NEWEST entry seen for the key in this file (used by
+    /// M7.5 range-tombstone shadowing / M7.6 conflict detection).  The iterator
+    /// is always deinited.
     fn probeFile(
         gpa: std.mem.Allocator,
         tc: *TableCache,
         user_cmp: comparator.Comparator,
         f: FileMetaData,
+        ctx: *GetContext,
         user_key: []const u8,
         lookup_ikey: []const u8,
+        sequence: u64,
         seq_out: ?*u64,
-    ) !?GetResult {
+    ) !bool {
         var it = try tc.newIterator(gpa, f.number, f.file_size);
         defer it.deinit();
         it.seek(lookup_ikey);
-        if (it.status()) |e| return e;
-        if (!it.valid()) return null;
 
-        const stored_ikey = it.key();
-        const stored_uk = internal_key.extractUserKey(stored_ikey);
-        if (user_cmp.compare(stored_uk, user_key) != .eq) return null;
+        while (true) {
+            if (it.status()) |e| return e;
+            if (!it.valid()) break;
 
-        const parsed = internal_key.parseInternalKey(stored_ikey) catch return error.Corruption;
-        if (seq_out) |p| p.* = parsed.sequence;
-        switch (parsed.type) {
-            .value => return .{ .found = try gpa.dupe(u8, it.value()) },
-            .deletion, .single_deletion, .range_deletion => return .deleted,
-            .merge => return null, // merge operands not handled at this layer
+            const stored_ikey = it.key();
+            const stored_uk = internal_key.extractUserKey(stored_ikey);
+            if (user_cmp.compare(stored_uk, user_key) != .eq) break;
+
+            const parsed = internal_key.parseInternalKey(stored_ikey) catch return error.Corruption;
+            // The seek trailer may land on an entry newer than `sequence`
+            // (mergeGet seeks with a max-type trailer); skip not-yet-visible
+            // versions instead of mistaking them for the answer.
+            if (parsed.sequence > sequence) {
+                it.next();
+                continue;
+            }
+            // Record the sequence of the newest VISIBLE entry seen across the
+            // whole probe (files are visited newest-first, so the FIRST one to
+            // set it wins).  Sequence 0 is the "unset" sentinel (writes start at
+            // 1), matching latestSequenceForKey.
+            if (seq_out) |p| {
+                if (p.* == 0) p.* = parsed.sequence;
+            }
+            if (try ctx.addEntry(parsed.type, it.value())) return true;
+            it.next();
         }
+        return false;
     }
 
     /// LSM point lookup across this Version for `user_key` visible at `sequence`.
@@ -150,6 +288,12 @@ pub const Version = struct {
     /// Like `get`, but writes the sequence of the surfaced entry into `seq_out`
     /// (when non-null) on a `.found`/`.deleted` result — used by M7.5 to decide
     /// whether a covering range tombstone shadows the value.
+    ///
+    /// This is the NON-merge fast path: with no operator threaded in, the first
+    /// entry the GetContext meets (a `.value` or a deletion) terminates the probe
+    /// immediately, exactly like the old one-shot seek.  A bare run of `.merge`
+    /// operands with no operator surfaces as null (a usage error elsewhere — an
+    /// operand can never be interpreted without an operator).
     pub fn getWithSeq(
         self: *const Version,
         gpa: std.mem.Allocator,
@@ -159,6 +303,46 @@ pub const Version = struct {
         sequence: u64,
         seq_out: ?*u64,
     ) !?GetResult {
+        var ctx = GetContext.init(gpa, user_cmp, null);
+        defer ctx.deinit();
+        try self.probeInto(gpa, tc, user_cmp, user_key, sequence, &ctx, seq_out);
+        return ctx.finish(user_key);
+    }
+
+    /// Merge-aware point lookup: accumulate `.merge` operands across this
+    /// Version's files (newest-first) over an optional base, combining them via
+    /// `merge_op`.  Returns `.found` (caller-owned bytes), `.deleted`, or null
+    /// (absent).  The accumulation happens in a single forward pass per file
+    /// (see `probeFile`), gathering operands across files rather than discarding
+    /// them as the old one-shot probe did.
+    pub fn getMerge(
+        self: *const Version,
+        gpa: std.mem.Allocator,
+        tc: *TableCache,
+        user_cmp: comparator.Comparator,
+        user_key: []const u8,
+        sequence: u64,
+        merge_op: merge_operator.MergeOperator,
+    ) !?GetResult {
+        var ctx = GetContext.init(gpa, user_cmp, merge_op);
+        defer ctx.deinit();
+        try self.probeInto(gpa, tc, user_cmp, user_key, sequence, &ctx, null);
+        return ctx.finish(user_key);
+    }
+
+    /// Probe every covering file newest-first, feeding `ctx` until it goes
+    /// terminal (a base / deletion is reached).  Shared by `getWithSeq` and
+    /// `getMerge`.
+    fn probeInto(
+        self: *const Version,
+        gpa: std.mem.Allocator,
+        tc: *TableCache,
+        user_cmp: comparator.Comparator,
+        user_key: []const u8,
+        sequence: u64,
+        ctx: *GetContext,
+        seq_out: ?*u64,
+    ) !void {
         // internal lookup key = user_key ++ fixed64(packSequenceAndType(seq, seek))
         var lookup: std.ArrayListUnmanaged(u8) = .empty;
         defer lookup.deinit(gpa);
@@ -172,8 +356,7 @@ pub const Version = struct {
         // -- Level 0: overlapping; probe covering files newest-first ---------
         // L0 is stored in insertion order (oldest first, newest last; see
         // applyEdit), and file numbers increase with write recency, so iterating
-        // in reverse visits the newest files first.  The first covering hit is
-        // the newest version visible at the snapshot, so it wins.
+        // in reverse visits the newest files first.
         {
             const l0 = self.files[0].items;
             var i = l0.len;
@@ -181,7 +364,7 @@ pub const Version = struct {
                 i -= 1;
                 const f = l0[i];
                 if (!fileCovers(user_cmp, f, user_key)) continue;
-                if (try probeFile(gpa, tc, user_cmp, f, user_key, lookup_ikey, seq_out)) |r| return r;
+                if (try probeFile(gpa, tc, user_cmp, f, ctx, user_key, lookup_ikey, sequence, seq_out)) return;
             }
         }
 
@@ -191,13 +374,12 @@ pub const Version = struct {
             const files = self.files[level].items;
             for (files) |f| {
                 if (!fileCovers(user_cmp, f, user_key)) continue;
-                if (try probeFile(gpa, tc, user_cmp, f, user_key, lookup_ikey, seq_out)) |r| return r;
+                if (try probeFile(gpa, tc, user_cmp, f, ctx, user_key, lookup_ikey, sequence, seq_out)) return;
                 // A non-overlapping level has at most one covering file; if it
-                // did not hold the key, no other file at this level can.
+                // did not terminate, no other file at this level can.
                 break;
             }
         }
-        return null;
     }
 
     /// Total bytes of all files at `level`.
@@ -1449,4 +1631,166 @@ test "Version.addIterators: merged scan yields every file's entries" {
         count += 1;
     }
     try testing.expectEqual(@as(usize, 2), count);
+}
+
+// ===========================================================================
+// getcontext — merge-operand accumulation across files (probeFile forward scan).
+// ===========================================================================
+
+fn u64le(buf: *[8]u8, v: u64) []const u8 {
+    std.mem.writeInt(u64, buf, v, .little);
+    return buf[0..];
+}
+
+fn decU64(bytes: []const u8) u64 {
+    return std.mem.readInt(u64, bytes[0..8], .little);
+}
+
+test "getcontext: Version.getMerge accumulates operands across multiple L0 files" {
+    const gpa = testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+    try e.makeDir("db");
+
+    const policy = bloom.BloomFilterPolicy.init(10);
+    const user_cmp = comparator.bytewise;
+
+    var add = merge_operator.Uint64AddOperator{};
+    const merge_op = add.operator();
+
+    var b: [8]u8 = undefined;
+
+    // Three separate SST files, each holding ONE entry for user key "c", written
+    // oldest -> newest (file numbers increasing).  The oldest is the Put base,
+    // then two merge operands in newer files:
+    //   file 7  (oldest):  c = value@1  (base 100)
+    //   file 8:            c = merge@3  (+5)
+    //   file 9  (newest):  c = merge@5  (+7)
+    // A newest-first probe must gather operands [+7, +5] then meet the base 100
+    // and sum to 112.
+    const f7 = [_]SSTEntry{.{ .user = "c", .seq = 1, .t = .value, .value = u64le(&b, 100) }};
+    var s7: []u8 = undefined;
+    var l7: []u8 = undefined;
+    const sz7 = try buildInternalSST(gpa, e, "db", 7, policy, &f7, &s7, &l7);
+    defer gpa.free(s7);
+    defer gpa.free(l7);
+
+    var b8: [8]u8 = undefined;
+    const f8 = [_]SSTEntry{.{ .user = "c", .seq = 3, .t = .merge, .value = u64le(&b8, 5) }};
+    var s8: []u8 = undefined;
+    var l8: []u8 = undefined;
+    const sz8 = try buildInternalSST(gpa, e, "db", 8, policy, &f8, &s8, &l8);
+    defer gpa.free(s8);
+    defer gpa.free(l8);
+
+    var b9: [8]u8 = undefined;
+    const f9 = [_]SSTEntry{.{ .user = "c", .seq = 5, .t = .merge, .value = u64le(&b9, 7) }};
+    var s9: []u8 = undefined;
+    var l9: []u8 = undefined;
+    const sz9 = try buildInternalSST(gpa, e, "db", 9, policy, &f9, &s9, &l9);
+    defer gpa.free(s9);
+    defer gpa.free(l9);
+
+    var version = Version.initEmpty();
+    defer version.deinit(gpa);
+    // L0 insertion order = oldest first; reverse iteration probes newest first.
+    try version.addFileOwned(gpa, 0, .{ .number = 7, .file_size = sz7, .smallest = s7, .largest = l7 });
+    try version.addFileOwned(gpa, 0, .{ .number = 8, .file_size = sz8, .smallest = s8, .largest = l8 });
+    try version.addFileOwned(gpa, 0, .{ .number = 9, .file_size = sz9, .smallest = s9, .largest = l9 });
+
+    var tc = TableCache.init(gpa, e, "db", .{}, null);
+    defer tc.deinit();
+
+    // High snapshot: base 100 + 5 + 7 = 112.
+    {
+        const r = (try version.getMerge(gpa, &tc, user_cmp, "c", 1000, merge_op)) orelse
+            return error.TestExpectedFound;
+        switch (r) {
+            .found => |val| {
+                defer gpa.free(val);
+                try testing.expectEqual(@as(u64, 112), decU64(val));
+            },
+            .deleted => return error.TestUnexpectedDeleted,
+        }
+    }
+
+    // Snapshot 4 hides file 9's @5 operand: base 100 + 5 = 105.
+    {
+        const r = (try version.getMerge(gpa, &tc, user_cmp, "c", 4, merge_op)) orelse
+            return error.TestExpectedFound;
+        switch (r) {
+            .found => |val| {
+                defer gpa.free(val);
+                try testing.expectEqual(@as(u64, 105), decU64(val));
+            },
+            .deleted => return error.TestUnexpectedDeleted,
+        }
+    }
+
+    // Snapshot 2 hides both operands; only the base 100 is visible.
+    {
+        const r = (try version.getMerge(gpa, &tc, user_cmp, "c", 2, merge_op)) orelse
+            return error.TestExpectedFound;
+        switch (r) {
+            .found => |val| {
+                defer gpa.free(val);
+                try testing.expectEqual(@as(u64, 100), decU64(val));
+            },
+            .deleted => return error.TestUnexpectedDeleted,
+        }
+    }
+}
+
+test "getcontext: operands with no base sum from 0; a deletion stops accumulation" {
+    const gpa = testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+    try e.makeDir("db");
+
+    const policy = bloom.BloomFilterPolicy.init(10);
+    const user_cmp = comparator.bytewise;
+
+    var add = merge_operator.Uint64AddOperator{};
+    const merge_op = add.operator();
+
+    var b: [8]u8 = undefined;
+
+    // No base — pure operands across two files: +4 (older) and +9 (newer) = 13.
+    const fa = [_]SSTEntry{.{ .user = "k", .seq = 2, .t = .merge, .value = u64le(&b, 4) }};
+    var sa: []u8 = undefined;
+    var la: []u8 = undefined;
+    const sza = try buildInternalSST(gpa, e, "db", 20, policy, &fa, &sa, &la);
+    defer gpa.free(sa);
+    defer gpa.free(la);
+
+    var bb: [8]u8 = undefined;
+    const fb = [_]SSTEntry{.{ .user = "k", .seq = 6, .t = .merge, .value = u64le(&bb, 9) }};
+    var sb: []u8 = undefined;
+    var lb: []u8 = undefined;
+    const szb = try buildInternalSST(gpa, e, "db", 21, policy, &fb, &sb, &lb);
+    defer gpa.free(sb);
+    defer gpa.free(lb);
+
+    var version = Version.initEmpty();
+    defer version.deinit(gpa);
+    try version.addFileOwned(gpa, 0, .{ .number = 20, .file_size = sza, .smallest = sa, .largest = la });
+    try version.addFileOwned(gpa, 0, .{ .number = 21, .file_size = szb, .smallest = sb, .largest = lb });
+
+    var tc = TableCache.init(gpa, e, "db", .{}, null);
+    defer tc.deinit();
+
+    // Pure operands sum from 0: 4 + 9 = 13.
+    {
+        const r = (try version.getMerge(gpa, &tc, user_cmp, "k", 1000, merge_op)) orelse
+            return error.TestExpectedFound;
+        switch (r) {
+            .found => |val| {
+                defer gpa.free(val);
+                try testing.expectEqual(@as(u64, 13), decU64(val));
+            },
+            .deleted => return error.TestUnexpectedDeleted,
+        }
+    }
 }
