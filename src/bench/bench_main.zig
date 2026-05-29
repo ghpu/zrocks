@@ -99,7 +99,7 @@ pub fn runBench(
     var cache_storage: Cache = undefined;
     var cache_ptr: ?*Cache = null;
     if (cfg.block_cache_bytes > 0) {
-        cache_storage = Cache.init(gpa, cfg.block_cache_bytes);
+        cache_storage = Cache.init(gpa, io, cfg.block_cache_bytes);
         cache_ptr = &cache_storage;
     }
     defer if (cache_ptr) |cp| cp.deinit();

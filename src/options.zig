@@ -337,7 +337,7 @@ test "compress-perlevel: empty per-level array falls back to scalar compression"
 }
 
 test "bench: Options.block_cache can be set" {
-    var c = Cache.init(std.testing.allocator, 1024 * 1024);
+    var c = Cache.init(std.testing.allocator, std.testing.io, 1024 * 1024);
     defer c.deinit();
     const opts = Options{ .block_cache = &c };
     try std.testing.expect(opts.block_cache != null);
