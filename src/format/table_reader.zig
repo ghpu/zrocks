@@ -191,12 +191,12 @@ pub const Table = struct {
 
     /// Read the metaindex block, look for a filter entry, and if present read
     /// the filter block and install the matching reader.  Auto-detects the
-    /// format (fulllocalbloom gate): a `"fullfilter."++name` entry installs a
-    /// FastLocalBloom `FullFilterReader`; otherwise a `"filter."++name` entry
-    /// installs the legacy block-based `FilterBlockReader`.  A missing filter
-    /// entry leaves the table working without bloom filtering.  The reader's
-    /// own `options.filter_mode` is irrelevant here — what is on disk wins, so
-    /// reopening a DB with a different mode never misreads old SSTs.
+    /// on-disk format: a `"fullfilter."++name` entry installs a FastLocalBloom
+    /// `FullFilterReader` (what zrocks now WRITES in every SST); a legacy
+    /// `"filter."++name` entry installs the block-based `FilterBlockReader`
+    /// (read-only — the WRITE path was dropped, but external LevelDB/old SSTs
+    /// still carry block-based filters).  A missing filter entry leaves the
+    /// table working without bloom filtering.  What is on disk always wins.
     fn readFilter(self: *Table, metaindex_handle: BlockHandle) !void {
         var meta_contents = try self.readBlockContents(metaindex_handle);
         defer meta_contents.release(self.gpa, self.block_cache);
@@ -312,17 +312,11 @@ pub const Table = struct {
                 if (!fr.keyMayMatch(handle.offset, key)) return null;
             }
         } else if (self.full_filter_reader) |*ffr| {
-            // FastLocalBloom full filter (fulllocalbloom): a single filter over
-            // every key, probed independently of the data-block offset.
-            if (self.prefix_extractor) |pe| {
-                const user_key = internal_key.extractUserKey(key);
-                if (pe.inDomain(user_key)) {
-                    if (!ffr.prefixMayMatch(pe.transform(user_key))) return null;
-                }
-                // out-of-domain: cannot prune; fall through to read the block.
-            } else {
-                if (!ffr.keyMayMatch(key)) return null;
-            }
+            // FastLocalBloom full filter (filter-rocksdb-only): a single filter
+            // over every WHOLE key, probed by the whole lookup key independently
+            // of the data-block offset.  The clean prefix-keyed filter was
+            // dropped, so the full filter is always whole-key — no prefix probe.
+            if (!ffr.keyMayMatch(key)) return null;
         }
 
         var data_contents = try self.readBlockContents(handle);
