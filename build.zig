@@ -102,6 +102,27 @@ pub fn build(b: *std.Build) void {
     });
     const run_leveldb_interop_tests = b.addRunArtifact(leveldb_interop_tests);
 
+    // Wave B core real-RocksDB read-interop gate (rooted at
+    // tests/rocksdb_interop_test.zig, importing the "zrocks" module): opens a
+    // committed genuine RocksDB v11.4.0 database read_only and reads every live
+    // key.  The absolute fixture path is injected as a build option so the test
+    // is independent of the process working directory.
+    const rocksdb_fixture_opts = b.addOptions();
+    rocksdb_fixture_opts.addOption(
+        []const u8,
+        "rocksdb_fixture_path",
+        b.pathFromRoot("tests/fixtures/rocksdb/basic"),
+    );
+    const rocksdb_interop_mod = b.createModule(.{
+        .root_source_file = b.path("tests/rocksdb_interop_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "zrocks", .module = mod }},
+    });
+    rocksdb_interop_mod.addOptions("build_options", rocksdb_fixture_opts);
+    const rocksdb_interop_tests = b.addTest(.{ .root_module = rocksdb_interop_mod });
+    const run_rocksdb_interop_tests = b.addRunArtifact(rocksdb_interop_tests);
+
     // Bench harness tests (bench_main.zig imports zrocks and has embedded tests).
     const bench_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -118,5 +139,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_integration_tests.step);
     test_step.dependOn(&run_interop_tests.step);
     test_step.dependOn(&run_leveldb_interop_tests.step);
+    test_step.dependOn(&run_rocksdb_interop_tests.step);
     test_step.dependOn(&run_bench_tests.step);
 }

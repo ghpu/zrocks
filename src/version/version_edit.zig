@@ -57,7 +57,24 @@ const Tag = struct {
     const kDeletedFile: u32 = 6;
     const kNewFile: u32 = 7;
     const kPrevLogNumber: u32 = 9;
-    const kNewFile4: u32 = 100;
+    /// kMinLogNumberToKeep (RocksDB tag 10): varint64 floor below which obsolete
+    /// WALs may be dropped.  Recovery has no use for it (it never deletes logs in
+    /// read paths) but it MUST be decoded so the real MANIFEST parses; we skip it.
+    const kMinLogNumberToKeep: u32 = 10;
+    /// zrocks legacy: zrocks's OWN DBs emit the extended new-file record under
+    /// tag 100 (RocksDB's kNewFile2) but in kNewFile4 wire shape (seqnos + a
+    /// custom-field terminator).  Kept for back-compatibility with self-written
+    /// databases.  Real RocksDB uses kNewFile4 = 103 for the same wire shape.
+    const kNewFile2Compat: u32 = 100;
+    /// kNewFile4 (RocksDB tag 103): the canonical extended new-file record.
+    const kNewFile4: u32 = 103;
+    /// kInAtomicGroup (RocksDB tag 300): varint32 "remaining edits in group".
+    /// Recovery applies edits sequentially regardless, so we decode + ignore.
+    const kInAtomicGroup: u32 = 300;
+    /// Mask bit (1 << 13) marking a forward-compatible tag from a newer RocksDB
+    /// that we may safely ignore.  Its payload is always a single
+    /// length-prefixed slice (RocksDB version_edit.cc default case).
+    const kTagSafeIgnoreMask: u32 = 1 << 13;
     // RocksDB column-family lifecycle tags (version_edit.cc).
     /// Identifies which CF this VersionEdit applies to (CF id, varint32).
     const kColumnFamily: u32 = 200;
@@ -448,7 +465,23 @@ pub const VersionEdit = struct {
                 Tag.kMaxColumnFamily => {
                     edit.max_column_family = try coding.getVarint32(&input);
                 },
-                Tag.kNewFile4 => {
+                Tag.kMinLogNumberToKeep => {
+                    // Decode + discard: read paths never garbage-collect WALs.
+                    _ = try coding.getVarint64(&input);
+                },
+                Tag.kInAtomicGroup => {
+                    // Decode + discard the "remaining edits" count: recovery
+                    // replays edits sequentially, so atomic-group framing is a
+                    // no-op for the read path.
+                    _ = try coding.getVarint32(&input);
+                },
+                Tag.kNewFile2Compat, Tag.kNewFile4 => {
+                    // Both share the kNewFile4 wire shape: scalars + two
+                    // internal keys + smallest/largest seqno + a custom-field
+                    // loop terminated by kTerminate.  Tag 100 is what zrocks's
+                    // own writer emits (RocksDB calls 100 "kNewFile2" but never
+                    // appends custom fields under it); tag 103 is real RocksDB's
+                    // kNewFile4.  We accept both identically.
                     const level = try coding.getVarint32(&input);
                     const number = try coding.getVarint64(&input);
                     const file_size = try coding.getVarint64(&input);
@@ -482,7 +515,20 @@ pub const VersionEdit = struct {
                         },
                     });
                 },
-                else => return error.Corruption,
+                else => {
+                    // A tag we don't explicitly handle.  RocksDB's convention:
+                    // tags with the kTagSafeIgnoreMask (1<<13) bit set are
+                    // forward-compatible records whose payload is a single
+                    // length-prefixed slice — skip them (e.g. kDbId,
+                    // kPersistUserDefinedTimestamps, kLastCompactedManifestFileSize,
+                    // kWalAddition/Deletion, kFullHistoryTsLow).  Anything else
+                    // is a genuine unknown tag → Corruption.
+                    if (tag & Tag.kTagSafeIgnoreMask != 0) {
+                        _ = try coding.getLengthPrefixedSlice(&input);
+                    } else {
+                        return error.Corruption;
+                    }
+                },
             }
         }
         return edit;
@@ -666,12 +712,13 @@ test "newfile4: golden byte prefix + terminate (no custom fields)" {
     defer buf.deinit(gpa);
     try edit.encodeTo(&buf, gpa);
 
-    // tag=100 (0x64), level=1, number=7, file_size=1000 (0xe8,0x07),
+    // tag=kNewFile4=103 (0x67) — the real RocksDB tag, which zrocks now emits
+    // for byte-exact interop; level=1, number=7, file_size=1000 (0xe8,0x07),
     // smallest len=9 + 9 bytes, largest len=9 + 9 bytes,
     // smallest_seqno=42 (0x2a), largest_seqno=99 (0x63), kTerminate=1 (0x01).
     var expected: std.ArrayListUnmanaged(u8) = .empty;
     defer expected.deinit(gpa);
-    try expected.appendSlice(gpa, &[_]u8{ 0x64, 0x01, 0x07, 0xe8, 0x07 });
+    try expected.appendSlice(gpa, &[_]u8{ 0x67, 0x01, 0x07, 0xe8, 0x07 });
     try expected.append(gpa, 0x09);
     try expected.appendSlice(gpa, smallest);
     try expected.append(gpa, 0x09);
@@ -960,4 +1007,102 @@ test "newfile4 and newfile (v7) coexist; default seqnos are zero" {
     try std.testing.expectEqual(@as(u64, 20), edit2.new_files.items[1].meta.number);
     try std.testing.expectEqual(@as(u64, 5), edit2.new_files.items[1].meta.smallest_seqno);
     try std.testing.expectEqual(@as(u64, 6), edit2.new_files.items[1].meta.largest_seqno);
+}
+
+// ===========================================================================
+// Real-RocksDB MANIFEST tag interop (Wave B)
+// ===========================================================================
+
+test "rocksdb interop: encoder emits kNewFile4 = tag 103" {
+    const gpa = std.testing.allocator;
+    const s = "a" ++ [_]u8{0} ** 8;
+    const l = "b" ++ [_]u8{0} ** 8;
+    var edit = VersionEdit.init();
+    defer edit.deinit(gpa);
+    try edit.addFile4(gpa, 0, 9, 1, s, l, 1, 2);
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(gpa);
+    try edit.encodeTo(&buf, gpa);
+    // First byte is the tag: 103 fits in one varint byte (0x67).
+    try std.testing.expectEqual(@as(u8, 103), buf.items[0]);
+}
+
+test "rocksdb interop: decode accepts the real kNewFile4 = 103 wire shape" {
+    const gpa = std.testing.allocator;
+    const smallest = "key000" ++ &[_]u8{ 0x01, 0x01, 0, 0, 0, 0, 0, 0 };
+    const largest = "key099" ++ &[_]u8{ 0x64, 0, 0, 0, 0, 0, 0, 0 };
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(gpa);
+    try coding.putVarint32(&buf, gpa, 103); // real RocksDB kNewFile4
+    try coding.putVarint32(&buf, gpa, 0); // level
+    try coding.putVarint64(&buf, gpa, 9); // number
+    try coding.putVarint64(&buf, gpa, 3670); // file_size
+    try coding.putLengthPrefixedSlice(&buf, gpa, smallest);
+    try coding.putLengthPrefixedSlice(&buf, gpa, largest);
+    try coding.putVarint64(&buf, gpa, 1); // smallest_seqno
+    try coding.putVarint64(&buf, gpa, 100); // largest_seqno
+    // Custom fields RocksDB v11 emits: kEpochNumber=13 then kUniqueId=12, then
+    // kTerminate=1 — all safe to skip.
+    try coding.putVarint32(&buf, gpa, 13);
+    try coding.putLengthPrefixedSlice(&buf, gpa, &[_]u8{0x01});
+    try coding.putVarint32(&buf, gpa, 12);
+    try coding.putLengthPrefixedSlice(&buf, gpa, &[_]u8{0} ** 16);
+    try coding.putVarint32(&buf, gpa, 1); // kTerminate
+
+    var edit = try VersionEdit.decodeFrom(gpa, buf.items);
+    defer edit.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), edit.new_files.items.len);
+    const nf = edit.new_files.items[0];
+    try std.testing.expectEqual(@as(u64, 9), nf.meta.number);
+    try std.testing.expectEqual(@as(u64, 3670), nf.meta.file_size);
+    try std.testing.expectEqual(@as(u64, 1), nf.meta.smallest_seqno);
+    try std.testing.expectEqual(@as(u64, 100), nf.meta.largest_seqno);
+}
+
+test "rocksdb interop: decode skips kMinLogNumberToKeep (tag 10)" {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(gpa);
+    try coding.putVarint32(&buf, gpa, 9); // kPrevLogNumber
+    try coding.putVarint64(&buf, gpa, 0);
+    try coding.putVarint32(&buf, gpa, 3); // kNextFileNumber
+    try coding.putVarint64(&buf, gpa, 10);
+    try coding.putVarint32(&buf, gpa, 10); // kMinLogNumberToKeep
+    try coding.putVarint64(&buf, gpa, 8);
+
+    var edit = try VersionEdit.decodeFrom(gpa, buf.items);
+    defer edit.deinit(gpa);
+    try std.testing.expectEqual(@as(u64, 10), edit.next_file_number.?);
+}
+
+test "rocksdb interop: decode skips safe-ignore tags (kDbId 8193, etc.)" {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(gpa);
+    // kDbId = kTagSafeIgnoreMask + 1 = 8193; payload is a length-prefixed UUID.
+    try coding.putVarint32(&buf, gpa, 8193);
+    try coding.putLengthPrefixedSlice(&buf, gpa, "96f7a699-902e-475f-a3ae-8ddb9462007a");
+    // Then a normal scalar to prove decoding resumed correctly past the skip.
+    try coding.putVarint32(&buf, gpa, 4); // kLastSequence
+    try coding.putVarint64(&buf, gpa, 101);
+
+    var edit = try VersionEdit.decodeFrom(gpa, buf.items);
+    defer edit.deinit(gpa);
+    try std.testing.expectEqual(@as(u64, 101), edit.last_sequence.?);
+}
+
+test "rocksdb interop: decode + ignore kInAtomicGroup (tag 300)" {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(gpa);
+    try coding.putVarint32(&buf, gpa, 300); // kInAtomicGroup
+    try coding.putVarint32(&buf, gpa, 2); // remaining edits
+    try coding.putVarint32(&buf, gpa, 2); // kLogNumber
+    try coding.putVarint64(&buf, gpa, 7);
+
+    var edit = try VersionEdit.decodeFrom(gpa, buf.items);
+    defer edit.deinit(gpa);
+    try std.testing.expectEqual(@as(u64, 7), edit.log_number.?);
 }
