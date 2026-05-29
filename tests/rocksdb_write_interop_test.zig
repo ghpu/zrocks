@@ -2,16 +2,16 @@
 //!
 //! ## Track 1 — CI self-consistency (runs in every `zig build test`)
 //!
-//! Proves that a zrocks DB written in the opt-in rocksdb-compatible dialect
-//! (`Options.sst_output = .rocksdb`), FULLY FLUSHED to SSTs, is internally
-//! consistent and re-readable end to end WITHOUT a real RocksDB binary:
+//! Proves that a zrocks DB (the format is now unconditionally RocksDB-compatible),
+//! FULLY FLUSHED to SSTs, is internally consistent and re-readable end to end
+//! WITHOUT a real RocksDB binary:
 //!
 //!   1. Write a DB via the public API in `.rocksdb` mode (keys spanning >= 2
 //!      data blocks plus a delete), force a flush so all data lives in SSTs and
 //!      the new WAL is empty, then close.
-//!   2. Re-open the SAME directory with a fresh zrocks DB (default `.native`
-//!      open options — the SST/MANIFEST readers auto-detect the on-disk RocksDB
-//!      form) and assert every live key reads back with its exact value, the
+//!   2. Re-open the SAME directory with a fresh zrocks DB (the SST/MANIFEST
+//!      readers transcode the on-disk RocksDB form) and assert every live key
+//!      reads back with its exact value, the
 //!      deleted key is absent, and a full scan yields exactly the live set.
 //!   3. Structural asserts on the on-disk bytes: the SST footer is fv5 + crc32c
 //!      with the RocksDB magic, its metaindex carries `rocksdb.properties` (the
@@ -133,7 +133,6 @@ test "rocksdb-write: fully-flushed .rocksdb DB round-trips through a fresh zrock
     {
         const opts = Options{
             .create_if_missing = true,
-            .sst_output = .rocksdb,
             .block_size = 48, // tiny -> several data blocks
             .block_restart_interval = 4,
         };
@@ -146,8 +145,7 @@ test "rocksdb-write: fully-flushed .rocksdb DB round-trips through a fresh zrock
 
     // ---- 2. Re-open with a fresh zrocks DB and read everything back ----
     {
-        // Default .native open options: the readers auto-detect the on-disk
-        // RocksDB form from the metaindex + index shape.
+        // The readers transcode the on-disk RocksDB index form.
         const db = try DB.open(gpa, e, dbname, .{});
         defer db.close();
 

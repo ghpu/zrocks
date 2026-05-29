@@ -29,7 +29,6 @@
 const std = @import("std");
 
 const block = @import("block.zig");
-const partitioned_index = @import("partitioned_index.zig");
 const filter_block = @import("filter_block.zig");
 const full_filter = @import("full_filter.zig");
 const bloom = @import("bloom.zig");
@@ -70,15 +69,9 @@ const kFullFilterMetaKeyPrefix: []const u8 = "fullfilter.";
 /// "rocksdb.deletion_data" / range_del block with a different layout.
 const kRangeDelMetaKey: []const u8 = "rocksdb.range_del";
 
-/// Metaindex key recording the SST's index shape (partitioned-idx), in zrocks's
-/// own clean format: a 1-byte tag (0=single_level, 1=two_level).  Written only
-/// for two-level tables; a missing entry means single_level so every existing
-/// SST keeps reading unchanged.  See partitioned_index.zig.
-const kIndexTypeMetaKey: []const u8 = partitioned_index.kIndexTypeMetaKey;
-
-/// Metaindex key naming the RocksDB table-properties block (rocksdb-write).
-/// Its presence is exactly the discriminator the reader uses to recognise a
-/// RocksDB-form SST (see `table_reader.metaindexHasRocksDbProperties`).
+/// Metaindex key naming the RocksDB table-properties block.  Every SST zrocks
+/// writes now carries it (the RocksDB-only format flip); the reader recognises a
+/// RocksDB-form index by its presence (see `table_reader`).
 const kRocksDbPropertiesMetaKey: []const u8 = "rocksdb.properties";
 
 pub const TableBuilder = struct {
@@ -89,15 +82,6 @@ pub const TableBuilder = struct {
 
     /// Builder for the current data block (entries flushed at ~block_size).
     data_block: BlockBuilder,
-    /// Builder for the index block (one entry per flushed data block).  Used
-    /// directly as the flat index under `.single_level`; under `.two_level` it is
-    /// the reusable builder for the TOP-LEVEL index block (see `index_partitions`).
-    index_block: BlockBuilder,
-    /// Partitioned (two-level) index accumulator (partitioned-idx).  Non-null only
-    /// when `options.index_type == .two_level`: index entries are routed here
-    /// during the build, then partitioned + written at `finish`.  zrocks's OWN
-    /// clean two-level format (see partitioned_index.zig), NOT RocksDB byte-exact.
-    index_partitions: ?partitioned_index.PartitionedIndexBuilder,
     /// Block-based bloom filter builder (one filter per 2KB data range).
     /// Used only when `options.filter_mode == .block_based` (the default).
     filter: FilterBlockBuilder,
@@ -130,11 +114,11 @@ pub const TableBuilder = struct {
     /// meta block registered under `kRangeDelMetaKey`.
     range_tombstones: delete_range.RangeTombstoneList,
 
-    // -- rocksdb-write (sst_output == .rocksdb) accumulators ------------------
+    // -- RocksDB-form index + properties accumulators -------------------------
     /// USER-key separators for the RocksDB-form index (one per data block).
     /// Each is the user-key portion of the chosen separator (no 8-byte trailer);
-    /// RocksDB reads the index with `index.key.is.user.key=1`.  Only populated
-    /// when `options.sst_output == .rocksdb`; owned (each entry freed in deinit).
+    /// RocksDB reads the index with `index.key.is.user.key=1`.  Owned (each entry
+    /// freed in deinit).
     rdb_index_seps: std.ArrayListUnmanaged([]u8),
     /// Data-block handles paired with `rdb_index_seps` (same length/order).
     rdb_index_handles: std.ArrayListUnmanaged(BlockHandle),
@@ -172,16 +156,6 @@ pub const TableBuilder = struct {
             // Data + index blocks hold keys ordered by the table's comparator
             // (an InternalKeyComparator for DB SSTs), so build them with it.
             .data_block = BlockBuilder.init(gpa, options.comparator, options.block_restart_interval),
-            .index_block = BlockBuilder.init(gpa, options.comparator, kMetaIndexRestartInterval),
-            .index_partitions = switch (options.index_type) {
-                .single_level => null,
-                .two_level => partitioned_index.PartitionedIndexBuilder.init(
-                    gpa,
-                    options.comparator,
-                    kMetaIndexRestartInterval,
-                    options.metadata_block_size,
-                ),
-            },
             .filter = filter,
             .full_filter = full_filter.FullFilterBuilder.init(policy.bits_per_key),
             .last_key = .empty,
@@ -205,8 +179,6 @@ pub const TableBuilder = struct {
 
     pub fn deinit(self: *TableBuilder) void {
         self.data_block.deinit();
-        self.index_block.deinit();
-        if (self.index_partitions) |*pib| pib.deinit();
         self.filter.deinit(self.gpa);
         self.full_filter.deinit(self.gpa);
         self.last_key.deinit(self.gpa);
@@ -317,29 +289,18 @@ pub const TableBuilder = struct {
     fn appendIndexEntry(self: *TableBuilder) !void {
         std.debug.assert(self.pending_index_entry);
 
-        // rocksdb-write: capture the USER-key separator + data-block handle for
-        // the RocksDB-form index built at `finish`.  `self.last_key` is the
-        // chosen separator (an internal key); RocksDB's index stores only its
-        // user-key portion (index.key.is.user.key=1).  The native index block
-        // is NOT built in this mode, so we return early after capturing.
-        if (self.options.sst_output == .rocksdb) {
-            const user_sep = internal_key.extractUserKey(self.last_key.items);
-            try self.rdb_index_seps.append(self.gpa, try self.gpa.dupe(u8, user_sep));
-            try self.rdb_index_handles.append(self.gpa, self.pending_handle);
-            self.pending_index_entry = false;
-            return;
-        }
-
-        self.handle_encoding.clearRetainingCapacity();
-        try self.pending_handle.encodeTo(&self.handle_encoding, self.gpa);
-        // Single-level: add straight to the flat index block.  Two-level: route to
-        // the partitioned-index accumulator (partitioned-idx); the partition/top
-        // blocks are produced at `finish`.
-        if (self.index_partitions) |*pib| {
-            try pib.addEntry(self.last_key.items, self.handle_encoding.items);
-        } else {
-            try self.index_block.add(self.last_key.items, self.handle_encoding.items);
-        }
+        // Capture the USER-key separator + data-block handle for the RocksDB-form
+        // index built at `finish`.  `self.last_key` is the chosen separator;
+        // RocksDB's index stores only its user-key portion (index.key.is.user.key
+        // =1).  DB SSTs are built with the InternalKeyComparator, so the separator
+        // is an internal key whose 8-byte trailer must be stripped; a bare-bytewise
+        // SST (no IKC) stores user keys directly, so use the separator as-is.
+        const user_sep = if (std.mem.eql(u8, self.options.comparator.name(), "leveldb.InternalKeyComparator"))
+            internal_key.extractUserKey(self.last_key.items)
+        else
+            self.last_key.items;
+        try self.rdb_index_seps.append(self.gpa, try self.gpa.dupe(u8, user_sep));
+        try self.rdb_index_handles.append(self.gpa, self.pending_handle);
         self.pending_index_entry = false;
     }
 
@@ -368,37 +329,6 @@ pub const TableBuilder = struct {
         const handle = try self.writeRawBlock(contents, kNoCompression);
         builder.reset();
         return handle;
-    }
-
-    /// Partition the accumulated index entries (partitioned-idx), write each
-    /// index PARTITION block (uncompressed, with the standard CRC trailer) to the
-    /// file, build the TOP-LEVEL index block, write it the same way, and return
-    /// its BlockHandle (the footer's `index_handle`).  Only called in two-level
-    /// mode (`index_partitions != null`).
-    fn writePartitionedIndex(self: *TableBuilder) !BlockHandle {
-        const pib = &self.index_partitions.?;
-        std.debug.assert(!pib.isEmpty());
-
-        // The TOP-LEVEL index block reuses `self.index_block` (already a fresh
-        // BlockBuilder with the table comparator + meta restart interval).
-        const num_parts = try pib.finish(
-            @ptrCast(self),
-            writePartitionCb,
-            &self.index_block,
-        );
-        std.debug.assert(num_parts >= 1);
-
-        // Write the finished top-level block (its bytes are produced by `finish`
-        // on `self.index_block`; `writeBlock` finishes+writes+resets it).
-        return try self.writeBlock(&self.index_block);
-    }
-
-    /// `PartitionedIndexBuilder.WritePartitionFn` adapter: writes one finished
-    /// index partition block to the file (uncompressed, with CRC trailer) and
-    /// returns its BlockHandle.  `ctx` is the `*TableBuilder`.
-    fn writePartitionCb(ctx: *anyopaque, contents: []const u8) anyerror!BlockHandle {
-        const self: *TableBuilder = @ptrCast(@alignCast(ctx));
-        return self.writeRawBlock(contents, kNoCompression);
     }
 
     /// Finish a data block, optionally Snappy-compress it (when
@@ -449,131 +379,32 @@ pub const TableBuilder = struct {
         return handle;
     }
 
-    /// Flush the remaining data, write the filter/metaindex/index blocks and
-    /// the footer, then flush the file. Does NOT close the file (caller owns).
+    /// Finish the SST in the (now unconditional) RocksDB-openable form.  Data
+    /// blocks were already written (internal keys).  Emit, in order:
+    ///   1. the final pending index entry (user-key short successor);
+    ///   2. the RocksDB-form INDEX block — USER-key separators (no trailer) +
+    ///      bare 2-varint handles, restart_interval=1 (every entry a restart);
+    ///   3. (when the table carries tombstones) the range-del block — still the
+    ///      zrocks bespoke `RangeTombstoneList` layout (the range-del-rocksdb
+    ///      milestone converts it to RocksDB's fragmented format);
+    ///   4. the `rocksdb.properties` block — the table properties RocksDB
+    ///      requires to open the file (num_entries, comparator name, the index
+    ///      shape flags index.key.is.user.key=1 + index.value.is.delta.encoded=1
+    ///      + block.based.table.index.type=kBinarySearch, raw sizes, …);
+    ///   5. the metaindex block — `rocksdb.properties` -> handle and (when
+    ///      present) `rocksdb.range_del` -> handle, in ascending bytewise key
+    ///      order ("rocksdb.properties" < "rocksdb.range_del");
+    ///   6. the fv5 / crc32c footer.
+    /// No filter block is written: RocksDB opens fine without one (the
+    /// filter-rocksdb-only milestone re-adds a FastLocalBloom full filter).
+    /// Does NOT close the file (caller owns).
     pub fn finish(self: *TableBuilder) !void {
         std.debug.assert(!self.finished);
         try self.flush();
         self.finished = true;
 
-        // rocksdb-write: emit a RocksDB-openable SST (RocksDB-form index +
-        // rocksdb.properties meta block, no filter block).  Diverges entirely
-        // from the native layout below.
-        if (self.options.sst_output == .rocksdb) {
-            try self.finishRocksDb();
-            return;
-        }
-
-        // 1. Filter block.  The active format (fulllocalbloom gate) decides both
-        //    the on-disk filter layout and the metaindex key it is registered
-        //    under — block-based under "filter."++name, full under
-        //    "fullfilter."++name — so the two never collide on disk.
-        const filter_contents = switch (self.options.filter_mode) {
-            .block_based => try self.filter.finish(self.gpa),
-            .full => try self.full_filter.finish(self.gpa),
-        };
-        const filter_handle = try self.writeRawBlock(filter_contents, kNoCompression);
-
-        // 1b. Range-del block (M7.5): a serialized RangeTombstoneList.  Written
-        //     only when the table carries tombstones (a table without them has no
-        //     range-del entry in the metaindex, and the reader treats its absence
-        //     as "no tombstones").
-        var range_del_handle: ?BlockHandle = null;
-        if (!self.range_tombstones.isEmpty()) {
-            var rd_buf: std.ArrayListUnmanaged(u8) = .empty;
-            defer rd_buf.deinit(self.gpa);
-            try self.range_tombstones.encode(&rd_buf, self.gpa);
-            range_del_handle = try self.writeRawBlock(rd_buf.items, kNoCompression);
-        }
-
-        // 2. Metaindex block: "filter."++name -> filter handle, and (when present)
-        //    "rocksdb.range_del" -> range-del handle.  Its keys are plain bytewise
-        //    meta keys (NOT internal keys), ordered/searched with the bytewise
-        //    comparator (matching the reader), so entries MUST be added in
-        //    ascending bytewise key order: "filter." < "rocksdb.range_del".
-        var metaindex_block = BlockBuilder.init(self.gpa, comparator.bytewise, kMetaIndexRestartInterval);
-        defer metaindex_block.deinit();
-        {
-            var key_buf: std.ArrayListUnmanaged(u8) = .empty;
-            defer key_buf.deinit(self.gpa);
-            const meta_prefix = switch (self.options.filter_mode) {
-                .block_based => kFilterMetaKeyPrefix,
-                .full => kFullFilterMetaKeyPrefix,
-            };
-            try key_buf.appendSlice(self.gpa, meta_prefix);
-            try key_buf.appendSlice(self.gpa, self.policy.name());
-
-            self.handle_encoding.clearRetainingCapacity();
-            try filter_handle.encodeTo(&self.handle_encoding, self.gpa);
-            try metaindex_block.add(key_buf.items, self.handle_encoding.items);
-        }
-        // Index-type tag (partitioned-idx): record a 1-byte tag ONLY for
-        // two-level tables so the reader can auto-detect the index shape.  Added
-        // before "rocksdb.range_del" to keep the metaindex bytewise-sorted
-        // ("rocksdb.index_type" < "rocksdb.range_del").  A single-level table
-        // writes no such entry (its absence means single_level).
-        if (self.index_partitions != null) {
-            try metaindex_block.add(kIndexTypeMetaKey, &[_]u8{partitioned_index.kTwoLevelTag});
-        }
-        if (range_del_handle) |rdh| {
-            self.handle_encoding.clearRetainingCapacity();
-            try rdh.encodeTo(&self.handle_encoding, self.gpa);
-            try metaindex_block.add(kRangeDelMetaKey, self.handle_encoding.items);
-        }
-        const metaindex_handle = try self.writeBlock(&metaindex_block);
-
-        // 3. Final pending index entry (use a short successor of the last key).
-        if (self.pending_index_entry) {
-            self.options.comparator.findShortSuccessor(&self.last_key);
-            try self.appendIndexEntry();
-        }
-
-        // 4. Index block.  Single-level: write the one flat index block.
-        //    Two-level (partitioned-idx): partition the accumulated index entries,
-        //    write each partition block, build the TOP-LEVEL index block, and
-        //    point the footer at the top-level block.
-        const index_handle = if (self.index_partitions != null)
-            try self.writePartitionedIndex()
-        else
-            try self.writeBlock(&self.index_block);
-
-        // 5. Footer (no trailer).
-        const footer = Footer{
-            .metaindex_handle = metaindex_handle,
-            .index_handle = index_handle,
-            .format_version = 5,
-            .checksum_type = .crc32c,
-        };
-        var footer_buf: std.ArrayListUnmanaged(u8) = .empty;
-        defer footer_buf.deinit(self.gpa);
-        try footer.encodeTo(&footer_buf, self.gpa);
-        try self.file.append(footer_buf.items);
-        self.offset += footer_buf.items.len;
-
-        try self.file.flush();
-    }
-
-    // -----------------------------------------------------------------------
-    // rocksdb-write — emit a real-RocksDB-openable SST (sst_output == .rocksdb)
-    // -----------------------------------------------------------------------
-
-    /// Finish the SST in RocksDB-openable form.  Data blocks were already
-    /// written (internal keys, exactly as native).  Here we emit, in order:
-    ///   1. the final pending index entry (user-key short successor);
-    ///   2. the RocksDB-form INDEX block — USER-key separators (no trailer) +
-    ///      bare 2-varint handles, restart_interval=1 (every entry a restart);
-    ///   3. the `rocksdb.properties` block — the basic table properties RocksDB
-    ///      requires to open the file (num_entries, comparator name, the index
-    ///      shape flags index.key.is.user.key=1 + index.value.is.delta.encoded=1
-    ///      + block.based.table.index.type=kBinarySearch, raw sizes, …);
-    ///   4. the metaindex block — a single `rocksdb.properties` -> handle entry
-    ///      (no filter, no zrocks-specific tags), the read-side discriminator;
-    ///   5. the fv5 / crc32c footer.
-    /// No filter block is written: RocksDB opens fine without one.
-    fn finishRocksDb(self: *TableBuilder) !void {
         // 1. Final pending index entry — narrow the last key to a short user-key
-        //    successor, then capture it (appendIndexEntry routes to the rocksdb
-        //    accumulators under sst_output == .rocksdb).
+        //    successor, then capture it into the index accumulators.
         if (self.pending_index_entry) {
             self.options.comparator.findShortSuccessor(&self.last_key);
             try self.appendIndexEntry();
@@ -587,11 +418,21 @@ pub const TableBuilder = struct {
         );
         defer self.gpa.free(index_raw);
         // Data blocks span [0, current offset); record it for the data.size
-        // property BEFORE the index/properties/metaindex are written.
+        // property BEFORE the index/range-del/properties/metaindex are written.
         const data_size = self.offset;
         const index_handle = try self.writeRawBlock(index_raw, kNoCompression);
 
-        // 3. Properties block.
+        // 3. Range-del block (M7.5): a serialized RangeTombstoneList, written only
+        //    when the table carries tombstones.  Absent entry => no tombstones.
+        var range_del_handle: ?BlockHandle = null;
+        if (!self.range_tombstones.isEmpty()) {
+            var rd_buf: std.ArrayListUnmanaged(u8) = .empty;
+            defer rd_buf.deinit(self.gpa);
+            try self.range_tombstones.encode(&rd_buf, self.gpa);
+            range_del_handle = try self.writeRawBlock(rd_buf.items, kNoCompression);
+        }
+
+        // 4. Properties block.
         const props_raw = try self.buildRocksDbPropertiesBlock(
             data_size,
             index_handle.size,
@@ -599,7 +440,10 @@ pub const TableBuilder = struct {
         defer self.gpa.free(props_raw);
         const props_handle = try self.writeRawBlock(props_raw, kNoCompression);
 
-        // 4. Metaindex block: a single `rocksdb.properties` -> handle entry.
+        // 5. Metaindex block: `rocksdb.properties` -> handle, then (when present)
+        //    `rocksdb.range_del` -> handle.  Keys are plain bytewise meta keys
+        //    ordered/searched with the bytewise comparator, so they MUST be added
+        //    in ascending bytewise order ("rocksdb.properties" < "rocksdb.range_del").
         var metaindex_block = BlockBuilder.init(self.gpa, comparator.bytewise, kMetaIndexRestartInterval);
         defer metaindex_block.deinit();
         {
@@ -607,9 +451,14 @@ pub const TableBuilder = struct {
             try props_handle.encodeTo(&self.handle_encoding, self.gpa);
             try metaindex_block.add(kRocksDbPropertiesMetaKey, self.handle_encoding.items);
         }
+        if (range_del_handle) |rdh| {
+            self.handle_encoding.clearRetainingCapacity();
+            try rdh.encodeTo(&self.handle_encoding, self.gpa);
+            try metaindex_block.add(kRangeDelMetaKey, self.handle_encoding.items);
+        }
         const metaindex_handle = try self.writeBlock(&metaindex_block);
 
-        // 5. Footer.
+        // 6. Footer.
         const footer = Footer{
             .metaindex_handle = metaindex_handle,
             .index_handle = index_handle,
@@ -846,7 +695,7 @@ fn freeEntries(gpa: std.mem.Allocator, list: *std.ArrayListUnmanaged(KV)) void {
     list.deinit(gpa);
 }
 
-test "table builder: multi-block round-trip, trailer CRCs, filter matches" {
+test "table builder: multi-block round-trip via Table.open (RocksDB-form), trailer CRCs" {
     const gpa = testing.allocator;
 
     var me = env.MemEnv.init(gpa);
@@ -882,85 +731,51 @@ test "table builder: multi-block round-trip, trailer CRCs, filter matches" {
         try wf.close();
     }
 
-    // ---- Read the file back ---------------------------------------------
+    // ---- Footer: fv5 + crc32c, RocksDB-form metaindex carries properties --
     const file = try readAllFile(e, gpa, "test.sst");
     defer gpa.free(file);
-
-    // ---- Footer ----------------------------------------------------------
     try testing.expect(file.len >= footer_mod.kEncodedLength);
     const footer = try Footer.decodeFrom(file[file.len - footer_mod.kEncodedLength ..]);
     try testing.expectEqual(@as(u32, 5), footer.format_version);
     try testing.expectEqual(footer_mod.ChecksumType.crc32c, footer.checksum_type);
-
-    // ---- Index block -----------------------------------------------------
-    const index_contents = try readVerifiedBlock(file, footer.index_handle);
-    const index_block = try block.Block.init(gpa, index_contents);
-
-    // Collect data-block handles from the index entries.
-    var data_handles: std.ArrayListUnmanaged(BlockHandle) = .empty;
-    defer data_handles.deinit(gpa);
-    {
-        var it = index_block.iterator(opts.comparator);
-        defer it.deinit();
-        it.seekToFirst();
-        while (it.valid()) : (it.next()) {
-            var hv: []const u8 = it.value();
-            const h = try BlockHandle.decodeFrom(&hv);
-            try data_handles.append(gpa, h);
-        }
-    }
-
-    // Multiple data blocks must have been produced.
-    try testing.expect(data_handles.items.len >= 2);
-
-    // ---- Data blocks: concatenated entries reproduce the input exactly ---
-    {
-        var idx: usize = 0;
-        for (data_handles.items) |h| {
-            const data_contents = try readVerifiedBlock(file, h);
-            const data_blk = try block.Block.init(gpa, data_contents);
-            var it = data_blk.iterator(opts.comparator);
-            defer it.deinit();
-            it.seekToFirst();
-            while (it.valid()) : (it.next()) {
-                try testing.expect(idx < entries.items.len);
-                try testing.expectEqualStrings(entries.items[idx].k, it.key());
-                try testing.expectEqualStrings(entries.items[idx].v, it.value());
-                idx += 1;
-            }
-        }
-        // Every input entry was reproduced, in order.
-        try testing.expectEqual(entries.items.len, idx);
-    }
-
-    // ---- Metaindex block: find the filter entry, read+verify filter ------
     {
         const meta_contents = try readVerifiedBlock(file, footer.metaindex_handle);
         const meta_blk = try block.Block.init(gpa, meta_contents);
-
-        // Expected key: "filter." ++ policy.name().
-        var want_key: std.ArrayListUnmanaged(u8) = .empty;
-        defer want_key.deinit(gpa);
-        try want_key.appendSlice(gpa, "filter.");
-        try want_key.appendSlice(gpa, policy.name());
-        try testing.expectEqualStrings("filter.leveldb.BuiltinBloomFilter2", want_key.items);
-
-        var it = meta_blk.iterator(opts.comparator);
+        var it = meta_blk.iterator(comparator.bytewise);
         defer it.deinit();
-        it.seek(want_key.items);
+        it.seek("rocksdb.properties");
         try testing.expect(it.valid());
-        try testing.expectEqualStrings(want_key.items, it.key());
-
-        var hv: []const u8 = it.value();
-        const filter_handle = try BlockHandle.decodeFrom(&hv);
-
-        const filter_contents = try readVerifiedBlock(file, filter_handle);
-        var fr = FilterBlockReader.init(policy, filter_contents);
-        // Several input keys should be reported as possibly-present.
-        try testing.expect(fr.keyMayMatch(0, entries.items[0].k));
-        try testing.expect(fr.keyMayMatch(0, entries.items[1].k));
-        try testing.expect(fr.keyMayMatch(0, entries.items[2].k));
+        try testing.expectEqualStrings("rocksdb.properties", it.key());
+        // No legacy block-based filter entry: filters are not written here.
+        it.seek("filter.leveldb.BuiltinBloomFilter2");
+        const has_filter = it.valid() and comparator.bytewise.compare(it.key(), "filter.leveldb.BuiltinBloomFilter2") == .eq;
+        try testing.expect(!has_filter);
     }
+
+    // ---- Round-trip every entry + a full ordered scan through Table.open --
+    const RdwTableT = @import("table_reader.zig").Table;
+    const size = try e.getFileSize("test.sst");
+    var raf = try e.newRandomAccessFile(gpa, "test.sst");
+    defer raf.close() catch {};
+    var tbl = try RdwTableT.open(gpa, raf, size, opts, policy, null, 0);
+    defer tbl.deinit();
+
+    for (entries.items) |kv| {
+        const got = try tbl.get(gpa, kv.k) orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings(kv.v, got);
+    }
+    var it = tbl.iterator(gpa);
+    defer it.deinit();
+    var idx: usize = 0;
+    it.seekToFirst();
+    while (it.valid()) : (it.next()) {
+        try testing.expect(idx < entries.items.len);
+        try testing.expectEqualStrings(entries.items[idx].k, it.key());
+        try testing.expectEqualStrings(entries.items[idx].v, it.value());
+        idx += 1;
+    }
+    try testing.expectEqual(entries.items.len, idx);
 }
 
 test "table builder: snappy data blocks — kSnappy trailer, CRC over compressed, handle = compressed size, decompresses to entries" {
@@ -1004,59 +819,62 @@ test "table builder: snappy data blocks — kSnappy trailer, CRC over compressed
     const file = try readAllFile(e, gpa, "snap.sst");
     defer gpa.free(file);
 
+    // At least one data block on disk must carry the kSnappy trailer byte (proves
+    // compression actually happened); each compressed payload must decompress.
+    // The data blocks span the file prefix before the index/properties/metaindex/
+    // footer; we scan trailers by walking blocks from offset 0 using the on-disk
+    // index handles parsed from the RocksDB-form index.
     const footer = try Footer.decodeFrom(file[file.len - footer_mod.kEncodedLength ..]);
-
-    // Index/metaindex/filter remain uncompressed (verbatim).
     const index_contents = try readVerifiedBlock(file, footer.index_handle);
-    const index_block = try block.Block.init(gpa, index_contents);
-
-    var data_handles: std.ArrayListUnmanaged(BlockHandle) = .empty;
-    defer data_handles.deinit(gpa);
+    // RocksDB-form index: restart_interval=1, USER-key sep + bare handle.  Decode
+    // each restart entry to recover the data-block handles.
+    var any_snappy = false;
     {
-        var it = index_block.iterator(opts.comparator);
-        defer it.deinit();
-        it.seekToFirst();
-        while (it.valid()) : (it.next()) {
-            var hv: []const u8 = it.value();
-            const h = try BlockHandle.decodeFrom(&hv);
-            try data_handles.append(gpa, h);
+        const raw = index_contents;
+        const num_restarts = coding.decodeFixed32(raw[raw.len - 4 ..][0..4]);
+        try testing.expect(num_restarts >= 2); // several data blocks
+        const restart_array_off = raw.len - (@as(usize, num_restarts) + 1) * @sizeOf(u32);
+        for (0..num_restarts) |i| {
+            const estart = coding.decodeFixed32(raw[restart_array_off + i * 4 ..][0..4]);
+            const eend: usize = if (i + 1 < num_restarts)
+                coding.decodeFixed32(raw[restart_array_off + (i + 1) * 4 ..][0..4])
+            else
+                restart_array_off;
+            var entry: []const u8 = raw[estart..eend];
+            const shared = try coding.getVarint32(&entry);
+            const non_shared = try coding.getVarint32(&entry);
+            try testing.expectEqual(@as(u32, 0), shared);
+            entry = entry[non_shared..];
+            const h = try BlockHandle.decodeFrom(&entry);
+            const dstart: usize = @intCast(h.offset);
+            const dsize: usize = @intCast(h.size);
+            if (file[dstart + dsize] == kSnappyCompression) {
+                any_snappy = true;
+                const decompressed = try snappy.decompress(gpa, file[dstart .. dstart + dsize]);
+                gpa.free(decompressed);
+            }
         }
     }
-    try testing.expect(data_handles.items.len >= 2);
+    try testing.expect(any_snappy);
 
-    // Each data block on disk must carry the kSnappy trailer byte, its CRC must
-    // cover the COMPRESSED bytes, handle.size must equal the compressed length,
-    // and decompressing must reproduce the original entries in order.
-    var any_snappy = false;
+    // Round-trip every entry through Table.open (exercises on-read decompression).
+    const RdwTableT = @import("table_reader.zig").Table;
+    const size = try e.getFileSize("snap.sst");
+    var raf = try e.newRandomAccessFile(gpa, "snap.sst");
+    defer raf.close() catch {};
+    var tbl = try RdwTableT.open(gpa, raf, size, opts, policy, null, 0);
+    defer tbl.deinit();
     var idx: usize = 0;
-    for (data_handles.items) |h| {
-        const start: usize = @intCast(h.offset);
-        const size: usize = @intCast(h.size);
-        const trailer_type = file[start + size];
-        if (trailer_type == kSnappyCompression) {
-            any_snappy = true;
-            // handle.size is the compressed payload length: decompressing it must
-            // yield MORE bytes than the on-disk size for this compressible data.
-            const decompressed = try snappy.decompress(gpa, file[start .. start + size]);
-            gpa.free(decompressed);
-        }
-
-        const data_contents = try readVerifiedBlockC(gpa, file, h);
-        defer gpa.free(data_contents);
-        const data_blk = try block.Block.init(gpa, data_contents);
-        var it = data_blk.iterator(opts.comparator);
-        defer it.deinit();
-        it.seekToFirst();
-        while (it.valid()) : (it.next()) {
-            try testing.expect(idx < entries.items.len);
-            try testing.expectEqualStrings(entries.items[idx].k, it.key());
-            try testing.expectEqualStrings(entries.items[idx].v, it.value());
-            idx += 1;
-        }
+    var it = tbl.iterator(gpa);
+    defer it.deinit();
+    it.seekToFirst();
+    while (it.valid()) : (it.next()) {
+        try testing.expect(idx < entries.items.len);
+        try testing.expectEqualStrings(entries.items[idx].k, it.key());
+        try testing.expectEqualStrings(entries.items[idx].v, it.value());
+        idx += 1;
     }
     try testing.expectEqual(entries.items.len, idx);
-    // At least one data block was actually stored Snappy-compressed.
-    try testing.expect(any_snappy);
 }
 
 test "table builder: single small block still well-formed" {
@@ -1091,27 +909,19 @@ test "table builder: single small block still well-formed" {
     const footer = try Footer.decodeFrom(file[file.len - footer_mod.kEncodedLength ..]);
     try testing.expectEqual(@as(u32, 5), footer.format_version);
 
+    // Exactly one data block -> the RocksDB-form index has exactly one entry.
     const index_contents = try readVerifiedBlock(file, footer.index_handle);
-    const index_block = try block.Block.init(gpa, index_contents);
+    const num_restarts = coding.decodeFixed32(index_contents[index_contents.len - 4 ..][0..4]);
+    try testing.expectEqual(@as(u32, 1), num_restarts);
 
-    // Exactly one data block -> exactly one index entry.
-    var n_index: usize = 0;
-    var data_handle: BlockHandle = undefined;
-    {
-        var it = index_block.iterator(opts.comparator);
-        defer it.deinit();
-        it.seekToFirst();
-        while (it.valid()) : (it.next()) {
-            var hv: []const u8 = it.value();
-            data_handle = try BlockHandle.decodeFrom(&hv);
-            n_index += 1;
-        }
-    }
-    try testing.expectEqual(@as(usize, 1), n_index);
-
-    const data_contents = try readVerifiedBlock(file, data_handle);
-    const data_blk = try block.Block.init(gpa, data_contents);
-    var it = data_blk.iterator(opts.comparator);
+    // Round-trip through Table.open.
+    const RdwTableT = @import("table_reader.zig").Table;
+    const size = try e.getFileSize("small.sst");
+    var raf = try e.newRandomAccessFile(gpa, "small.sst");
+    defer raf.close() catch {};
+    var tbl = try RdwTableT.open(gpa, raf, size, opts, policy, null, 0);
+    defer tbl.deinit();
+    var it = tbl.iterator(gpa);
     defer it.deinit();
     var idx: usize = 0;
     it.seekToFirst();
@@ -1124,150 +934,8 @@ test "table builder: single small block still well-formed" {
 }
 
 // ===========================================================================
-// fulllocalbloom — FastLocalBloom full filter wired through builder + reader.
-// ===========================================================================
-
-const FullFilterReader = full_filter.FullFilterReader;
-
-test "table builder: full-filter mode writes fullfilter. meta key + readable FastLocalBloom" {
-    const gpa = testing.allocator;
-
-    var me = env.MemEnv.init(gpa);
-    defer me.deinit();
-    const e = me.env();
-
-    const opts = options_mod.Options{
-        .block_size = 200,
-        .block_restart_interval = 4,
-        .filter_mode = .full, // fulllocalbloom gate
-    };
-    const policy = bloom.BloomFilterPolicy.init(10);
-
-    var entries = try makeSortedEntries(gpa, 50);
-    defer freeEntries(gpa, &entries);
-
-    {
-        var wf = try e.newWritableFile(gpa, "full.sst");
-        errdefer wf.close() catch {};
-        var tb = try TableBuilder.init(gpa, opts, wf, policy);
-        defer tb.deinit();
-        for (entries.items) |kv| try tb.add(kv.k, kv.v);
-        try tb.finish();
-        try wf.close();
-    }
-
-    const file = try readAllFile(e, gpa, "full.sst");
-    defer gpa.free(file);
-
-    const footer = try Footer.decodeFrom(file[file.len - footer_mod.kEncodedLength ..]);
-
-    // Metaindex carries the FULL-filter key, NOT the block-based one.
-    const meta_contents = try readVerifiedBlock(file, footer.metaindex_handle);
-    const meta_blk = try block.Block.init(gpa, meta_contents);
-
-    var full_key: std.ArrayListUnmanaged(u8) = .empty;
-    defer full_key.deinit(gpa);
-    try full_key.appendSlice(gpa, "fullfilter.");
-    try full_key.appendSlice(gpa, policy.name());
-    try testing.expectEqualStrings("fullfilter.leveldb.BuiltinBloomFilter2", full_key.items);
-
-    var legacy_key: std.ArrayListUnmanaged(u8) = .empty;
-    defer legacy_key.deinit(gpa);
-    try legacy_key.appendSlice(gpa, "filter.");
-    try legacy_key.appendSlice(gpa, policy.name());
-
-    {
-        var it = meta_blk.iterator(comparator.bytewise);
-        defer it.deinit();
-        it.seek(full_key.items);
-        try testing.expect(it.valid());
-        try testing.expectEqualStrings(full_key.items, it.key());
-
-        var hv: []const u8 = it.value();
-        const filter_handle = try BlockHandle.decodeFrom(&hv);
-        const filter_contents = try readVerifiedBlock(file, filter_handle);
-
-        var fr = FullFilterReader.init(filter_contents);
-        try testing.expect(fr.valid);
-        // No false negatives: every inserted internal key reports may-match.
-        for (entries.items) |kv| try testing.expect(fr.keyMayMatch(kv.k));
-        // An absent key is (almost surely) pruned.
-        try testing.expect(!fr.keyMayMatch("definitely-absent-key-9999"));
-    }
-
-    {
-        // The legacy "filter." block-based entry must be ABSENT in full mode.
-        var it = meta_blk.iterator(comparator.bytewise);
-        defer it.deinit();
-        it.seek(legacy_key.items);
-        const present = it.valid() and comparator.bytewise.compare(it.key(), legacy_key.items) == .eq;
-        try testing.expect(!present);
-    }
-}
-
-test "table reader: full-filter mode round-trips through Table.get (no data lost, absent pruned)" {
-    const gpa = testing.allocator;
-
-    var me = env.MemEnv.init(gpa);
-    defer me.deinit();
-    const e = me.env();
-
-    // Plain bytewise keys across several data blocks (small block_size), with
-    // the FastLocalBloom full filter enabled.  This drives Table.get's bloom
-    // fast-path through `full_filter_reader`: a present key must never be
-    // pruned (no false negatives), an absent key is pruned/not-found.
-    const opts = options_mod.Options{
-        .block_size = 200,
-        .block_restart_interval = 4,
-        .filter_mode = .full,
-    };
-    const policy = bloom.BloomFilterPolicy.init(10);
-
-    var entries = try makeSortedEntries(gpa, 50);
-    defer freeEntries(gpa, &entries);
-
-    {
-        var wf = try e.newWritableFile(gpa, "fullget.sst");
-        errdefer wf.close() catch {};
-        var tb = try TableBuilder.init(gpa, opts, wf, policy);
-        defer tb.deinit();
-        for (entries.items) |kv| try tb.add(kv.k, kv.v);
-        try tb.finish();
-        try wf.close();
-    }
-
-    const size = try e.getFileSize("fullget.sst");
-    var raf = try e.newRandomAccessFile(gpa, "fullget.sst");
-    defer raf.close() catch {};
-
-    const table_reader = @import("table_reader.zig");
-    var tbl = try table_reader.Table.open(gpa, raf, size, opts, policy, null, 0);
-    defer tbl.deinit();
-
-    // The reader must have detected the FULL filter (not the legacy one).
-    try testing.expect(tbl.full_filter_reader != null);
-    try testing.expect(tbl.filter_reader == null);
-
-    // 1. No data lost: every inserted key resolves to its value — proving the
-    //    full filter never drops a present key.
-    for (entries.items) |kv| {
-        const got = try tbl.get(gpa, kv.k);
-        try testing.expect(got != null);
-        defer gpa.free(got.?);
-        try testing.expectEqualStrings(kv.v, got.?);
-    }
-
-    // 2. Absent keys return null (the filter prunes most; any survivor is found
-    //    absent in its data block).
-    {
-        const got = try tbl.get(gpa, "key99999-definitely-absent");
-        try testing.expect(got == null);
-    }
-}
-
-// ===========================================================================
-// rocksdb-write — SST emitted in real-RocksDB-openable form (sst_output ==
-// .rocksdb).  CI-safe: zrocks writes the RocksDB-form SST, then RE-READS it via
+// rocksdb-write — SST emitted in real-RocksDB-openable form (now the ONLY form).
+// CI-safe: zrocks writes the RocksDB-form SST, then RE-READS it via
 // its own RocksDB-read path (Table.open auto-detects the form), proving the
 // metaindex carries rocksdb.properties and the index parses as the RocksDB
 // (user-key separator) shape.  The real-RocksDB authenticity gate lives in
@@ -1299,7 +967,6 @@ test "rocksdb-write: SST is RocksDB-form (metaindex has rocksdb.properties, inde
         .comparator = ikc.comparatorInterface(),
         .block_size = 64,
         .block_restart_interval = 4,
-        .sst_output = .rocksdb,
     };
     const policy = bloom.BloomFilterPolicy.init(10);
 
@@ -1487,43 +1154,4 @@ test "rocksdb-write: SST is RocksDB-form (metaindex has rocksdb.properties, inde
         }
         try testing.expectEqual(users.len, idx);
     }
-}
-
-test "rocksdb-write: native sst_output is unchanged (no rocksdb.properties, filter present)" {
-    const gpa = testing.allocator;
-
-    var me = env.MemEnv.init(gpa);
-    defer me.deinit();
-    const e = me.env();
-
-    const opts = options_mod.Options{ .block_size = 200, .block_restart_interval = 4 }; // .native default
-    const policy = bloom.BloomFilterPolicy.init(10);
-
-    var entries = try makeSortedEntries(gpa, 30);
-    defer freeEntries(gpa, &entries);
-    {
-        var wf = try e.newWritableFile(gpa, "native.sst");
-        errdefer wf.close() catch {};
-        var tb = try TableBuilder.init(gpa, opts, wf, policy);
-        defer tb.deinit();
-        for (entries.items) |kv| try tb.add(kv.k, kv.v);
-        try tb.finish();
-        try wf.close();
-    }
-
-    const file = try readAllFile(e, gpa, "native.sst");
-    defer gpa.free(file);
-    const footer = try Footer.decodeFrom(file[file.len - footer_mod.kEncodedLength ..]);
-    const meta_contents = try readVerifiedBlock(file, footer.metaindex_handle);
-    const meta_blk = try block.Block.init(gpa, meta_contents);
-    var it = meta_blk.iterator(comparator.bytewise);
-    defer it.deinit();
-
-    // Native mode: NO rocksdb.properties entry; the legacy filter entry IS there.
-    it.seek("rocksdb.properties");
-    const has_props = it.valid() and comparator.bytewise.compare(it.key(), "rocksdb.properties") == .eq;
-    try testing.expect(!has_props);
-    it.seek("filter.leveldb.BuiltinBloomFilter2");
-    try testing.expect(it.valid());
-    try testing.expectEqualStrings("filter.leveldb.BuiltinBloomFilter2", it.key());
 }

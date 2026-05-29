@@ -824,32 +824,18 @@ pub const VersionSet = struct {
     /// kColumnFamilyAdd record for the default CF so the snapshot is
     /// self-contained when read by a RocksDB-aware reader).
     fn writeSnapshot(self: *VersionSet, writer: *log_writer.Writer, wf: env.WritableFile) !void {
-        const rocksdb = self.options.sst_output == .rocksdb;
+        // The default-CF kColumnFamilyAdd record is OMITTED: real RocksDB
+        // auto-creates the default CF and rejects a MANIFEST that adds it again
+        // ("adding the same column family twice: default").
 
-        // First record: kColumnFamilyAdd for the default CF (id=0, name="default").
-        // OMITTED in rocksdb-write mode: real RocksDB auto-creates the default CF
-        // and rejects a MANIFEST that adds it again ("adding the same column
-        // family twice: default").
-        if (!rocksdb) {
-            var cf_edit = VersionEdit.init();
-            defer cf_edit.deinit(self.gpa);
-            cf_edit.setColumnFamilyId(0);
-            try cf_edit.setColumnFamilyAdd(self.gpa, "default");
-
-            var cf_buf: std.ArrayListUnmanaged(u8) = .empty;
-            defer cf_buf.deinit(self.gpa);
-            try cf_edit.encodeTo(&cf_buf, self.gpa);
-            try writer.addRecord(self.gpa, cf_buf.items);
-        }
-
-        // Second record: full state snapshot (comparator, scalars, files).
+        // Full state snapshot record (comparator, scalars, files).
         var edit = VersionEdit.init();
         defer edit.deinit(self.gpa);
 
-        // rocksdb-write records the USER comparator name; zrocks DB SSTs are
-        // ordered by the InternalKeyComparator, but RocksDB's MANIFEST expects
-        // the user comparator (e.g. leveldb.BytewiseComparator).
-        if (rocksdb and std.mem.eql(u8, self.cmp.name(), "leveldb.InternalKeyComparator")) {
+        // Record the USER comparator name; zrocks DB SSTs are ordered by the
+        // InternalKeyComparator, but RocksDB's MANIFEST expects the user
+        // comparator (e.g. leveldb.BytewiseComparator).
+        if (std.mem.eql(u8, self.cmp.name(), "leveldb.InternalKeyComparator")) {
             try edit.setComparatorName(self.gpa, "leveldb.BytewiseComparator");
         } else {
             try edit.setComparatorName(self.gpa, self.cmp.name());
@@ -862,22 +848,18 @@ pub const VersionSet = struct {
         var level: usize = 0;
         while (level < kNumLevels) : (level += 1) {
             for (self.current.files[level].items) |f| {
-                if (rocksdb) {
-                    // kNewFile4 (tag 103) with the file's seqno range — what
-                    // real RocksDB needs in its MANIFEST.
-                    try edit.addFile4(
-                        self.gpa,
-                        @intCast(level),
-                        f.number,
-                        f.file_size,
-                        f.smallest,
-                        f.largest,
-                        f.smallest_seqno,
-                        f.largest_seqno,
-                    );
-                } else {
-                    try edit.addFile(self.gpa, @intCast(level), f.number, f.file_size, f.smallest, f.largest);
-                }
+                // kNewFile4 (tag 103) with the file's seqno range — what real
+                // RocksDB needs in its MANIFEST.
+                try edit.addFile4(
+                    self.gpa,
+                    @intCast(level),
+                    f.number,
+                    f.file_size,
+                    f.smallest,
+                    f.largest,
+                    f.smallest_seqno,
+                    f.largest_seqno,
+                );
             }
         }
 

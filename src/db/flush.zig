@@ -174,26 +174,21 @@ pub fn commitFlush(
     defer edit.deinit(gpa);
 
     if (result.num_entries != 0) {
-        // rocksdb-write: emit a kNewFile4 (tag 103) record carrying the file's
-        // smallest/largest sequence numbers (decoded from the internal-key
-        // trailers), which real RocksDB requires in its MANIFEST.  Native mode
-        // keeps the legacy kNewFile=7 record (no seqnos).
-        if (versions.options.sst_output == .rocksdb) {
-            const smin = seqnoOf(result.smallest.?);
-            const smax = seqnoOf(result.largest.?);
-            try edit.addFile4(
-                gpa,
-                0,
-                result.file_number,
-                result.file_size,
-                result.smallest.?,
-                result.largest.?,
-                @min(smin, smax),
-                @max(smin, smax),
-            );
-        } else {
-            try edit.addFile(gpa, 0, result.file_number, result.file_size, result.smallest.?, result.largest.?);
-        }
+        // Emit a kNewFile4 (tag 103) record carrying the file's smallest/largest
+        // sequence numbers (decoded from the internal-key trailers), which real
+        // RocksDB requires in its MANIFEST.
+        const smin = seqnoOf(result.smallest.?);
+        const smax = seqnoOf(result.largest.?);
+        try edit.addFile4(
+            gpa,
+            0,
+            result.file_number,
+            result.file_size,
+            result.smallest.?,
+            result.largest.?,
+            @min(smin, smax),
+            @max(smin, smax),
+        );
         edit.setLastFileHasRangeTombstones(result.has_range_tombstones);
     }
 
