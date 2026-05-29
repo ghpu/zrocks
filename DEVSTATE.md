@@ -72,7 +72,7 @@ RocksDB reference: https://github.com/facebook/rocksdb/wiki
 - [x] M7.5 DeleteRange (range tombstones)  (src/rocks/delete_range.zig + multi-file)
 - [x] M7.6 Transactions (optimistic + pessimistic)  (src/rocks/txn/*)
 - [x] M7.7 Checkpoints                (src/rocks/checkpoint.zig)
-- [ ] (revisit) RocksDB real-DB read-interop gate (now feasible: SST read path + manifest exist; needs RocksDB kNewFile4 manifest tag + full-filter format)
+- [x] RocksDB real-DB READ interop DONE — reads real RocksDB v11.4.0 + real Chromium LevelDB DBs read_only, verified vs a built-from-source librocksdb oracle (tests/fixtures/rocksdb/basic, tests/rocksdb_interop_test.zig, tests/leveldb_interop_test.zig). Frontier: WRITE-interop, compression/delta-index SST variants.
 
 Phase 7 parallelization: core files (db.zig, compaction.zig, version_set.zig, memtable.zig) are shared — only run DISJOINT-footprint milestones in parallel. Compaction-modifiers (M7.3/M7.4/M7.5) one at a time; db/memtable-modifiers (M7.0 CF, M7.1 merge, M7.6 txn) one at a time. Wave A = M7.2 (SST-format/read-path) + M7.7 (standalone checkpoint, new file only) — disjoint.
 
