@@ -10,6 +10,7 @@
 //! because zrocks tests drive a MemEnv single-threaded.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const env_mod = @import("env.zig");
 
 const Env = env_mod.Env;
@@ -87,7 +88,22 @@ pub const MemEnv = struct {
         .makeDir = makeDir,
         .lockFile = lockFile,
         .unlockFile = unlockFile,
+        .io = ioCapability,
     };
+
+    /// The `std.Io` capability for this test double (D2a-1).  A MemEnv is driven
+    /// single-threaded, so the DB's write mutex is never contended and this `io`
+    /// is never actually dereferenced (an uncontended `std.Io.Mutex` lock/unlock
+    /// is a pure cmpxchg with no futex call).  We still hand back a real `io` —
+    /// the test runner's global `std.testing.io` in test builds — so nothing ever
+    /// touches an undefined value; in a (non-test) build where MemEnv is unused
+    /// there is no global io, so fall back to an unreachable stub.
+    fn ioCapability(ptr: *anyopaque) std.Io {
+        _ = ptr;
+        if (builtin.is_test) return std.testing.io;
+        // MemEnv is a test-only double; a non-test build never reaches here.
+        unreachable;
+    }
 
     fn newWritableFile(ptr: *anyopaque, gpa: std.mem.Allocator, path: []const u8) Error!WritableFile {
         const self: *MemEnv = @ptrCast(@alignCast(ptr));

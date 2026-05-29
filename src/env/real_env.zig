@@ -125,7 +125,15 @@ pub const RealEnv = struct {
         .makeDir = makeDir,
         .lockFile = lockFile,
         .unlockFile = unlockFile,
+        .io = ioCapability,
     };
+
+    /// Expose the owned `std.Io` so the DB's write mutex / background workers
+    /// share this Env's concurrency capability (D2a-1).
+    fn ioCapability(ptr: *anyopaque) Io {
+        const self: *RealEnv = @ptrCast(@alignCast(ptr));
+        return self.io;
+    }
 
     fn newWritableFile(ptr: *anyopaque, gpa: std.mem.Allocator, path: []const u8) Error!WritableFile {
         const self: *RealEnv = @ptrCast(@alignCast(ptr));
