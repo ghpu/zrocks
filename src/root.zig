@@ -12,6 +12,7 @@ pub const coding = @import("util/coding.zig");
 pub const comparator = @import("util/comparator.zig");
 pub const arena = @import("util/arena.zig");
 pub const crc32c = @import("util/crc32c.zig");
+pub const xxph3 = @import("util/xxph3.zig");
 pub const cache = @import("util/cache.zig");
 pub const snappy = @import("util/snappy.zig");
 pub const options = @import("options.zig");
