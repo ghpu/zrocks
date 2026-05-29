@@ -125,6 +125,13 @@ pub const Env = struct {
         fileExists: *const fn (ptr: *anyopaque, path: []const u8) bool,
         getFileSize: *const fn (ptr: *anyopaque, path: []const u8) Error!u64,
         makeDir: *const fn (ptr: *anyopaque, path: []const u8) Error!void,
+        // List the basenames of the entries directly under directory `path`
+        // (leveldb-interop, Wave A).  Allocates the returned slice AND each
+        // basename via `gpa`; the caller frees them with `freeListing`.  Used by
+        // recovery to discover ALL `NNNNNN.log` WAL files present (LevelDB
+        // recovery replays every log whose number is >= the recovered
+        // log_number, not just the one named in the MANIFEST).
+        listDir: *const fn (ptr: *anyopaque, gpa: std.mem.Allocator, path: []const u8) Error![][]u8,
         // Advisory file locking.  See note in RealEnv/MemEnv: stubbed for now
         // (TODO M5/M6 — DB-level single-process lock).  No-op success.
         lockFile: *const fn (ptr: *anyopaque, path: []const u8) Error!void,
@@ -172,6 +179,17 @@ pub const Env = struct {
     /// Create a directory; success if it already exists.
     pub fn makeDir(self: Env, path: []const u8) Error!void {
         return self.vtable.makeDir(self.ptr, path);
+    }
+    /// List the basenames of the entries directly under directory `path`
+    /// (leveldb-interop, Wave A).  Each returned name AND the outer slice are
+    /// allocated via `gpa`; free with `freeListing`.  Order is unspecified.
+    pub fn listDir(self: Env, gpa: std.mem.Allocator, path: []const u8) Error![][]u8 {
+        return self.vtable.listDir(self.ptr, gpa, path);
+    }
+    /// Free a listing previously returned by `listDir`.
+    pub fn freeListing(gpa: std.mem.Allocator, list: [][]u8) void {
+        for (list) |name| gpa.free(name);
+        gpa.free(list);
     }
     pub fn lockFile(self: Env, path: []const u8) Error!void {
         return self.vtable.lockFile(self.ptr, path);
@@ -308,6 +326,47 @@ fn runAppendableContract(env: Env, gpa: std.mem.Allocator) !void {
     try env.deleteFile("fresh.txt");
 }
 
+/// `listDir` contract (leveldb-interop, Wave A): create a directory with three
+/// files, list it, and confirm exactly those basenames come back (order-free).
+/// Listing a missing directory surfaces `error.NotFound`.
+fn runListDirContract(env: Env, gpa: std.mem.Allocator) !void {
+    try env.makeDir("listdir_d");
+    for ([_][]const u8{ "listdir_d/CURRENT", "listdir_d/000003.log", "listdir_d/MANIFEST-000001" }) |p| {
+        var wf = try env.newWritableFile(gpa, p);
+        errdefer wf.close() catch {};
+        try wf.append("x");
+        try wf.close();
+    }
+
+    const names = try env.listDir(gpa, "listdir_d");
+    defer Env.freeListing(gpa, names);
+    try std.testing.expectEqual(@as(usize, 3), names.len);
+
+    var saw_current = false;
+    var saw_log = false;
+    var saw_manifest = false;
+    for (names) |n| {
+        if (std.mem.eql(u8, n, "CURRENT")) saw_current = true;
+        if (std.mem.eql(u8, n, "000003.log")) saw_log = true;
+        if (std.mem.eql(u8, n, "MANIFEST-000001")) saw_manifest = true;
+    }
+    try std.testing.expect(saw_current and saw_log and saw_manifest);
+
+    for ([_][]const u8{ "listdir_d/CURRENT", "listdir_d/000003.log", "listdir_d/MANIFEST-000001" }) |p| {
+        try env.deleteFile(p);
+    }
+
+    // A non-existent directory must either surface NotFound (RealEnv) or list as
+    // empty (MemEnv's flat map cannot tell "missing" from "empty") — recovery's
+    // replayAllLogs treats both as "no logs to replay".
+    if (env.listDir(gpa, "no_such_dir")) |empty| {
+        defer Env.freeListing(gpa, empty);
+        try std.testing.expectEqual(@as(usize, 0), empty.len);
+    } else |err| {
+        try std.testing.expectEqual(error.NotFound, err);
+    }
+}
+
 test "MemEnv contract" {
     const gpa = std.testing.allocator;
     var me = MemEnv.init(gpa);
@@ -342,4 +401,22 @@ test "RealEnv contract" {
 
     var re = RealEnv.init(io, tmp.dir);
     try runEnvContract(re.env(), gpa);
+}
+
+test "MemEnv listDir contract" {
+    const gpa = std.testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    try runListDirContract(me.env(), gpa);
+}
+
+test "RealEnv listDir contract" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var re = RealEnv.init(io, tmp.dir);
+    try runListDirContract(re.env(), gpa);
 }
