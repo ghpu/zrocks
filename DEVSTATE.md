@@ -4,11 +4,11 @@ zig_binary: /home/ghpu/zig/zig
 stdlib: /home/ghpu/zig/lib/std
 target_rocksdb: "9.x line; block-based table format_version 5; legacy WAL/MANIFEST log (see docs/adr/000-target-format.md)"
 active_phase: "DONE — Phases 0-7 complete"
-active_milestone: "INTEROP: reads real LevelDB AND real RocksDB v11.4.0 DBs read-only (verified vs oracle). Frontier: write-interop, compression, delta-index."
-last_completed: Wave B core — read a real RocksDB DB (kNewFile4=103 fix, XXH3 checksum, index transcode); oracle = real librocksdb
+active_milestone: "WRITE-interop done: real RocksDB opens a zrocks DB (opt-in .rocksdb). NEXT: make RocksDB the ONLY format (remove native) per DIRECTIVE."
+last_completed: RocksDB write-interop (Options.sst_output=.rocksdb; verify_open opens zrocks DB)
 worktrees: "(none — clean)"
 test_command: "/home/ghpu/zig/zig build test"
-test_count: 527
+test_count: 530
 artifacts: "zig build -> zig-out/lib/libzrocks.a + zig-out/bin/zrocks (CLI). CLI verified end-to-end (put/get/scan/bench, durable across processes)."
 updated: 2026-05-29
 ---
