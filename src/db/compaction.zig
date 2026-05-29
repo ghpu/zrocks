@@ -419,9 +419,39 @@ const Output = struct {
     file_size: u64,
 };
 
-/// Run the compaction: merge inputs[0] ++ inputs[1], drop shadowed/obsolete
-/// entries, write the survivors into fresh `level+1` SSTs, and logAndApply a
-/// VersionEdit that removes the inputs and adds the outputs.
+/// Result of a compaction's BUILD phase (D2a-3): the finished output SSTs'
+/// metadata + whether they carry surviving range tombstones.
+///
+/// The build phase merges the inputs and writes the output `.sst` files to disk
+/// touching ONLY the allocator + Env filesystem + a private table cache — it
+/// NEVER touches the shared `VersionSet` — so it is safe to run on a background
+/// worker fiber (`io.concurrent`).  The foreground then COMMITS this result via
+/// `commitCompaction` (which calls `versions.logAndApply` under the DB write
+/// mutex), keeping the VersionSet/MANIFEST single-writer (roadmap hazard (c)).
+///
+/// The build either commits its outputs (via `commitCompaction`, which consumes
+/// them) or, on an error / abandonment path, frees them via `deinit`.
+pub const CompactionBuildResult = struct {
+    outputs: std.ArrayListUnmanaged(Output),
+    /// True iff the outputs were seeded with surviving range tombstones, so the
+    /// committed FileMetaData must record `has_range_tombstones` (D3a-M1).
+    out_has_tombstones: bool,
+
+    pub fn deinit(self: *CompactionBuildResult, gpa: std.mem.Allocator) void {
+        for (self.outputs.items) |o| {
+            gpa.free(o.smallest);
+            gpa.free(o.largest);
+        }
+        self.outputs.deinit(gpa);
+        self.* = undefined;
+    }
+};
+
+/// Run the compaction synchronously: BUILD the output SSTs then COMMIT them to
+/// the VersionSet.  This is the foreground/single-threaded entry point; the
+/// background-worker path (D2a-3) calls `buildCompaction` + `commitCompaction`
+/// separately so the heavy merge/build runs off the foreground while the
+/// MANIFEST write stays single-writer.
 pub fn doCompaction(
     gpa: std.mem.Allocator,
     e: env.Env,
@@ -430,19 +460,66 @@ pub fn doCompaction(
     ikc: comparator.Comparator,
     user_cmp: comparator.Comparator,
     versions: *VersionSet,
-    /// The DB's table cache — obsolete input files are reclaimed from it (gc1).
-    /// Distinct from the per-compaction private cache `tc` built below.
     db_table_cache: *table_cache_mod.TableCache,
     compaction: *Compaction,
     smallest_snapshot: u64,
-    /// True iff a LIVE snapshot pins `smallest_snapshot` (vs. it merely being the
-    /// latest sequence because no snapshot is held).  The compaction filter (M7.4)
-    /// must never modify an entry a live snapshot can still read, so when this is
-    /// true the newest `.value` of a key is filtered only if its sequence is
-    /// strictly ABOVE `smallest_snapshot` (a post-snapshot version the oldest
-    /// snapshot does not see); when false, the newest version is always eligible.
     has_live_snapshot: bool,
 ) !void {
+    var result = try buildCompaction(
+        gpa,
+        e,
+        dbname,
+        options,
+        ikc,
+        user_cmp,
+        versions,
+        compaction,
+        smallest_snapshot,
+        has_live_snapshot,
+    );
+    // commitCompaction consumes `result` on success; on its error it is freed.
+    errdefer result.deinit(gpa);
+    try commitCompaction(gpa, e, dbname, versions, db_table_cache, compaction, &result);
+}
+
+/// The BUILD phase of a compaction (D2a-3): merge `inputs[0] ++ inputs[1]`, drop
+/// shadowed/obsolete entries (snapshot-pinned), carry surviving range
+/// tombstones, and write the survivors into fresh output SSTs at
+/// `compaction.outputLevel()`.  Returns the finished outputs' metadata.
+///
+/// SAFE TO RUN ON A BACKGROUND WORKER FIBER: it touches only the allocator, the
+/// Env filesystem, and a PRIVATE per-compaction table cache — never the shared
+/// DB state — and it reads the `Compaction`'s deep-owned input snapshot (taken
+/// on the foreground by `pickCompaction`).  It does call `versions.newFileNumber`
+/// to number its outputs, which only bumps the file-number counter; the
+/// single-flush + single-compact + flush-then-compact sequencing (see
+/// `maybeScheduleCompaction`) guarantees the build worker is the SOLE VersionSet
+/// accessor while it runs (the foreground is blocked in `await`), so this is not
+/// a data race.  The MANIFEST write (`logAndApply`) is deferred to
+/// `commitCompaction` on the foreground, keeping the MANIFEST single-writer
+/// (roadmap hazard (c)).
+///
+/// `versions` is used only for `newFileNumber` (output numbering) and the
+/// read-only `isBaseLevelForKey` overlap check.
+///
+/// `has_live_snapshot`: true iff a LIVE snapshot pins `smallest_snapshot` (vs. it
+/// merely being the latest sequence because no snapshot is held).  The compaction
+/// filter (M7.4) must never modify an entry a live snapshot can still read, so
+/// when this is true the newest `.value` of a key is filtered only if its
+/// sequence is strictly ABOVE `smallest_snapshot`; when false, the newest version
+/// is always eligible.
+pub fn buildCompaction(
+    gpa: std.mem.Allocator,
+    e: env.Env,
+    dbname: []const u8,
+    options: options_mod.Options,
+    ikc: comparator.Comparator,
+    user_cmp: comparator.Comparator,
+    versions: *VersionSet,
+    compaction: *Compaction,
+    smallest_snapshot: u64,
+    has_live_snapshot: bool,
+) !CompactionBuildResult {
     // --- 1. Build child iterators over every input file --------------------
     var children: std.ArrayListUnmanaged(iterator.Iterator) = .empty;
     // On any error before the merger takes ownership, tear the children down.
@@ -491,8 +568,11 @@ pub fn doCompaction(
     const mit = merger.iterator();
 
     // --- 3. Accumulate finished outputs (their metadata) -------------------
+    // On success, ownership of `outputs` transfers to the returned
+    // CompactionBuildResult (the caller commits then frees it); on any error here
+    // we free them ourselves.
     var outputs: std.ArrayListUnmanaged(Output) = .empty;
-    defer {
+    errdefer {
         for (outputs.items) |o| {
             gpa.free(o.smallest);
             gpa.free(o.largest);
@@ -712,7 +792,38 @@ pub fn doCompaction(
         try finishOutput(gpa, &builder, &cur_file, cur_number, &cur_smallest, &cur_largest, &outputs);
     }
 
-    // --- 4. Apply the edit: remove inputs, add outputs at level+1 ----------
+    // Build done.  Hand the outputs to the caller, which COMMITS them to the
+    // VersionSet on the foreground (commitCompaction) — keeping the MANIFEST
+    // single-writer.  D3a-M1: surviving tombstones are seeded into every output
+    // by ensureBuilder, so all outputs carry tombstones iff `surviving` is
+    // non-empty.
+    return .{ .outputs = outputs, .out_has_tombstones = !surviving.isEmpty() };
+}
+
+/// The COMMIT phase of a compaction (D2a-3): build a VersionEdit removing the
+/// inputs and adding `result`'s outputs at `compaction.outputLevel()`, write it
+/// to the MANIFEST via `logAndApply`, then reclaim the obsolete input files.
+///
+/// MUST run on the foreground holding the DB write mutex: `logAndApply` is the
+/// single-writer MANIFEST mutation, and `reclaimObsoleteFiles` is sound only
+/// while no concurrent reader/worker can capture a just-removed file (guaranteed
+/// by the single-compact + flush-then-compact sequencing — at commit time no
+/// flush is in flight and this is the only compaction).
+///
+/// Consumes `result` on success (its outputs are now referenced by the new
+/// Version); on an error before/at `logAndApply` the caller's `errdefer` frees
+/// it (the output SSTs on disk are then orphaned, reclaimed by a future GC — no
+/// memory unsafety).
+pub fn commitCompaction(
+    gpa: std.mem.Allocator,
+    e: env.Env,
+    dbname: []const u8,
+    versions: *VersionSet,
+    /// The DB's table cache — obsolete input files are reclaimed from it (gc1).
+    db_table_cache: *table_cache_mod.TableCache,
+    compaction: *Compaction,
+    result: *CompactionBuildResult,
+) !void {
     var edit = version_edit.VersionEdit.init();
     defer edit.deinit(gpa);
 
@@ -725,20 +836,21 @@ pub fn doCompaction(
     // Universal keeps the merged run in L0 (output_level == 0); leveled writes it
     // to `level + 1`.  `outputLevel()` resolves the right destination.
     const out_level = compaction.outputLevel();
-    // D3a-M1: surviving tombstones are seeded into every output file by
-    // ensureBuilder, so all outputs carry tombstones iff surviving is non-empty.
-    const out_has_tombs = !surviving.isEmpty();
-    for (outputs.items) |o| {
+    for (result.outputs.items) |o| {
         try edit.addFile(gpa, @intCast(out_level), o.number, o.file_size, o.smallest, o.largest);
-        edit.setLastFileHasRangeTombstones(out_has_tombs);
+        edit.setLastFileHasRangeTombstones(result.out_has_tombstones);
     }
 
     try versions.logAndApply(&edit);
     // gc1: now that the new Version is durable, the input .sst files are
     // obsolete — evict them from the DB cache and delete them from disk.  Sound
-    // only while single-threaded (see reclaimObsoleteFiles); convert to a
-    // pending-deletion queue when background workers land (D2a).
+    // here because the single-compact + flush-then-compact sequencing means no
+    // concurrent worker/flush holds a captured handle to a just-removed input.
     reclaimObsoleteFiles(gpa, e, dbname, db_table_cache, &edit);
+    // The outputs are now owned by the new Version's FileMetaData; free the
+    // build result's bookkeeping (its smallest/largest were duped into the edit
+    // and then into the Version).
+    result.deinit(gpa);
 }
 
 /// Finish the current output builder: emit the table, capture its metadata into

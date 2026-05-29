@@ -3273,3 +3273,82 @@ test "D2a-2: a flush in flight is served from the pinned imm holder (read safety
     db.imm = null;
     db.write_mutex.unlock(db.io);
 }
+
+// ---------------------------------------------------------------------------
+// D2a-3 — background compaction worker + single-writer-MANIFEST invariant
+// ---------------------------------------------------------------------------
+
+test "D2a-3: leveled compaction runs on the background worker; data survives" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    // Tiny buffer + low L0 trigger so writes flush to L0 and then a leveled
+    // L0->L1 compaction fires repeatedly — each compaction's heavy build phase
+    // runs on the background worker (via io.concurrent), the MANIFEST commit on
+    // the foreground.
+    const opts: Options = .{
+        .write_buffer_size = 1,
+        .compaction_style = .level,
+        .level0_file_num_compaction_trigger = 2,
+        .target_file_size_base = 1 << 20,
+    };
+    const n: usize = 200;
+
+    {
+        const db = try DB.open(gpa, e, "bgcompact", opts);
+        defer db.close();
+
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            var kbuf: [16]u8 = undefined;
+            var vbuf: [32]u8 = undefined;
+            const k = try std.fmt.bufPrint(&kbuf, "key{d:0>5}", .{i});
+            const v = try std.fmt.bufPrint(&vbuf, "val-{d:0>5}", .{i});
+            try db.put(.{}, k, v);
+        }
+
+        // At least one background compaction must have run (the build phase went
+        // through io.concurrent).
+        try testing.expect(db.bg_compactions >= 1);
+
+        // Data must have been pushed below L0 by the compactions: some file lives
+        // at L1 or deeper.
+        {
+            var deeper: usize = 0;
+            const v = db.versions.currentVersion();
+            var lvl: usize = 1;
+            while (lvl < v.files.len) : (lvl += 1) deeper += v.files[lvl].items.len;
+            try testing.expect(deeper >= 1);
+        }
+
+        // Every key is readable after the background compactions committed.
+        i = 0;
+        while (i < n) : (i += 1) {
+            var kbuf: [16]u8 = undefined;
+            var vbuf: [32]u8 = undefined;
+            const k = try std.fmt.bufPrint(&kbuf, "key{d:0>5}", .{i});
+            const want = try std.fmt.bufPrint(&vbuf, "val-{d:0>5}", .{i});
+            const got = try db.get(.{}, k) orelse return error.TestExpectedFound;
+            defer gpa.free(got);
+            try testing.expectEqualStrings(want, got);
+        }
+    }
+
+    // Reopen and re-verify the compacted data survived durably.
+    {
+        const db2 = try DB.open(gpa, e, "bgcompact", opts);
+        defer db2.close();
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            var kbuf: [16]u8 = undefined;
+            var vbuf: [32]u8 = undefined;
+            const k = try std.fmt.bufPrint(&kbuf, "key{d:0>5}", .{i});
+            const want = try std.fmt.bufPrint(&vbuf, "val-{d:0>5}", .{i});
+            const got = try db2.get(.{}, k) orelse return error.TestExpectedFound;
+            defer gpa.free(got);
+            try testing.expectEqualStrings(want, got);
+        }
+    }
+}
