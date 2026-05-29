@@ -3,6 +3,7 @@ const comparator = @import("util/comparator.zig");
 const prefix = @import("rocks/prefix.zig");
 const merge_operator = @import("rocks/merge_operator.zig");
 const compaction_filter = @import("rocks/compaction_filter.zig");
+const cache_mod = @import("util/cache.zig");
 
 // Re-export so callers can write `options_mod.PrefixExtractor`.
 pub const PrefixExtractor = prefix.PrefixExtractor;
@@ -12,6 +13,8 @@ pub const MergeOperator = merge_operator.MergeOperator;
 pub const CompactionFilter = compaction_filter.CompactionFilter;
 pub const Decision = compaction_filter.Decision;
 // `CompactionStyle` is declared below; nothing to re-export from another module.
+/// Re-export Cache so callers can write `options_mod.Cache`.
+pub const Cache = cache_mod.Cache;
 
 // ---------------------------------------------------------------------------
 // CompactionStyle — which compaction algorithm the DB drives (M7.3)
@@ -117,6 +120,14 @@ pub const Options = struct {
     /// `(sum of all runs except the oldest) / (oldest run) * 100` exceeds this,
     /// ALL L0 runs are merged together regardless of size ratios.  Default 200.
     universal_max_size_amplification_percent: u32 = 200,
+
+    // -- Block cache (bench + production) ------------------------------------
+    /// Shared LRU block cache for decoded SST data blocks.  When non-null, the
+    /// `TableCache` passes it to every `TableReader` it opens, so hot blocks are
+    /// served from RAM instead of re-reading + re-decoding from disk on each
+    /// lookup.  The caller owns the `Cache` and must ensure its lifetime exceeds
+    /// the DB's.  Default null (no block-cache; each lookup re-reads the block).
+    block_cache: ?*Cache = null,
 };
 
 // ---------------------------------------------------------------------------
@@ -226,4 +237,17 @@ test "M7.3: compaction style override works" {
     const opts = Options{ .compaction_style = .fifo, .fifo_max_table_files_size = 4096 };
     try std.testing.expectEqual(CompactionStyle.fifo, opts.compaction_style);
     try std.testing.expectEqual(@as(u64, 4096), opts.fifo_max_table_files_size);
+}
+
+test "bench: Options.block_cache defaults to null" {
+    const opts = Options{};
+    try std.testing.expectEqual(@as(?*Cache, null), opts.block_cache);
+}
+
+test "bench: Options.block_cache can be set" {
+    var c = Cache.init(std.testing.allocator, 1024 * 1024);
+    defer c.deinit();
+    const opts = Options{ .block_cache = &c };
+    try std.testing.expect(opts.block_cache != null);
+    try std.testing.expectEqual(&c, opts.block_cache.?);
 }
