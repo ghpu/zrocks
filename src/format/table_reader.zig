@@ -29,6 +29,7 @@ const std = @import("std");
 const footer_mod = @import("footer.zig");
 const block = @import("block.zig");
 const filter_block = @import("filter_block.zig");
+const full_filter = @import("full_filter.zig");
 const bloom = @import("bloom.zig");
 const crc32c = @import("../util/crc32c.zig");
 const coding = @import("../util/coding.zig");
@@ -45,6 +46,7 @@ const BlockHandle = footer_mod.BlockHandle;
 const Footer = footer_mod.Footer;
 const Block = block.Block;
 const FilterBlockReader = filter_block.FilterBlockReader;
+const FullFilterReader = full_filter.FullFilterReader;
 
 /// kNoCompression — block stored verbatim (compression type byte 0).
 pub const kNoCompression: u8 = 0;
@@ -69,9 +71,15 @@ pub const Table = struct {
     index_contents: []u8,
     index_block: Block,
 
-    /// Owned contents of the filter block, if the table carries one.
+    /// Owned contents of the filter block, if the table carries one (shared by
+    /// whichever filter format the table was built with).
     filter_contents: ?[]u8,
+    /// Legacy LevelDB block-based filter reader ("filter."++name entry).
     filter_reader: ?FilterBlockReader,
+    /// FastLocalBloom full-filter reader ("fullfilter."++name entry).  At most
+    /// one of `filter_reader` / `full_filter_reader` is set, chosen by which
+    /// metaindex entry the table carries (fulllocalbloom gate, auto-detected).
+    full_filter_reader: ?FullFilterReader,
 
     /// Optional shared block cache (caller-owned; not freed by `deinit`).
     block_cache: ?*cache_mod.Cache,
@@ -124,6 +132,7 @@ pub const Table = struct {
             .index_block = index_block,
             .filter_contents = null,
             .filter_reader = null,
+            .full_filter_reader = null,
             .block_cache = block_cache,
             .cache_id = cache_id,
             .metaindex_handle = footer.metaindex_handle,
@@ -146,37 +155,65 @@ pub const Table = struct {
         return readBlockCached(self.gpa, self.file, handle, self.block_cache, self.cache_id);
     }
 
-    /// Read the metaindex block, look for the filter entry, and if present read
-    /// the filter block and install a FilterBlockReader. A missing filter entry
-    /// leaves the table working without bloom filtering.
+    /// Read the metaindex block, look for a filter entry, and if present read
+    /// the filter block and install the matching reader.  Auto-detects the
+    /// format (fulllocalbloom gate): a `"fullfilter."++name` entry installs a
+    /// FastLocalBloom `FullFilterReader`; otherwise a `"filter."++name` entry
+    /// installs the legacy block-based `FilterBlockReader`.  A missing filter
+    /// entry leaves the table working without bloom filtering.  The reader's
+    /// own `options.filter_mode` is irrelevant here — what is on disk wins, so
+    /// reopening a DB with a different mode never misreads old SSTs.
     fn readFilter(self: *Table, metaindex_handle: BlockHandle) !void {
         const meta_contents = try self.readBlock(metaindex_handle);
         defer self.gpa.free(meta_contents);
         const meta_block = try Block.init(self.gpa, meta_contents);
 
-        // Build the lookup key "filter." ++ policy.name().
-        var key_buf: std.ArrayListUnmanaged(u8) = .empty;
-        defer key_buf.deinit(self.gpa);
-        try key_buf.appendSlice(self.gpa, "filter.");
-        try key_buf.appendSlice(self.gpa, self.policy.name());
-
         // The metaindex is built with the BYTEWISE comparator over plain meta
         // keys (NOT internal keys), so it must be searched bytewise — using the
         // table's main comparator (an IKC for DB SSTs, which strips a trailer)
         // would mis-order/mis-match the meta keys.
-        var it = meta_block.iterator(comparator.bytewise);
-        defer it.deinit();
-        it.seek(key_buf.items);
-        if (!it.valid() or comparator.bytewise.compare(it.key(), key_buf.items) != .eq) {
-            // No filter for this policy: reader works without bloom.
-            return;
+
+        // 1. Prefer the FastLocalBloom full filter ("fullfilter."++name).
+        {
+            var key_buf: std.ArrayListUnmanaged(u8) = .empty;
+            defer key_buf.deinit(self.gpa);
+            try key_buf.appendSlice(self.gpa, "fullfilter.");
+            try key_buf.appendSlice(self.gpa, self.policy.name());
+
+            var it = meta_block.iterator(comparator.bytewise);
+            defer it.deinit();
+            it.seek(key_buf.items);
+            if (it.valid() and comparator.bytewise.compare(it.key(), key_buf.items) == .eq) {
+                var hv: []const u8 = it.value();
+                const filter_handle = try BlockHandle.decodeFrom(&hv);
+                const filter_contents = try self.readBlock(filter_handle);
+                self.filter_contents = filter_contents;
+                self.full_filter_reader = FullFilterReader.init(filter_contents);
+                return;
+            }
         }
 
-        var hv: []const u8 = it.value();
-        const filter_handle = try BlockHandle.decodeFrom(&hv);
-        const filter_contents = try self.readBlock(filter_handle);
-        self.filter_contents = filter_contents;
-        self.filter_reader = FilterBlockReader.init(self.policy, filter_contents);
+        // 2. Fall back to the legacy block-based filter ("filter."++name).
+        {
+            var key_buf: std.ArrayListUnmanaged(u8) = .empty;
+            defer key_buf.deinit(self.gpa);
+            try key_buf.appendSlice(self.gpa, "filter.");
+            try key_buf.appendSlice(self.gpa, self.policy.name());
+
+            var it = meta_block.iterator(comparator.bytewise);
+            defer it.deinit();
+            it.seek(key_buf.items);
+            if (!it.valid() or comparator.bytewise.compare(it.key(), key_buf.items) != .eq) {
+                // No filter for this policy: reader works without bloom.
+                return;
+            }
+
+            var hv: []const u8 = it.value();
+            const filter_handle = try BlockHandle.decodeFrom(&hv);
+            const filter_contents = try self.readBlock(filter_handle);
+            self.filter_contents = filter_contents;
+            self.filter_reader = FilterBlockReader.init(self.policy, filter_contents);
+        }
     }
 
     /// Read this table's range tombstones (M7.5) by scanning the metaindex for
@@ -233,6 +270,18 @@ pub const Table = struct {
                 // out-of-domain: cannot prune; fall through to read the block.
             } else {
                 if (!fr.keyMayMatch(handle.offset, key)) return null;
+            }
+        } else if (self.full_filter_reader) |*ffr| {
+            // FastLocalBloom full filter (fulllocalbloom): a single filter over
+            // every key, probed independently of the data-block offset.
+            if (self.prefix_extractor) |pe| {
+                const user_key = internal_key.extractUserKey(key);
+                if (pe.inDomain(user_key)) {
+                    if (!ffr.prefixMayMatch(pe.transform(user_key))) return null;
+                }
+                // out-of-domain: cannot prune; fall through to read the block.
+            } else {
+                if (!ffr.keyMayMatch(key)) return null;
             }
         }
 
