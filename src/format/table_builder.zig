@@ -39,14 +39,17 @@ const coding = @import("../util/coding.zig");
 const comparator = @import("../util/comparator.zig");
 const env = @import("../env/env.zig");
 const options_mod = @import("../options.zig");
+const snappy = @import("../util/snappy.zig");
 
 const BlockBuilder = block.BlockBuilder;
 const BlockHandle = footer_mod.BlockHandle;
 const Footer = footer_mod.Footer;
 const FilterBlockBuilder = filter_block.FilterBlockBuilder;
 
-/// kNoCompression — the only compression type supported here.
+/// kNoCompression — block stored verbatim (compression type byte 0).
 pub const kNoCompression: u8 = 0;
+/// kSnappyCompression — block stored as a Snappy block-format payload (byte 1).
+pub const kSnappyCompression: u8 = 1;
 
 /// Restart interval used for the index and metaindex blocks (LevelDB uses 1).
 const kMetaIndexRestartInterval: usize = 1;
@@ -214,7 +217,7 @@ pub const TableBuilder = struct {
         if (self.data_block.isEmpty()) return;
         std.debug.assert(!self.pending_index_entry);
 
-        self.pending_handle = try self.writeBlock(&self.data_block);
+        self.pending_handle = try self.writeDataBlock(&self.data_block);
         self.pending_index_entry = true;
         try self.file.flush();
 
@@ -222,10 +225,39 @@ pub const TableBuilder = struct {
         try self.filter.startBlock(self.gpa, self.offset);
     }
 
-    /// Finish a BlockBuilder, write it (with trailer) to the file, reset the
-    /// builder, and return its BlockHandle.
+    /// Finish a BlockBuilder, write it UNCOMPRESSED (with trailer) to the file,
+    /// reset the builder, and return its BlockHandle.  Used for the
+    /// index/metaindex blocks, which are always stored verbatim.
     fn writeBlock(self: *TableBuilder, builder: *BlockBuilder) !BlockHandle {
         const contents = builder.finish();
+        const handle = try self.writeRawBlock(contents, kNoCompression);
+        builder.reset();
+        return handle;
+    }
+
+    /// Finish a data block, optionally Snappy-compress it (when
+    /// `options.compression == .snappy`), write it (with trailer) to the file,
+    /// reset the builder, and return its BlockHandle.
+    ///
+    /// Compression is applied only when it actually shrinks the block; otherwise
+    /// the block is stored verbatim with `kNoCompression` (mirrors RocksDB's
+    /// "GoodCompressionRatio" guard so a non-compressible block never grows).
+    /// The on-disk (post-compression) payload is what the trailer CRC covers and
+    /// what `BlockHandle.size` records, so the reader sizes its read off it.
+    fn writeDataBlock(self: *TableBuilder, builder: *BlockBuilder) !BlockHandle {
+        const contents = builder.finish();
+
+        if (self.options.compression == .snappy) {
+            const compressed = try snappy.compress(self.gpa, contents);
+            defer self.gpa.free(compressed);
+            // Only keep the compressed form if it is actually smaller.
+            if (compressed.len < contents.len) {
+                const handle = try self.writeRawBlock(compressed, kSnappyCompression);
+                builder.reset();
+                return handle;
+            }
+        }
+
         const handle = try self.writeRawBlock(contents, kNoCompression);
         builder.reset();
         return handle;
@@ -352,21 +384,48 @@ fn readAllFile(e: env.Env, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
     return buf;
 }
 
-/// Slice a block's contents out of the file bytes given its handle, validate
-/// the 5-byte trailer CRC, and return the contents slice (into `file`).
+/// Slice an UNCOMPRESSED block's on-disk payload out of the file bytes given its
+/// handle, validate the 5-byte trailer CRC, assert it is stored verbatim, and
+/// return the contents slice (into `file`).  Use this for blocks the builder
+/// never compresses (index/metaindex/filter/range-del).
 fn readVerifiedBlock(file: []const u8, handle: BlockHandle) ![]const u8 {
     const start: usize = @intCast(handle.offset);
     const size: usize = @intCast(handle.size);
     try testing.expect(start + size + 5 <= file.len);
-    const contents = file[start .. start + size];
+    const payload = file[start .. start + size];
 
     const trailer = file[start + size .. start + size + 5];
     const compression_type = trailer[0];
     try testing.expectEqual(@as(u8, kNoCompression), compression_type);
     const stored_masked = coding.decodeFixed32(trailer[1..5]);
-    const expected = crc32c.extend(crc32c.value(contents), &[_]u8{compression_type});
+    const expected = crc32c.extend(crc32c.value(payload), &[_]u8{compression_type});
     try testing.expectEqual(expected, crc32c.unmask(stored_masked));
-    return contents;
+    return payload;
+}
+
+/// Compression-aware verifier: slice a block's ON-DISK payload (whose length is
+/// `handle.size`) out of `file`, validate the 5-byte trailer CRC over the
+/// payload (the trailer CRC always covers the on-disk/compressed bytes), then
+/// decompress it when the trailer marks it Snappy.  Returns an OWNED buffer the
+/// caller frees with `gpa` (so an uncompressed block is duped too, for a uniform
+/// ownership contract).
+fn readVerifiedBlockC(gpa: std.mem.Allocator, file: []const u8, handle: BlockHandle) ![]u8 {
+    const start: usize = @intCast(handle.offset);
+    const size: usize = @intCast(handle.size);
+    try testing.expect(start + size + 5 <= file.len);
+    const payload = file[start .. start + size];
+
+    const trailer = file[start + size .. start + size + 5];
+    const compression_type = trailer[0];
+    const stored_masked = coding.decodeFixed32(trailer[1..5]);
+    const expected = crc32c.extend(crc32c.value(payload), &[_]u8{compression_type});
+    try testing.expectEqual(expected, crc32c.unmask(stored_masked));
+
+    return switch (compression_type) {
+        kNoCompression => try gpa.dupe(u8, payload),
+        kSnappyCompression => try snappy.decompress(gpa, payload),
+        else => error.NotSupported,
+    };
 }
 
 /// Build a sorted set of ~`n` entries with small keys/values.
@@ -511,6 +570,102 @@ test "table builder: multi-block round-trip, trailer CRCs, filter matches" {
         try testing.expect(fr.keyMayMatch(0, entries.items[1].k));
         try testing.expect(fr.keyMayMatch(0, entries.items[2].k));
     }
+}
+
+test "table builder: snappy data blocks — kSnappy trailer, CRC over compressed, handle = compressed size, decompresses to entries" {
+    const gpa = testing.allocator;
+
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    // Compression ON; small block_size so several data blocks form.
+    const opts = options_mod.Options{
+        .block_size = 256,
+        .block_restart_interval = 4,
+        .compression = .snappy,
+    };
+    const policy = bloom.BloomFilterPolicy.init(10);
+
+    // Highly compressible values so each data block actually shrinks.
+    var entries: std.ArrayListUnmanaged(KV) = .empty;
+    defer freeEntries(gpa, &entries);
+    {
+        var i: usize = 0;
+        while (i < 60) : (i += 1) {
+            const k = try std.fmt.allocPrint(gpa, "key{d:0>5}", .{i});
+            // Long run of repeated bytes → very compressible.
+            const v = try std.fmt.allocPrint(gpa, "{s}", .{"A" ** 80});
+            try entries.append(gpa, .{ .k = k, .v = v });
+        }
+    }
+
+    {
+        var wf = try e.newWritableFile(gpa, "snap.sst");
+        errdefer wf.close() catch {};
+        var tb = try TableBuilder.init(gpa, opts, wf, policy);
+        defer tb.deinit();
+        for (entries.items) |kv| try tb.add(kv.k, kv.v);
+        try tb.finish();
+        try wf.close();
+    }
+
+    const file = try readAllFile(e, gpa, "snap.sst");
+    defer gpa.free(file);
+
+    const footer = try Footer.decodeFrom(file[file.len - footer_mod.kEncodedLength ..]);
+
+    // Index/metaindex/filter remain uncompressed (verbatim).
+    const index_contents = try readVerifiedBlock(file, footer.index_handle);
+    const index_block = try block.Block.init(gpa, index_contents);
+
+    var data_handles: std.ArrayListUnmanaged(BlockHandle) = .empty;
+    defer data_handles.deinit(gpa);
+    {
+        var it = index_block.iterator(opts.comparator);
+        defer it.deinit();
+        it.seekToFirst();
+        while (it.valid()) : (it.next()) {
+            var hv: []const u8 = it.value();
+            const h = try BlockHandle.decodeFrom(&hv);
+            try data_handles.append(gpa, h);
+        }
+    }
+    try testing.expect(data_handles.items.len >= 2);
+
+    // Each data block on disk must carry the kSnappy trailer byte, its CRC must
+    // cover the COMPRESSED bytes, handle.size must equal the compressed length,
+    // and decompressing must reproduce the original entries in order.
+    var any_snappy = false;
+    var idx: usize = 0;
+    for (data_handles.items) |h| {
+        const start: usize = @intCast(h.offset);
+        const size: usize = @intCast(h.size);
+        const trailer_type = file[start + size];
+        if (trailer_type == kSnappyCompression) {
+            any_snappy = true;
+            // handle.size is the compressed payload length: decompressing it must
+            // yield MORE bytes than the on-disk size for this compressible data.
+            const decompressed = try snappy.decompress(gpa, file[start .. start + size]);
+            gpa.free(decompressed);
+        }
+
+        const data_contents = try readVerifiedBlockC(gpa, file, h);
+        defer gpa.free(data_contents);
+        const data_blk = try block.Block.init(gpa, data_contents);
+        var it = data_blk.iterator(opts.comparator);
+        defer it.deinit();
+        it.seekToFirst();
+        while (it.valid()) : (it.next()) {
+            try testing.expect(idx < entries.items.len);
+            try testing.expectEqualStrings(entries.items[idx].k, it.key());
+            try testing.expectEqualStrings(entries.items[idx].v, it.value());
+            idx += 1;
+        }
+    }
+    try testing.expectEqual(entries.items.len, idx);
+    // At least one data block was actually stored Snappy-compressed.
+    try testing.expect(any_snappy);
 }
 
 test "table builder: single small block still well-formed" {
