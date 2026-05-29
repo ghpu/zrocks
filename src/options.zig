@@ -244,6 +244,37 @@ test "bench: Options.block_cache defaults to null" {
     try std.testing.expectEqual(@as(?*Cache, null), opts.block_cache);
 }
 
+test "compress-perlevel: compressionForLevel falls back to scalar compression when no array" {
+    const a = Options{ .compression = .snappy };
+    try std.testing.expectEqual(CompressionType.snappy, a.compressionForLevel(0));
+    try std.testing.expectEqual(CompressionType.snappy, a.compressionForLevel(6));
+    const b = Options{};
+    try std.testing.expectEqual(CompressionType.none, b.compressionForLevel(3));
+}
+
+test "compress-perlevel: compressionForLevel indexes the per-level array" {
+    const per_level = [_]CompressionType{ .none, .none, .snappy, .snappy };
+    const opts = Options{ .compression_per_level = &per_level };
+    try std.testing.expectEqual(CompressionType.none, opts.compressionForLevel(0));
+    try std.testing.expectEqual(CompressionType.none, opts.compressionForLevel(1));
+    try std.testing.expectEqual(CompressionType.snappy, opts.compressionForLevel(2));
+    try std.testing.expectEqual(CompressionType.snappy, opts.compressionForLevel(3));
+}
+
+test "compress-perlevel: compressionForLevel clamps level beyond array to the last element" {
+    const per_level = [_]CompressionType{ .none, .snappy };
+    const opts = Options{ .compression_per_level = &per_level };
+    // Levels at or past the last array slot use the last element.
+    try std.testing.expectEqual(CompressionType.snappy, opts.compressionForLevel(2));
+    try std.testing.expectEqual(CompressionType.snappy, opts.compressionForLevel(6));
+}
+
+test "compress-perlevel: empty per-level array falls back to scalar compression" {
+    const per_level = [_]CompressionType{};
+    const opts = Options{ .compression = .snappy, .compression_per_level = &per_level };
+    try std.testing.expectEqual(CompressionType.snappy, opts.compressionForLevel(0));
+}
+
 test "bench: Options.block_cache can be set" {
     var c = Cache.init(std.testing.allocator, 1024 * 1024);
     defer c.deinit();
