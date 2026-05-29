@@ -4,11 +4,11 @@ zig_binary: /home/ghpu/zig/zig
 stdlib: /home/ghpu/zig/lib/std
 target_rocksdb: "9.x line; block-based table format_version 5; legacy WAL/MANIFEST log (see docs/adr/000-target-format.md)"
 active_phase: "DONE — Phases 0-7 complete"
-active_milestone: "Next-directions roadmap FULLY EXECUTED: 27/27 milestones landed (incl. partitioned-idx)"
-last_completed: partitioned-idx (two-level index) — finishes Wave 9; full roadmap done
+active_milestone: "INTEROP Wave A done: reads real external LevelDB DBs read-only. Next: Wave B (build RocksDB)."
+last_completed: Wave A LevelDB read-interop (read_only mode, replay-all-logs, Env.listDir)
 worktrees: "(none — clean)"
 test_command: "/home/ghpu/zig/zig build test"
-test_count: 515
+test_count: 520
 artifacts: "zig build -> zig-out/lib/libzrocks.a + zig-out/bin/zrocks (CLI). CLI verified end-to-end (put/get/scan/bench, durable across processes)."
 updated: 2026-05-29
 ---
