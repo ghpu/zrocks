@@ -33,6 +33,12 @@
 /// 1 = two_level).  The reader reads it back; a missing entry means single_level
 /// (so every pre-existing SST keeps reading as before).  This is zrocks's own
 /// clean detection convention, NOT RocksDB's properties block.
+///
+/// SCOPE: this milestone implements the partitioned INDEX only.  Partitioned
+/// FILTERS (splitting the full filter into per-partition filters + a top-level
+/// filter index, analogous to the index here) are intentionally left out.
+/// TODO(wave-9.x): partitioned filter — per-partition filter blocks keyed by the
+/// same top-level partition boundaries, with a filter-partition index block.
 const std = @import("std");
 
 const block = @import("block.zig");
@@ -170,8 +176,7 @@ pub const PartitionedIndexBuilder = struct {
             const is_last = (i + 1 == self.entries.items.len);
             if (is_last or part.currentSizeEstimate() >= self.metadata_block_size) {
                 num_partitions += 1;
-                const handle = try self.flushPartition(&part, &last_sep, ctx, write_partition, out_top_level);
-                _ = handle;
+                try self.flushPartition(&part, &last_sep, ctx, write_partition, out_top_level);
             }
         }
 
@@ -187,7 +192,7 @@ pub const PartitionedIndexBuilder = struct {
         ctx: *anyopaque,
         write_partition: WritePartitionFn,
         out_top_level: *BlockBuilder,
-    ) !BlockHandle {
+    ) !void {
         const contents = part.finish();
         const handle = try write_partition(ctx, contents);
         part.reset();
@@ -196,7 +201,6 @@ pub const PartitionedIndexBuilder = struct {
         defer handle_enc.deinit(self.gpa);
         try handle.encodeTo(&handle_enc, self.gpa);
         try out_top_level.add(last_sep.items, handle_enc.items);
-        return handle;
     }
 };
 
