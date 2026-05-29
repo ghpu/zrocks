@@ -1151,7 +1151,20 @@ pub const SharedManifest = struct {
             var level: usize = 0;
             while (level < kNumLevels) : (level += 1) {
                 for (vs.current.files[level].items) |f| {
-                    try edit.addFile(self.gpa, @intCast(level), f.number, f.file_size, f.smallest, f.largest);
+                    // remove-native-and-tests: the SharedManifest startup
+                    // snapshot now emits kNewFile4 (tag 103) with the file's
+                    // seqno range — matching the per-CF VersionSet.writeSnapshot
+                    // and the unconditional RocksDB-only on-disk format.
+                    try edit.addFile4(
+                        self.gpa,
+                        @intCast(level),
+                        f.number,
+                        f.file_size,
+                        f.smallest,
+                        f.largest,
+                        f.smallest_seqno,
+                        f.largest_seqno,
+                    );
                     edit.setLastFileHasRangeTombstones(f.has_range_tombstones);
                 }
             }
