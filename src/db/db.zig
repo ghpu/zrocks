@@ -3434,3 +3434,152 @@ test "D2a-3: leveled compaction runs on the background worker; data survives" {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// D2a-4 — write stalls + L0 file-count throttling
+// ---------------------------------------------------------------------------
+
+test "d2a4-stalls: steady-state writes never stall or slow down" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    // Default-ish options: a buffer big enough that nothing overflows, so L0
+    // never grows near the slowdown/stop triggers.
+    const db = try DB.open(gpa, e, "nostall", .{ .write_buffer_size = 1 << 20 });
+    defer db.close();
+
+    var i: usize = 0;
+    while (i < 50) : (i += 1) {
+        var kbuf: [16]u8 = undefined;
+        const k = try std.fmt.bufPrint(&kbuf, "key{d:0>5}", .{i});
+        try db.put(.{}, k, "v");
+    }
+
+    try testing.expectEqual(@as(u64, 0), db.write_slowdowns);
+    try testing.expectEqual(@as(u64, 0), db.write_stalls);
+}
+
+test "d2a4-stalls: L0 reaching the slowdown trigger increments the slowdown counter" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    // Tiny buffer so every put rotates + flushes an L0 SST, but set the leveled
+    // compaction trigger HIGH so no auto-compaction drains L0 — L0 accumulates.
+    // A low slowdown trigger (3) is reached well before the stop trigger (100).
+    // The slowdown delay is 0us so the test does not actually sleep.
+    const opts: Options = .{
+        .write_buffer_size = 1,
+        .level0_file_num_compaction_trigger = 1000,
+        .level0_slowdown_writes_trigger = 3,
+        .level0_stop_writes_trigger = 100,
+        .write_stall_slowdown_delay_us = 0,
+    };
+    const db = try DB.open(gpa, e, "slowdown", opts);
+    defer db.close();
+
+    // Write enough to push L0 past the slowdown trigger.  Each write checks the
+    // stall condition BEFORE its insert, so once L0 >= 3 the subsequent writes
+    // each record a slowdown.
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        var kbuf: [16]u8 = undefined;
+        const k = try std.fmt.bufPrint(&kbuf, "k{d:0>4}", .{i});
+        try db.put(.{}, k, "v");
+    }
+
+    // L0 grew past the slowdown trigger (no compaction was allowed to drain it),
+    // so several writes recorded a slowdown; none hit the (much higher) stop.
+    try testing.expect(db.versions.currentVersion().numFiles(0) >= 3);
+    try testing.expect(db.write_slowdowns >= 1);
+    try testing.expectEqual(@as(u64, 0), db.write_stalls);
+}
+
+test "d2a4-stalls: L0 reaching the stop trigger stalls the write, which drains L0 below the trigger (release)" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    // Tiny buffer (each put -> one L0 SST), leveled trigger HIGH so normal
+    // compaction never fires, and a low STOP trigger (4).  When a write finds
+    // L0 already at/over 4, it must STALL: force-drain L0 (leveled L0->L1
+    // compaction) until L0 is back below the stop trigger, THEN proceed.
+    const opts: Options = .{
+        .write_buffer_size = 1,
+        .level0_file_num_compaction_trigger = 1000,
+        .level0_slowdown_writes_trigger = 1000,
+        .level0_stop_writes_trigger = 4,
+        .target_file_size_base = 1 << 20,
+    };
+    const n: usize = 30;
+    const db = try DB.open(gpa, e, "stopstall", opts);
+    defer db.close();
+
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        var kbuf: [16]u8 = undefined;
+        var vbuf: [32]u8 = undefined;
+        const k = try std.fmt.bufPrint(&kbuf, "key{d:0>5}", .{i});
+        const v = try std.fmt.bufPrint(&vbuf, "val-{d:0>5}", .{i});
+        try db.put(.{}, k, v);
+        // The stall is enforced at the START of each write, so right after any
+        // write returns L0 must be strictly below the stop trigger.
+        try testing.expect(db.versions.currentVersion().numFiles(0) < opts.level0_stop_writes_trigger);
+    }
+
+    // At least one stall fired (we wrote far more than the stop trigger with no
+    // normal compaction to drain L0), and the forced drain pushed data below L0.
+    try testing.expect(db.write_stalls >= 1);
+    {
+        var deeper: usize = 0;
+        const v = db.versions.currentVersion();
+        var lvl: usize = 1;
+        while (lvl < v.files.len) : (lvl += 1) deeper += v.files[lvl].items.len;
+        try testing.expect(deeper >= 1);
+    }
+
+    // Every key is still readable after the stalls drained L0.
+    i = 0;
+    while (i < n) : (i += 1) {
+        var kbuf: [16]u8 = undefined;
+        var vbuf: [32]u8 = undefined;
+        const k = try std.fmt.bufPrint(&kbuf, "key{d:0>5}", .{i});
+        const want = try std.fmt.bufPrint(&vbuf, "val-{d:0>5}", .{i});
+        const got = try db.get(.{}, k) orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings(want, got);
+    }
+}
+
+test "d2a4-stalls: a zero stop trigger disables the stop stall" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    // stop trigger 0 means "disabled" (RocksDB treats 0 as off); L0 grows freely
+    // and no stall is recorded.
+    const opts: Options = .{
+        .write_buffer_size = 1,
+        .level0_file_num_compaction_trigger = 1000,
+        .level0_slowdown_writes_trigger = 0,
+        .level0_stop_writes_trigger = 0,
+    };
+    const db = try DB.open(gpa, e, "nostoptrig", opts);
+    defer db.close();
+
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        var kbuf: [16]u8 = undefined;
+        const k = try std.fmt.bufPrint(&kbuf, "k{d:0>4}", .{i});
+        try db.put(.{}, k, "v");
+    }
+
+    try testing.expect(db.versions.currentVersion().numFiles(0) >= 4);
+    try testing.expectEqual(@as(u64, 0), db.write_stalls);
+    try testing.expectEqual(@as(u64, 0), db.write_slowdowns);
+}
