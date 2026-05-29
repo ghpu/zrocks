@@ -845,6 +845,14 @@ pub const DB = struct {
         // (No errdefer-undo past this point: the remaining steps are infallible
         //  until the launch, which handles its own failure inline.)
 
+        // D2b4: seal the OLD memtable BEFORE publishing it as `imm`, while still
+        // holding the write mutex and before any further `add` can target it.
+        // This atomically promotes it active->immutable: the seal's `.release`
+        // happens-after every prior write's insert, so the background flush
+        // worker (and any reader) that scans `holder.mem` sees a frozen, fully
+        // published entry set and any stray `add` would be rejected.
+        self.mem.seal();
+
         // --- infallible rotation ---
         self.imm = holder;
         self.mem = new_mem;

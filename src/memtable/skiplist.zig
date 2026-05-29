@@ -8,8 +8,15 @@
 //! `next` pointers are `std.atomic.Value(?*Node)`.  Readers load with `.acquire`
 //! and the lone writer publishes with `.release`, so a reader that observes a
 //! spliced-in node is guaranteed to also observe that node's fully-written key
-//! and `next` array.  (Tests here are single-threaded; the atomics encode the
-//! design invariant.)
+//! and `next` array.  `max_height` is likewise atomic (writer `.release` on
+//! raise, reader `.acquire` on sample): a reader that observes a raised height
+//! finds the new levels either already linked to the new node OR still null (in
+//! which case it harmlessly drops down) — never a torn pointer.  The SWMR
+//! invariant (no torn keys, no out-of-order splices, sortedness always holds,
+//! published nodes never disappear) is audited at runtime by the
+//! "SWMR: one writer + many concurrent readers" test below (one writer fiber +
+//! several reader fibers on the Threaded io).  The SOLE writer is also the only
+//! arena allocator, so the (non-thread-safe) backing allocator is never raced.
 //!
 //! Standalone test note (Zig 0.16): this file uses `../util/...` imports, which
 //! resolve when it is compiled as part of the `src`-rooted `zrocks` module

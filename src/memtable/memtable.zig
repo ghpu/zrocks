@@ -109,6 +109,15 @@ pub const MemTable = struct {
     /// its key bytes in the gpa (not the arena) so they survive independently;
     /// freed in `deinit`.
     range_tombstones: delete_range.RangeTombstoneList,
+    /// Active -> immutable promotion flag (D2b4).  A memtable starts ACTIVE
+    /// (writer-owned, mutable).  `seal()` flips this to true, marking it
+    /// IMMUTABLE: the entry set is frozen, so `add` is rejected and concurrent
+    /// flush/read fibers may scan it without a lock.  Atomic with `.release` on
+    /// seal / `.acquire` on observe so the flip happens-after every prior `add`
+    /// (the bytes those adds published are visible to any thread that observes
+    /// `sealed == true`).  The DB rotates the active memtable into `imm` only
+    /// after sealing it, making the promotion a single atomic transition.
+    sealed: std.atomic.Value(bool),
 
     /// Construct a heap-allocated MemTable.  Heap allocation keeps `arena` and
     /// `ikcmp` at stable addresses for the lifetime of the table, which matters
@@ -121,6 +130,7 @@ pub const MemTable = struct {
         self.arena = arena.Arena.init(gpa);
         self.ikcmp = .{ .user = user_cmp };
         self.range_tombstones = delete_range.RangeTombstoneList.init(gpa);
+        self.sealed = std.atomic.Value(bool).init(false);
 
         // Entry comparator: ctx = &self.ikcmp (stable). Each "key" handed to it
         // is an encoded entry buffer; it extracts the length-prefixed internal
@@ -140,6 +150,25 @@ pub const MemTable = struct {
         gpa.destroy(self);
     }
 
+    /// Promote this memtable from ACTIVE to IMMUTABLE (D2b4).  After `seal`, the
+    /// entry set is frozen: `add` returns `error.MemTableSealed`, and the table
+    /// may be scanned concurrently by a flush worker + readers without a lock
+    /// (the skiplist is itself single-writer/multi-reader, and with no further
+    /// writer the reads are pure).  Idempotent.  Published `.release` so a thread
+    /// that later observes `sealed == true` also observes every prior `add`'s
+    /// bytes — the writer must perform all its `add`s BEFORE calling `seal`
+    /// (which the DB write path guarantees by holding the write mutex across the
+    /// last insert + the seal + the rotation into `imm`).
+    pub fn seal(self: *MemTable) void {
+        self.sealed.store(true, .release);
+    }
+
+    /// Whether this memtable has been sealed (promoted to immutable).  Loaded
+    /// `.acquire` to pair with `seal`'s release.
+    pub fn isSealed(self: *const MemTable) bool {
+        return self.sealed.load(.acquire);
+    }
+
     /// Encode an entry and insert it into the skiplist.
     /// For a deletion, `value` is typically empty (but any value is accepted).
     ///
@@ -154,6 +183,10 @@ pub const MemTable = struct {
         key: []const u8,
         value: []const u8,
     ) !void {
+        // D2b4: an immutable (sealed) memtable is frozen — its entry set must
+        // not change while a flush/read fiber scans it.  Reject mutations.
+        if (self.isSealed()) return error.MemTableSealed;
+
         // A range tombstone (M7.5) is NOT a skiplist point entry: `key` is the
         // begin user key and `value` is the end user key.  Record it in the
         // tombstone list at `sequence` and return.
