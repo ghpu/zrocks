@@ -51,6 +51,19 @@ pub const TableCache = struct {
     policy: bloom.BloomFilterPolicy,
     /// file_number -> heap-allocated open Table reader.
     tables: std.AutoHashMapUnmanaged(u64, *Entry),
+    /// Concurrency capability for `mutex` (D2a-2): the SAME `std.Io` that owns
+    /// the owning DB's filesystem authority — never an ambient/global io.
+    io: std.Io,
+    /// Serializes mutation of the `tables` map (D2a-2).  Once a background flush
+    /// or compaction worker runs concurrently with the read path, both call
+    /// `findTable`, which may INSERT into the map (resizing it) while another
+    /// caller reads it — a data race on the hashmap's backing store.  This mutex
+    /// makes the map lookup-insert and `evict` atomic.  The returned `*Table` /
+    /// `*Entry` pointers stay valid after the lock is dropped: an `Entry` is
+    /// never moved or freed while still referenced (only `evict`/`deinit` free
+    /// it, and the obsolete-file pending-deletion queue guarantees no live reader
+    /// holds an evicted entry).
+    mutex: std.Io.Mutex,
 
     /// One cached open table: the reader plus the file it reads through (the
     /// reader borrows the file and never closes it, so the cache owns both).
@@ -78,6 +91,9 @@ pub const TableCache = struct {
             // filter for this policy simply work without bloom fast-paths.
             .policy = bloom.BloomFilterPolicy.init(10),
             .tables = .empty,
+            // The cache's `io` is the SAME one the Env owns (no ambient io).
+            .io = e.io(),
+            .mutex = .init,
         };
     }
 
@@ -98,6 +114,12 @@ pub const TableCache = struct {
     /// use.  The returned pointer is owned by the cache and stays valid until
     /// `deinit`.
     pub fn findTable(self: *TableCache, file_number: u64, file_size: u64) !*Table {
+        // Serialize map mutation against a concurrent background worker (D2a-2).
+        // Held across the open + insert so a miss can never race a concurrent
+        // insert of the same file number into the hashmap's backing arrays.
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
+
         if (self.tables.get(file_number)) |entry| return &entry.table;
 
         const path = try filename.tableFileName(self.gpa, self.dbname, file_number);
@@ -144,6 +166,11 @@ pub const TableCache = struct {
     /// Evict the cached entry for `file_number` if present; no-op if not cached.
     /// Mirrors the `deinit` teardown order: table.deinit → file.close → gpa.destroy.
     pub fn evict(self: *TableCache, file_number: u64) void {
+        // Serialize against findTable / a concurrent worker (D2a-2).  `evict`
+        // returns void and cannot propagate error.Canceled, so lock uncancelably.
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
         const kv = self.tables.fetchRemove(file_number) orelse return;
         const entry = kv.value;
         entry.table.deinit();
@@ -470,4 +497,62 @@ test "TableCache.evict: evict then deleteFile -> findTable returns FileNotFound"
     // findTable should now fail because the file is gone.
     const result = tc.findTable(20, size);
     try testing.expectError(error.NotFound, result);
+}
+
+test "D2a-2: concurrent findTable from multiple fibers is serialized (no map corruption)" {
+    const gpa = testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+    try e.makeDir("db");
+
+    const policy = bloom.BloomFilterPolicy.init(10);
+
+    // Build a handful of distinct SSTs so concurrent finders insert different
+    // file numbers into the cache map at the same time — the exact race the
+    // D2a-2 mutex guards (a concurrent insert resizes the hashmap's backing
+    // arrays while another caller reads/inserts them).
+    const nfiles: u64 = 8;
+    var fnum: u64 = 30;
+    var sizes: [8]u64 = undefined;
+    while (fnum < 30 + nfiles) : (fnum += 1) {
+        const entries = [_]IKV{
+            .{ .user = "k", .seq = fnum, .t = .value, .v = "v" },
+        };
+        try buildSST(gpa, e, "db", fnum, policy, &entries);
+        const p = try filename.tableFileName(gpa, "db", fnum);
+        defer gpa.free(p);
+        sizes[fnum - 30] = try e.getFileSize(p);
+    }
+
+    var tc = TableCache.init(gpa, e, "db", .{}, null);
+    defer tc.deinit();
+
+    // Each worker opens every file (each `findTable` may insert); running them
+    // concurrently exercises the serialization.  A worker returns the first
+    // error it hits (or null on success).
+    const Worker = struct {
+        fn run(cache: *TableCache, szs: []const u64, base: u64, count: u64) ?anyerror {
+            var n: u64 = 0;
+            while (n < count) : (n += 1) {
+                _ = cache.findTable(base + n, szs[n]) catch |err| return err;
+            }
+            return null;
+        }
+    };
+
+    const io = std.testing.io;
+    var f1 = std.Io.async(io, Worker.run, .{ &tc, sizes[0..nfiles], @as(u64, 30), nfiles });
+    var f2 = std.Io.async(io, Worker.run, .{ &tc, sizes[0..nfiles], @as(u64, 30), nfiles });
+    var f3 = std.Io.async(io, Worker.run, .{ &tc, sizes[0..nfiles], @as(u64, 30), nfiles });
+    const r1 = f1.await(io);
+    const r2 = f2.await(io);
+    const r3 = f3.await(io);
+    try testing.expect(r1 == null);
+    try testing.expect(r2 == null);
+    try testing.expect(r3 == null);
+
+    // Exactly one entry per file ended up cached (no duplicate inserts, no
+    // lost/corrupted entries).
+    try testing.expectEqual(@as(usize, nfiles), tc.tables.count());
 }

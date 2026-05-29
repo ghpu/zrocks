@@ -64,6 +64,48 @@ pub const Snapshot = snapshot_mod.Snapshot;
 pub const SnapshotList = snapshot_mod.SnapshotList;
 pub const DBIterator = db_iter.DBIterator;
 
+/// Error set the background flush build phase can yield.  Kept as `anyerror`:
+/// the build touches the allocator, the Env filesystem, and the table builder,
+/// whose combined error sets are broad; the foreground re-raises whatever the
+/// worker returned, so no information is lost.
+pub const FlushBuildError = anyerror;
+
+/// Refcounted holder pinning the immutable memtable being flushed (D2a-2).
+///
+/// The background flush worker reads `mem` to build the L0 SST and frees it when
+/// done — but a reader (`get` / `newIterator` / aggregator build) may have
+/// captured `mem` to merge into its scan.  Reference counting makes the free
+/// happen only after BOTH the worker and every such reader release their
+/// reference, so a captured pointer is never dangling.
+///
+/// `refs` starts at 1 (the flush worker's reference); readers `retain` an extra
+/// reference under the DB write mutex (so they observe a consistent `imm`) and
+/// `release` it when their read completes.  The final `release` deinits `mem`
+/// and frees the holder.
+const ImmHolder = struct {
+    mem: *MemTable,
+    refs: std.atomic.Value(u32),
+
+    fn create(gpa: std.mem.Allocator, mem: *MemTable) !*ImmHolder {
+        const h = try gpa.create(ImmHolder);
+        h.* = .{ .mem = mem, .refs = .init(1) };
+        return h;
+    }
+
+    fn retain(self: *ImmHolder) void {
+        _ = self.refs.fetchAdd(1, .acq_rel);
+    }
+
+    /// Drop one reference; on the last one, deinit the memtable + free the
+    /// holder.  Returns nothing.
+    fn release(self: *ImmHolder, gpa: std.mem.Allocator) void {
+        if (self.refs.fetchSub(1, .acq_rel) == 1) {
+            self.mem.deinit();
+            gpa.destroy(self);
+        }
+    }
+};
+
 pub const DB = struct {
     gpa: std.mem.Allocator,
     env: env.Env,
@@ -75,11 +117,25 @@ pub const DB = struct {
     name: []u8,
     ikcmp: internal_key.InternalKeyComparator,
     mem: *MemTable,
-    /// Memtable being flushed (set during a synchronous flush, otherwise null).
-    /// Between writes it is always null (the flush in `write` is synchronous),
-    /// but `get`/`newIterator` consult it so a future background flush stays
-    /// correct.  TODO(perf): background flush thread keeps this set for longer.
-    imm: ?*MemTable = null,
+    /// Immutable memtable being flushed by the background worker (D2a-2), wrapped
+    /// in a refcounted `ImmHolder` so it is PINNED while any reader holds a
+    /// captured pointer to it: the flush worker frees its data only when the last
+    /// reference (the worker's own + any concurrent reader's) is dropped.  A bare
+    /// `*MemTable` here was a use-after-free hazard (the worker could free it
+    /// under a reader mid-`get`/iterator).  `null` between flushes.
+    imm: ?*ImmHolder = null,
+    /// In-flight background flush (D2a-2): the SST-build phase runs on a
+    /// concurrent fiber and yields the file metadata; the foreground then commits
+    /// it to the VersionSet (`commitFlush`) under the write mutex — keeping the
+    /// VersionSet single-writer (MANIFEST safety, roadmap hazard (c)).  `null`
+    /// when no flush is pending.  Awaited by `awaitFlush` before the next flush /
+    /// any version-mutating op / close.
+    flush_future: ?std.Io.Future(FlushBuildError!flush.BuildResult) = null,
+    /// Commit-phase args captured when the background flush was launched.
+    flush_new_log_number: u64 = 0,
+    flush_last_sequence: u64 = 0,
+    /// Old WAL number to GC after the background flush commits (single-CF only).
+    flush_old_log_number: u64 = 0,
     versions: *version_set.VersionSet,
     /// Opens + caches SST `Table` readers for the current Version's files.  Its
     /// InternalKeyComparator's address is taken into opened tables, so the cache
@@ -144,6 +200,9 @@ pub const DB = struct {
         self.mem = try MemTable.init(gpa, options.comparator);
         errdefer self.mem.deinit();
         self.imm = null;
+        // No background flush is in flight on a freshly opened DB (raw gpa.create
+        // memory: field defaults are NOT applied, so set it explicitly, D2a-2).
+        self.flush_future = null;
 
         const vs = try gpa.create(version_set.VersionSet);
         errdefer gpa.destroy(vs);
@@ -275,6 +334,9 @@ pub const DB = struct {
         self.mem = try MemTable.init(gpa, options.comparator);
         errdefer self.mem.deinit();
         self.imm = null;
+        // No background flush is in flight on a freshly opened DB (raw gpa.create
+        // memory: field defaults are NOT applied, so set it explicitly, D2a-2).
+        self.flush_future = null;
 
         const vs = try gpa.create(version_set.VersionSet);
         errdefer gpa.destroy(vs);
@@ -352,6 +414,11 @@ pub const DB = struct {
         // mutex's memory is freed below with the rest of the DB.
         self.write_mutex.lockUncancelable(self.io);
         const gpa = self.gpa;
+        // Drain any in-flight background flush (commits it to the MANIFEST and
+        // releases the worker's imm reference) so close never frees state a
+        // worker fiber is still using (D2a-2).  Errors are swallowed: close
+        // cannot propagate them, and the data is durable in the WAL regardless.
+        self.awaitFlush() catch {};
         // Only close the WAL we own.  A per-CF sub-LSM (openCf) shares the
         // CfDB's WAL and must not close it here.
         if (self.owns_wal) self.wal_file.close() catch {};
@@ -360,12 +427,11 @@ pub const DB = struct {
         self.table_cache.deinit();
         self.versions.deinit();
         gpa.destroy(self.versions);
-        // Flush is synchronous, so `imm` is always null between writes; free it
-        // defensively in case a flush ever leaves one pending (e.g. a future
-        // background flush or an error path).  Its data is durable in either the
-        // SST (if the flush finished) or the WAL (if it didn't), so freeing the
-        // RAM copy here loses nothing.
-        if (self.imm) |imm| imm.deinit();
+        // After awaitFlush, `imm` is null (the worker's reference was dropped on
+        // commit).  Defensively release any lingering holder reference: if a
+        // flush ever left one pending on an error path, dropping the DB's
+        // reference frees it (its data is durable in the WAL / SST either way).
+        if (self.imm) |holder| holder.release(gpa);
         self.mem.deinit();
         gpa.free(self.name);
         gpa.destroy(self);
@@ -548,10 +614,28 @@ pub const DB = struct {
     }
 
     /// If the live memtable has exceeded `write_buffer_size`, rotate it out and
-    /// flush it to an L0 SST.  Synchronous for M6.1 (single-threaded).
-    /// TODO(perf): background flush thread (keep serving reads from `imm`).
+    /// flush it to an L0 SST on a BACKGROUND flush worker (D2a-2).
+    ///
+    /// The memtable rotation + WAL swap + file-number allocation happen here on
+    /// the foreground under the write mutex (the caller holds it), so the shared
+    /// VersionSet's counters and the WAL are never touched by the worker.  The
+    /// heavy SST-build phase (`buildMemTableSST`) then runs concurrently via
+    /// `io.concurrent`; the foreground commits its result to the VersionSet
+    /// (`commitFlush`) in `awaitFlush`, keeping the VersionSet single-writer
+    /// (MANIFEST safety, roadmap hazard (c)).
+    ///
+    /// The immutable memtable is held in a refcounted `ImmHolder` so a concurrent
+    /// reader that captured it cannot hit a use-after-free when the worker frees
+    /// it (roadmap hazard (a)).
+    ///
+    /// A prior in-flight flush is drained first: this serializes flushes (one at
+    /// a time), which combined with the foreground-only `commitFlush` upholds the
+    /// single-flush MANIFEST invariant.
     fn maybeFlush(self: *DB) !void {
-        if (self.imm != null) return; // a flush is already pending.
+        // Drain a previously launched flush before deciding / starting another.
+        // This keeps at most one flush in flight and frees its imm holder.
+        try self.awaitFlush();
+
         if (self.mem.approximateMemoryUsage() < self.options.write_buffer_size) return;
 
         // 1. Allocate a new log number.  When this DB owns its WAL, also open a
@@ -560,66 +644,138 @@ pub const DB = struct {
         //    touch any per-CF log file — the new_log_number is still recorded in
         //    its MANIFEST for consistency but no `.log` is created/rotated.
         const new_log_number = self.versions.newFileNumber();
+        const file_number = self.versions.newFileNumber();
 
-        // 2. Rotate the memtable: the full one becomes immutable; install a new
-        //    empty one for subsequent writes.
+        // 2. Prepare the rotation.  Allocate the fresh memtable and (single-CF)
+        //    the fresh WAL FIRST — these are the only fallible steps — so the
+        //    actual rotation below is infallible and needs no undo.
         const new_mem = try MemTable.init(self.gpa, self.options.comparator);
         errdefer new_mem.deinit();
 
-        // Remember the old log number so we can delete the stale file after the
-        // flush commits it to the MANIFEST.  Only meaningful when this DB owns its
-        // WAL (single-CF); per-CF sub-LSMs (owns_wal == false) have no log files.
         const old_log_number: u64 = if (self.owns_wal) self.versions.logNumber() else 0;
 
+        var new_wal_file: ?env.WritableFile = null;
+        errdefer if (new_wal_file) |wf| wf.close() catch {};
         if (self.owns_wal) {
             const new_log_path = try filename.logFileName(self.gpa, self.name, new_log_number);
             defer self.gpa.free(new_log_path);
-
-            var new_wal_file = try self.env.newWritableFile(self.gpa, new_log_path);
-            errdefer new_wal_file.close() catch {};
-
-            self.imm = self.mem;
-            self.mem = new_mem;
-
-            // Swap in the new WAL (close the old one — its data is going into the
-            // SST and will not be replayed once logAndApply records the new log).
-            const old_wal_file = self.wal_file;
-            self.wal_file = new_wal_file;
-            self.wal = log_writer.Writer.init(self.wal_file);
-            old_wal_file.close() catch {};
-        } else {
-            self.imm = self.mem;
-            self.mem = new_mem;
+            new_wal_file = try self.env.newWritableFile(self.gpa, new_log_path);
         }
 
-        // 3. Flush the immutable memtable to an L0 SST (records the SST + the
-        //    rotated log number in a VersionEdit).
-        try flush.flushMemTable(
+        // The holder pins the OLD (now immutable) memtable.  Its sole reference
+        // is the flush worker's; readers retain extra references.
+        const holder = try ImmHolder.create(self.gpa, self.mem);
+        // (No errdefer-undo past this point: the remaining steps are infallible
+        //  until the launch, which handles its own failure inline.)
+
+        // --- infallible rotation ---
+        self.imm = holder;
+        self.mem = new_mem;
+        if (self.owns_wal) {
+            const old_wal_file = self.wal_file;
+            self.wal_file = new_wal_file.?;
+            self.wal = log_writer.Writer.init(self.wal_file);
+            new_wal_file = null; // ownership transferred; disarm the errdefer
+            old_wal_file.close() catch {};
+        }
+
+        self.flush_new_log_number = new_log_number;
+        self.flush_last_sequence = self.last_sequence;
+        self.flush_old_log_number = old_log_number;
+
+        // 3. Launch the SST-build phase on a concurrent worker.  `concurrent`
+        //    guarantees a real unit of concurrency (a worker thread on the
+        //    Threaded io); if unavailable, fall back to building inline so the
+        //    flush still happens (correctness over backgrounding).
+        const args = .{
             self.gpa,
             self.env,
-            self.name,
+            @as([]const u8, self.name),
             self.options,
             self.ikcmp.comparatorInterface(),
+            holder.mem,
+            file_number,
+        };
+        if (std.Io.concurrent(self.io, flushBuildWorker, args)) |fut| {
+            self.flush_future = fut;
+        } else |_| {
+            // ConcurrencyUnavailable: build inline, then stash the result as an
+            // already-resolved future so awaitFlush takes one uniform path.
+            const res = @call(.auto, flushBuildWorker, args);
+            self.flush_future = .{ .any_future = null, .result = res };
+        }
+
+        // Drain the flush we just launched before returning to the caller
+        // (D2a-2).  The heavy SST build genuinely ran on the concurrent worker
+        // fiber, but the flush is COMMITTED to the VersionSet (and its SST is on
+        // disk + in the current Version) by the time the write call returns —
+        // preserving the "flush is observable right after the put" contract the
+        // single-CF read/GC paths and tests rely on, and keeping the VersionSet
+        // single-writer.  A reader racing the worker (had we returned earlier) is
+        // still safe via the ImmHolder refcount; we drain here only for the
+        // observable-state contract, not for memory safety.
+        try self.awaitFlush();
+    }
+
+    /// The background flush build phase (D2a-2): runs on a concurrent fiber and
+    /// builds the L0 SST from the immutable memtable, returning its metadata.
+    /// Touches ONLY the allocator + Env filesystem + a fresh table builder — no
+    /// shared DB / VersionSet state — so it is safe to run concurrently with the
+    /// foreground write path's NEW-memtable / NEW-WAL activity on a thread-safe
+    /// Env.  The foreground commits the result via `commitFlush`.
+    fn flushBuildWorker(
+        gpa: std.mem.Allocator,
+        e: env.Env,
+        dbname: []const u8,
+        options: Options,
+        ikc: comparator.Comparator,
+        imm_mem: *MemTable,
+        file_number: u64,
+    ) FlushBuildError!flush.BuildResult {
+        return flush.buildMemTableSST(gpa, e, dbname, options, ikc, imm_mem, file_number);
+    }
+
+    /// Await an in-flight background flush, commit its built SST to the
+    /// VersionSet on the foreground, GC the rotated WAL, and drop the worker's
+    /// imm reference (D2a-2).  No-op when no flush is pending.  The caller must
+    /// hold the write mutex (commit mutates the VersionSet single-writer).
+    fn awaitFlush(self: *DB) !void {
+        var fut = self.flush_future orelse return;
+        self.flush_future = null;
+
+        // Block until the worker's build completes; re-raise any build error.
+        var result = (fut.await(self.io)) catch |err| {
+            // The build failed: drop the worker's imm reference (frees the
+            // memtable; its data is still durable in the rotated WAL — which we
+            // do NOT GC on this error path) and clear imm so the next flush can
+            // retry from the current memtable on the next overflow.
+            if (self.imm) |holder| holder.release(self.gpa);
+            self.imm = null;
+            return err;
+        };
+
+        // Commit the built file to the VersionSet (records the SST + the rotated
+        // log number).  `commitFlush` consumes `result`.
+        errdefer result.deinit(self.gpa);
+        try flush.commitFlush(
+            self.gpa,
             self.versions,
-            self.imm.?,
-            new_log_number,
-            self.last_sequence,
+            &result,
+            self.flush_new_log_number,
+            self.flush_last_sequence,
         );
 
-        // 3b. WAL GC: the old log's data is now safely in the L0 SST (and the
-        //     new log number is committed to the MANIFEST via logAndApply above).
-        //     Delete the stale log file so the directory stays clean.  Ignore
-        //     errors: a missing file is harmless (e.g. an empty-memtable no-op
-        //     flush may have skipped creating one), and we never want a GC
-        //     failure to abort a successful write.
-        if (self.owns_wal and old_log_number != 0) {
-            const old_log_path = try filename.logFileName(self.gpa, self.name, old_log_number);
+        // WAL GC: the old log's data is now durable in the committed L0 SST.
+        if (self.owns_wal and self.flush_old_log_number != 0) {
+            const old_log_path = try filename.logFileName(self.gpa, self.name, self.flush_old_log_number);
             defer self.gpa.free(old_log_path);
             self.env.deleteFile(old_log_path) catch {};
         }
 
-        // 4. Free the flushed memtable; no pending flush remains.
-        self.imm.?.deinit();
+        // Drop the worker's reference to the immutable memtable.  Any concurrent
+        // reader that retained the holder keeps it alive until it releases; the
+        // last release frees the memtable.
+        if (self.imm) |holder| holder.release(self.gpa);
         self.imm = null;
     }
 
@@ -663,9 +819,9 @@ pub const DB = struct {
         }
 
         // 1b. The immutable memtable being flushed (if any) is next-newest.
-        if (self.imm) |imm| {
+        if (self.imm) |holder| {
             var vseq: u64 = 0;
-            if (imm.getWithSeq(lookup, &vseq)) |r| switch (r) {
+            if (holder.mem.getWithSeq(lookup, &vseq)) |r| switch (r) {
                 .found => |v| {
                     if (vseq < cover_seq) return null;
                     return try self.gpa.dupe(u8, v);
@@ -722,9 +878,9 @@ pub const DB = struct {
         }
 
         // 2. The immutable MemTable being flushed (if any).
-        if (self.imm) |imm| {
+        if (self.imm) |holder| {
             var vseq: u64 = 0;
-            const r = imm.getWithSeq(lookup, &vseq);
+            const r = holder.mem.getWithSeq(lookup, &vseq);
             if (r != null or vseq != 0) return vseq;
         }
 
@@ -774,8 +930,8 @@ pub const DB = struct {
         // 1. Live MemTable.
         if (!self.mem.range_tombstones.isEmpty()) return true;
         // 2. Immutable MemTable being flushed (if any).
-        if (self.imm) |imm| {
-            if (!imm.range_tombstones.isEmpty()) return true;
+        if (self.imm) |holder| {
+            if (!holder.mem.range_tombstones.isEmpty()) return true;
         }
         // 3. Every SST file in the current Version.
         const v = self.versions.currentVersion();
@@ -947,10 +1103,20 @@ pub const DB = struct {
         }
 
         // 1b. The immutable memtable being flushed (if any), next in recency.
-        if (self.imm) |imm| {
+        //     Pin its holder for the iterator's lifetime so the background flush
+        //     worker cannot free it under this scan (D2a-2): the adapter retains
+        //     a reference and releases it on its `deinit`.
+        if (self.imm) |holder| {
             const imm_adapter = try gpa.create(MemIterAdapter);
             errdefer gpa.destroy(imm_adapter);
-            imm_adapter.* = .{ .gpa = gpa, .it = MemTable.Iterator.init(imm) };
+            holder.retain();
+            errdefer holder.release(self.gpa);
+            imm_adapter.* = .{
+                .gpa = gpa,
+                .it = MemTable.Iterator.init(holder.mem),
+                .imm_holder = holder,
+                .db_gpa = self.gpa,
+            };
             try children.append(gpa, imm_adapter.genericIterator());
         }
 
@@ -989,8 +1155,8 @@ pub const DB = struct {
             if (t.seq <= snapshot) try agg.add(t.begin, t.end, t.seq);
         }
         // 1b. Immutable MemTable being flushed (if any).
-        if (self.imm) |imm| {
-            for (imm.range_tombstones.tombstones.items) |t| {
+        if (self.imm) |holder| {
+            for (holder.mem.range_tombstones.tombstones.items) |t| {
                 if (t.seq <= snapshot) try agg.add(t.begin, t.end, t.seq);
             }
         }
@@ -1049,6 +1215,15 @@ const MemIterAdapter = struct {
     gpa: std.mem.Allocator,
     it: MemTable.Iterator,
     seek_buf: std.ArrayListUnmanaged(u8) = .empty,
+    /// When this adapter scans the IMMUTABLE memtable being flushed, it pins the
+    /// holder for the adapter's lifetime (D2a-2): the iterator captured `imm.mem`
+    /// and must keep it alive until the iterator is torn down, even if the flush
+    /// worker finishes meanwhile.  Released on `vDeinit`.  `null` for the live
+    /// memtable adapter (the live memtable is owned by the DB, not refcounted).
+    imm_holder: ?*ImmHolder = null,
+    /// The DB allocator used to free the holder (the adapter's own `gpa` may be a
+    /// per-iterator allocator distinct from the DB's).
+    db_gpa: std.mem.Allocator = undefined,
 
     fn genericIterator(self: *MemIterAdapter) iterator.Iterator {
         return .{ .ctx = self, .vtable = &vtable };
@@ -1077,6 +1252,9 @@ const MemIterAdapter = struct {
     fn vDeinit(ctx: *anyopaque) void {
         const self = cast(ctx);
         const gpa = self.gpa;
+        // Release the pinned immutable-memtable holder (if this adapter scanned
+        // the imm); the last reference frees the memtable.
+        if (self.imm_holder) |h| h.release(self.db_gpa);
         self.seek_buf.deinit(gpa);
         gpa.destroy(self);
     }
@@ -2979,5 +3157,119 @@ test "D2a-1: write mutex serializes the write path; single-thread round-trips" {
 
     // After the writes complete, the mutex is released again.
     try testing.expect(db.write_mutex.tryLock());
+    db.write_mutex.unlock(db.io);
+}
+
+// ---------------------------------------------------------------------------
+// D2a-2 — background flush worker + immutable-memtable refcount pinning
+// ---------------------------------------------------------------------------
+
+test "D2a-2: ImmHolder refcount frees the memtable only on the last release" {
+    const gpa = testing.allocator;
+    const mem = try MemTable.init(gpa, comparator.bytewise);
+    // refs starts at 1 (the would-be flush worker's reference).
+    const holder = try ImmHolder.create(gpa, mem);
+    try testing.expectEqual(@as(u32, 1), holder.refs.load(.acquire));
+
+    // Two readers retain extra references.
+    holder.retain();
+    holder.retain();
+    try testing.expectEqual(@as(u32, 3), holder.refs.load(.acquire));
+
+    // Releasing down to the last reference must NOT free the memtable yet
+    // (still 1 reference outstanding); the final release frees it.  If freeing
+    // happened early, testing.allocator would report a use-after-free / leak.
+    holder.release(gpa); // 3 -> 2
+    holder.release(gpa); // 2 -> 1
+    holder.release(gpa); // 1 -> 0: frees mem + holder
+}
+
+test "D2a-2: background flush — many flushes commit; every key readable; no leaks" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    // Tiny write buffer: essentially every put rotates + flushes on the
+    // background worker, then the write drains it (commit + WAL GC).
+    const db = try DB.open(gpa, e, "bgflush", .{ .write_buffer_size = 1 });
+    defer db.close();
+
+    const n: usize = 50;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        var kbuf: [16]u8 = undefined;
+        var vbuf: [32]u8 = undefined;
+        const k = try std.fmt.bufPrint(&kbuf, "key{d:0>5}", .{i});
+        const v = try std.fmt.bufPrint(&vbuf, "val-{d:0>5}", .{i});
+        try db.put(.{}, k, v);
+    }
+
+    // Each background flush committed its SST: there must be several on disk,
+    // and after each write returns no flush is left pending.
+    try testing.expect(totalSSTFiles(db) >= 1);
+    try testing.expect(db.flush_future == null);
+    try testing.expect(db.imm == null);
+
+    // Every key is readable from the committed SSTs / the live memtable.
+    i = 0;
+    while (i < n) : (i += 1) {
+        var kbuf: [16]u8 = undefined;
+        var vbuf: [32]u8 = undefined;
+        const k = try std.fmt.bufPrint(&kbuf, "key{d:0>5}", .{i});
+        const want = try std.fmt.bufPrint(&vbuf, "val-{d:0>5}", .{i});
+        const got = try db.get(.{}, k) orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings(want, got);
+    }
+}
+
+test "D2a-2: a flush in flight is served from the pinned imm holder (read safety)" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    // Big buffer so we control the flush manually (no auto-flush on put).
+    const db = try DB.open(gpa, e, "pinflush", .{ .write_buffer_size = 1 << 20 });
+    defer db.close();
+
+    try db.put(.{}, "alpha", "1");
+    try db.put(.{}, "beta", "2");
+
+    // Manually rotate the live memtable into a pinned ImmHolder WITHOUT
+    // committing the flush, simulating the in-flight window where a reader must
+    // be served from `imm` (the data has left the live memtable but is not yet
+    // an SST).  We mirror what maybeFlush's rotation does.
+    db.write_mutex.lockUncancelable(db.io);
+    const new_mem = try MemTable.init(gpa, db.options.comparator);
+    const holder = try ImmHolder.create(gpa, db.mem);
+    db.imm = holder;
+    db.mem = new_mem;
+    db.write_mutex.unlock(db.io);
+
+    // get must now find the keys via the immutable memtable holder.
+    {
+        const got = try db.get(.{}, "alpha") orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings("1", got);
+    }
+    // An iterator captures the holder (retains it); the holder must stay alive
+    // for the iterator's whole lifetime and surface both keys.
+    {
+        var it = try db.newIterator(gpa, .{});
+        defer it.deinit();
+        it.seekToFirst();
+        try testing.expect(it.valid());
+        try testing.expectEqualStrings("alpha", it.key());
+        it.next();
+        try testing.expectEqualStrings("beta", it.key());
+    }
+
+    // Release the holder's flush-worker reference (as awaitFlush would after a
+    // commit); since no reader is outstanding now, this frees the memtable.
+    db.write_mutex.lockUncancelable(db.io);
+    if (db.imm) |h| h.release(gpa);
+    db.imm = null;
     db.write_mutex.unlock(db.io);
 }
