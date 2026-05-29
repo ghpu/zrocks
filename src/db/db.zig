@@ -67,6 +67,10 @@ pub const DBIterator = db_iter.DBIterator;
 pub const DB = struct {
     gpa: std.mem.Allocator,
     env: env.Env,
+    /// Concurrency capability backing this DB (D2a-1): the SAME `std.Io` that
+    /// owns `env`'s filesystem authority.  Used by `write_mutex` (and, later, the
+    /// background flush/compaction workers) — never an ambient/global io.
+    io: std.Io,
     options: Options,
     name: []u8,
     ikcmp: internal_key.InternalKeyComparator,
@@ -92,7 +96,14 @@ pub const DB = struct {
     /// Live point-in-time snapshots.  Their oldest sequence bounds what
     /// compaction may discard (M6.3 snapshot pinning).
     snapshots: SnapshotList,
-    // TODO(concurrency): DB write mutex (single-threaded for M4.1/M5.2).
+    /// Serializes the write path (`write` / `applyBatchNoWal`) and the
+    /// teardown/snapshot-list mutations (`close` / `releaseSnapshot`) so the
+    /// memtable + WAL + last_sequence stay consistent once background flush /
+    /// compaction workers land (D2a-1).  Single-threaded today, so it is always
+    /// uncontended (lock = a cmpxchg, no futex).  `write` returns `!void` and uses
+    /// the cancelable `lock`; the void-returning `close`/`releaseSnapshot` cannot
+    /// propagate `error.Canceled`, so they use `lockUncancelable`.
+    write_mutex: std.Io.Mutex = .init,
 
     /// Open a DB rooted at directory `name` on `e`, recovering durable state.
     ///
@@ -112,6 +123,11 @@ pub const DB = struct {
 
         self.gpa = gpa;
         self.env = e;
+        // Pull the concurrency capability from the Env (no ambient io).  Reset the
+        // write mutex to unlocked — `self` came from raw `gpa.create` memory, so
+        // the field's default initializer is NOT applied; set it explicitly.
+        self.io = e.io();
+        self.write_mutex = .init;
         self.options = options;
         self.last_sequence = 0;
         self.owns_wal = true;
@@ -244,6 +260,8 @@ pub const DB = struct {
 
         self.gpa = gpa;
         self.env = e;
+        self.io = e.io();
+        self.write_mutex = .init;
         self.options = options;
         self.last_sequence = 0;
         self.owns_wal = false;
@@ -312,6 +330,13 @@ pub const DB = struct {
     /// the batch, recorded onto this CF so its reads/snapshots and any flush use
     /// the shared sequence space.
     pub fn applyBatchNoWal(self: *DB, batch: *const WriteBatch, cf_id: u32, first_sequence: u64, set_last_sequence: u64) !void {
+        // Serialize this CF's memtable mutation + flush/compaction under the CF's
+        // own write mutex (D2a-1).  Distinct from the CfDB-level shared-WAL mutex,
+        // so there is no deadlock: the CfDB locks the shared WAL, then fans out to
+        // each CF which briefly locks only its own sub-LSM.
+        try self.write_mutex.lock(self.io);
+        defer self.write_mutex.unlock(self.io);
+
         try write_path.insertBatchForCf(self.mem, batch, cf_id, first_sequence);
         self.last_sequence = set_last_sequence;
         try self.maybeFlush();
@@ -321,6 +346,11 @@ pub const DB = struct {
     /// Flush+close the WAL, deinit the table cache + VersionSet + MemTable,
     /// free the DB.
     pub fn close(self: *DB) void {
+        // Acquire the write mutex so close cannot race a writer once background
+        // workers exist (D2a-1).  `close` returns `void` and cannot propagate
+        // `error.Canceled`, so use the uncancelable lock.  We never unlock: the
+        // mutex's memory is freed below with the rest of the DB.
+        self.write_mutex.lockUncancelable(self.io);
         const gpa = self.gpa;
         // Only close the WAL we own.  A per-CF sub-LSM (openCf) shares the
         // CfDB's WAL and must not close it here.
@@ -386,7 +416,13 @@ pub const DB = struct {
     /// (unless disabled), insert its records into the MemTable, and advance the
     /// last sequence by the batch's record count.
     pub fn write(self: *DB, wopts: WriteOptions, batch: *WriteBatch) !void {
-        // TODO(concurrency): acquire DB write mutex here (single-threaded now).
+        // Serialize writers (D2a-1).  Single-threaded today (always uncontended,
+        // so `lock` is a cmpxchg with no cancelation point reached), but holding
+        // the mutex across the WAL append + memtable insert + flush/compaction
+        // keeps the whole write atomic once background workers contend.
+        try self.write_mutex.lock(self.io);
+        defer self.write_mutex.unlock(self.io);
+
         const first_sequence = self.last_sequence + 1;
         batch.setSequence(first_sequence);
 
@@ -991,6 +1027,12 @@ pub const DB = struct {
     /// Release a snapshot taken with `getSnapshot`, unpinning its sequence so
     /// later compactions may reclaim versions it was holding.
     pub fn releaseSnapshot(self: *DB, snap: *Snapshot) void {
+        // Guard the snapshot-list mutation against a concurrent writer (whose
+        // compaction reads `snapshots.oldest()` under the same mutex) once
+        // background workers land (D2a-1).  `releaseSnapshot` returns `void`, so
+        // it cannot propagate `error.Canceled` — use the uncancelable lock.
+        self.write_mutex.lockUncancelable(self.io);
+        defer self.write_mutex.unlock(self.io);
         self.snapshots.release(snap);
     }
 };
@@ -2897,4 +2939,45 @@ test "compress-perlevel: deeper-level compaction output is compressed, data corr
             try testing.expectEqualStrings("A" ** 200, got);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// D2a-1 — io capability + write mutex (prerequisite for background workers)
+// ---------------------------------------------------------------------------
+
+test "D2a-1: DB carries an io capability obtained from its Env" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const db = try openTestDB(gpa, &me);
+    defer db.close();
+
+    // The DB holds an `io` capability (used by the write mutex's futex paths
+    // once background workers contend).  It must be the SAME io the Env exposes.
+    try testing.expect(db.io.userdata == me.env().io().userdata);
+    try testing.expect(db.io.vtable == me.env().io().vtable);
+}
+
+test "D2a-1: write mutex serializes the write path; single-thread round-trips" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const db = try openTestDB(gpa, &me);
+    defer db.close();
+
+    // Between writes the mutex is free (no write in flight): tryLock succeeds,
+    // and releasing it leaves writes working normally.
+    try testing.expect(db.write_mutex.tryLock());
+    db.write_mutex.unlock(db.io);
+
+    // Normal single-threaded writes/reads still work with the mutex in place.
+    try db.put(.{}, "k", "v1");
+    try db.put(.{}, "k", "v2");
+    const got = try db.get(.{}, "k") orelse return error.TestExpectedFound;
+    defer gpa.free(got);
+    try testing.expectEqualStrings("v2", got);
+
+    // After the writes complete, the mutex is released again.
+    try testing.expect(db.write_mutex.tryLock());
+    db.write_mutex.unlock(db.io);
 }

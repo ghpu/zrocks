@@ -129,6 +129,11 @@ pub const Env = struct {
         // (TODO M5/M6 — DB-level single-process lock).  No-op success.
         lockFile: *const fn (ptr: *anyopaque, path: []const u8) Error!void,
         unlockFile: *const fn (ptr: *anyopaque, path: []const u8) Error!void,
+        // The async/concurrency capability backing this Env (D2a-1).  Threaded
+        // through to the DB so its write mutex (`std.Io.Mutex`) and the upcoming
+        // background flush/compaction workers use the SAME `std.Io` instance that
+        // owns this Env's filesystem authority — no global/ambient `io`.
+        io: *const fn (ptr: *anyopaque) std.Io,
     };
 
     /// Create/truncate `path` for writing/appending.
@@ -173,6 +178,12 @@ pub const Env = struct {
     }
     pub fn unlockFile(self: Env, path: []const u8) Error!void {
         return self.vtable.unlockFile(self.ptr, path);
+    }
+    /// The `std.Io` capability backing this Env (D2a-1).  The DB pulls its write
+    /// mutex's `io` (and, later, its background workers' `io`) from here so all
+    /// concurrency uses the SAME instance that owns the filesystem authority.
+    pub fn io(self: Env) std.Io {
+        return self.vtable.io(self.ptr);
     }
 };
 
