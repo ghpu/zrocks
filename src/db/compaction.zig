@@ -152,6 +152,39 @@ pub fn pickCompaction(
 }
 
 // ===========================================================================
+// Obsolete-file GC (gc1) — reclaim the .sst inputs a committed edit removed
+// ===========================================================================
+
+/// After a VersionEdit that removes input files has been applied via
+/// `logAndApply`, reclaim those files: evict each from the DB's `table_cache`
+/// (dropping any open handle) and `deleteFile` it from disk.
+///
+/// SAFETY: this is synchronous obsolete-file deletion, sound ONLY while zrocks
+/// is single-threaded.  Once background flush/compaction workers land (D2a) a
+/// concurrent reader could hold a captured handle to a just-removed file, so
+/// this must then become a refcount/pending-deletion queue.  See roadmap D2c.
+///
+/// The DB's `table_cache` must be passed (NOT the per-compaction private cache),
+/// so the entry a reader would re-`findTable` is the one that gets torn down.
+/// Deletion errors (e.g. NotFound when the file was never opened/written) are
+/// swallowed — the file is gone from the Version regardless.
+fn reclaimObsoleteFiles(
+    gpa: std.mem.Allocator,
+    e: env.Env,
+    dbname: []const u8,
+    table_cache: *table_cache_mod.TableCache,
+    edit: *const version_edit.VersionEdit,
+) void {
+    for (edit.deleted_files.items) |df| {
+        // Evict first so no open handle outlives the on-disk file.
+        table_cache.evict(df.number);
+        const path = filename.tableFileName(gpa, dbname, df.number) catch continue;
+        defer gpa.free(path);
+        e.deleteFile(path) catch {};
+    }
+}
+
+// ===========================================================================
 // FIFO compaction (M7.3) — cache-like whole-file eviction of oldest L0 files
 // ===========================================================================
 
@@ -168,7 +201,11 @@ pub fn pickCompaction(
 /// TODO: ttl — only the size-based policy is implemented.
 pub fn runFifoEviction(
     gpa: std.mem.Allocator,
+    e: env.Env,
+    dbname: []const u8,
     versions: *VersionSet,
+    /// The DB's table cache — evicted files are also reclaimed from it (gc1).
+    table_cache: *table_cache_mod.TableCache,
     fifo_max_table_files_size: u64,
 ) !bool {
     const v = versions.currentVersion();
@@ -203,6 +240,8 @@ pub fn runFifoEviction(
     if (evicted == 0) return false;
 
     try versions.logAndApply(&edit);
+    // gc1: reclaim the evicted files from disk and the DB cache.
+    reclaimObsoleteFiles(gpa, e, dbname, table_cache, &edit);
     return true;
 }
 
@@ -387,6 +426,9 @@ pub fn doCompaction(
     ikc: comparator.Comparator,
     user_cmp: comparator.Comparator,
     versions: *VersionSet,
+    /// The DB's table cache — obsolete input files are reclaimed from it (gc1).
+    /// Distinct from the per-compaction private cache `tc` built below.
+    db_table_cache: *table_cache_mod.TableCache,
     compaction: *Compaction,
     smallest_snapshot: u64,
     /// True iff a LIVE snapshot pins `smallest_snapshot` (vs. it merely being the
@@ -680,9 +722,11 @@ pub fn doCompaction(
     }
 
     try versions.logAndApply(&edit);
-    // TODO: delete obsolete input .sst files via an SST file manager.  They are
-    // dropped from the Version here but left on disk so concurrent readers (none
-    // yet) cannot fault.
+    // gc1: now that the new Version is durable, the input .sst files are
+    // obsolete — evict them from the DB cache and delete them from disk.  Sound
+    // only while single-threaded (see reclaimObsoleteFiles); convert to a
+    // pending-deletion queue when background workers land (D2a).
+    reclaimObsoleteFiles(gpa, e, dbname, db_table_cache, &edit);
 }
 
 /// Finish the current output builder: emit the table, capture its metadata into
