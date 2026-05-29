@@ -1,9 +1,18 @@
-//! log_reader.zig — WAL/MANIFEST log record reader (legacy LevelDB format).
+//! log_reader.zig — WAL/MANIFEST log record reader.
 //!
 //! See `log_format.zig` for the byte layout. The reader pulls physical blocks
 //! from a `SequentialFile`, verifies each fragment's masked CRC32C, and
 //! reassembles `first`/`middle`/`last` fragment chains into a single logical
 //! record. `full` fragments are returned directly.
+//!
+//! Both on-disk formats are understood transparently. The reader inspects each
+//! record's type byte to decide whether it is a legacy record (types 1-4,
+//! 7-byte header) or a recyclable record (types 5-8, 11-byte header carrying a
+//! log_number). For recyclable records the reader optionally enforces an
+//! expected log_number: a record stamped with a different log number is a stale
+//! leftover in a recycled file and is treated as a clean end-of-stream. Set the
+//! expected log number with `initRecyclable`; the default reader (`init`)
+//! accepts any log number.
 //!
 //! Truncated-tail policy (matches LevelDB's default, non-checksum-strict
 //! behavior): a partial/truncated record at the physical end of the file —
@@ -22,6 +31,7 @@ pub const Error = error{Corruption} || env.Error;
 
 const kBlockSize = format.kBlockSize;
 const kHeaderSize = format.kHeaderSize;
+const kRecyclableHeaderSize = format.kRecyclableHeaderSize;
 
 /// Outcome of parsing one physical record from the current block buffer.
 const Fragment = union(enum) {
@@ -48,9 +58,22 @@ pub const Reader = struct {
     eof_seen: bool = false,
     /// False until the first physical block has been loaded.
     started: bool = false,
+    /// When set, recyclable records (types 5-8) whose stamped log_number does
+    /// not equal this value are treated as stale leftovers from a recycled
+    /// file and reported as a clean end-of-stream. `null` accepts any log
+    /// number (and never rejects on this basis).
+    expected_log_number: ?u32 = null,
 
     pub fn init(file: env.SequentialFile) Reader {
         return .{ .file = file };
+    }
+
+    /// Construct a reader that enforces `log_number` on recyclable records: any
+    /// recyclable fragment carrying a different log number is treated as a
+    /// clean end-of-stream (a stale record from the file's previous life).
+    /// Legacy records (types 1-4) are unaffected.
+    pub fn initRecyclable(file: env.SequentialFile, log_number: u32) Reader {
+        return .{ .file = file, .expected_log_number = log_number };
     }
 
     /// Read the next logical record. For a `full` fragment the returned slice
@@ -78,20 +101,20 @@ pub const Reader = struct {
                     if (!try self.loadBlock()) return null;
                 },
                 .ok => |frag| switch (frag.record_type) {
-                    .full => {
+                    .full, .recyclable_full => {
                         if (in_fragmented) return error.Corruption;
                         return frag.payload;
                     },
-                    .first => {
+                    .first, .recyclable_first => {
                         if (in_fragmented) return error.Corruption;
                         in_fragmented = true;
                         try scratch.appendSlice(gpa, frag.payload);
                     },
-                    .middle => {
+                    .middle, .recyclable_middle => {
                         if (!in_fragmented) return error.Corruption;
                         try scratch.appendSlice(gpa, frag.payload);
                     },
-                    .last => {
+                    .last, .recyclable_last => {
                         if (!in_fragmented) return error.Corruption;
                         try scratch.appendSlice(gpa, frag.payload);
                         return scratch.items;
@@ -153,8 +176,15 @@ pub const Reader = struct {
             return .end_of_block;
         }
 
-        if (kHeaderSize + length > remaining) {
-            // The record claims more bytes than the block holds.
+        if (type_byte > format.kMaxRecyclableRecordType) return error.Corruption;
+        const record_type: format.RecordType = @enumFromInt(type_byte);
+        const recyclable = format.isRecyclable(record_type);
+        // Recyclable records carry a 4-byte log_number after the legacy header.
+        const header_size: usize = if (recyclable) kRecyclableHeaderSize else kHeaderSize;
+
+        if (header_size + length > remaining) {
+            // The record claims more bytes than the block holds (or the
+            // recyclable log_number field itself runs past the block).
             if (self.eof_seen) {
                 // Physical end of file in the middle of a record -> truncated
                 // tail -> clean EOF (default LevelDB behavior).
@@ -165,17 +195,27 @@ pub const Reader = struct {
             return error.Corruption;
         }
 
-        if (type_byte > format.kMaxRecordType) return error.Corruption;
-        const record_type: format.RecordType = @enumFromInt(type_byte);
+        const payload = self.buf[self.pos + header_size .. self.pos + header_size + length];
 
-        const payload = self.buf[self.pos + kHeaderSize .. self.pos + kHeaderSize + length];
+        if (recyclable) {
+            const log_number = std.mem.readInt(u32, self.buf[self.pos + 7 .. self.pos + 11][0..4], .little);
+            // Verify checksum over [type] ++ log_number_LE ++ payload. Both
+            // `stored_crc` and `recyclableChecksum` are masked CRC32C values.
+            const expected_crc = format.recyclableChecksum(record_type, log_number, payload);
+            if (stored_crc != expected_crc) return error.Corruption;
+            // A recyclable record whose log_number does not match the expected
+            // one is a stale leftover from a recycled file: clean end-of-stream.
+            if (self.expected_log_number) |expected| {
+                if (log_number != expected) return .eof;
+            }
+        } else {
+            // Verify checksum: unmask, recompute over [type] ++ payload, compare.
+            const want = crc32c.unmask(stored_crc);
+            const got = crc32c.extend(crc32c.value(&[_]u8{type_byte}), payload);
+            if (want != got) return error.Corruption;
+        }
 
-        // Verify checksum: unmask, recompute over [type] ++ payload, compare.
-        const want = crc32c.unmask(stored_crc);
-        const got = crc32c.extend(crc32c.value(&[_]u8{type_byte}), payload);
-        if (want != got) return error.Corruption;
-
-        self.pos += kHeaderSize + length;
+        self.pos += header_size + length;
         return .{ .ok = .{ .record_type = record_type, .payload = payload } };
     }
 };
@@ -251,6 +291,39 @@ fn roundTrip(records: []const []const u8) !void {
     {
         var wf = try e.newWritableFile(gpa, "wal");
         var w = Writer.init(wf);
+        errdefer wf.close() catch {};
+        for (records) |rec| try w.addRecord(gpa, rec);
+        try wf.flush();
+        try wf.close();
+    }
+
+    var sf = try e.newSequentialFile(gpa, "wal");
+    var r = Reader.init(sf);
+    defer sf.close() catch {};
+
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(gpa);
+
+    var i: usize = 0;
+    while (try r.readRecord(gpa, &scratch)) |rec| : (i += 1) {
+        try std.testing.expect(i < records.len);
+        try std.testing.expectEqualSlices(u8, records[i], rec);
+    }
+    try std.testing.expectEqual(records.len, i);
+}
+
+/// Helper: write `records` to a MemEnv WAL in recyclable format stamped with
+/// `log_number`, then read them back and assert the read sequence matches. The
+/// reader is constructed via `init` (accepts any log number).
+fn roundTripRecyclable(log_number: u32, records: []const []const u8) !void {
+    const gpa = std.testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    {
+        var wf = try e.newWritableFile(gpa, "wal");
+        var w = Writer.initRecyclable(wf, log_number);
         errdefer wf.close() catch {};
         for (records) |rec| try w.addRecord(gpa, rec);
         try wf.flush();
@@ -565,4 +638,307 @@ test "corruption: bad record length within a fully-present block (not the tail)"
 
     // Bad length in a fully-present (non-tail) block -> Corruption.
     try std.testing.expectError(error.Corruption, r.readRecord(gpa, &scratch));
+}
+
+// ===========================================================================
+// Recyclable-log format tests (record types 5-8, 11-byte header).
+// ===========================================================================
+
+test "recyclable golden header: single full record \"hello\"" {
+    const gpa = std.testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    const log_number: u32 = 0x11223344;
+    {
+        var wf = try e.newWritableFile(gpa, "wal");
+        var w = Writer.initRecyclable(wf, log_number);
+        errdefer wf.close() catch {};
+        try w.addRecord(gpa, "hello");
+        try wf.flush();
+        try wf.close();
+    }
+
+    const bytes = try readAllBytes(e, gpa, "wal");
+    defer gpa.free(bytes);
+
+    // 11-byte recyclable header + 5-byte payload.
+    try std.testing.expectEqual(@as(usize, format.kRecyclableHeaderSize + 5), bytes.len);
+
+    // checksum: mask(crc32c({5} ++ log_number_LE ++ "hello")), LE in bytes[0..4].
+    const expected_crc = format.recyclableChecksum(.recyclable_full, log_number, "hello");
+    const stored_crc = std.mem.readInt(u32, bytes[0..4], .little);
+    try std.testing.expectEqual(expected_crc, stored_crc);
+
+    // length = 5, LE in bytes[4..6].
+    const stored_len = std.mem.readInt(u16, bytes[4..6], .little);
+    try std.testing.expectEqual(@as(u16, 5), stored_len);
+
+    // type = recyclable_full (5).
+    try std.testing.expectEqual(
+        @as(u8, @intFromEnum(format.RecordType.recyclable_full)),
+        bytes[6],
+    );
+
+    // log_number, LE in bytes[7..11].
+    const stored_log = std.mem.readInt(u32, bytes[7..11], .little);
+    try std.testing.expectEqual(log_number, stored_log);
+
+    // payload.
+    try std.testing.expectEqualStrings("hello", bytes[11..]);
+}
+
+test "recyclable round-trip: small record" {
+    try roundTripRecyclable(7, &[_][]const u8{"hello world"});
+}
+
+test "recyclable round-trip: empty payload" {
+    try roundTripRecyclable(1, &[_][]const u8{""});
+}
+
+test "recyclable round-trip: several records of varying sizes" {
+    try roundTripRecyclable(99, &[_][]const u8{
+        "",
+        "a",
+        "bb",
+        "the quick brown fox",
+        "x" ** 100,
+        "y" ** 1000,
+    });
+}
+
+test "recyclable round-trip: large record fragments first/middle/last across blocks" {
+    const gpa = std.testing.allocator;
+    const big_len = 2 * format.kBlockSize + 1234;
+    const big = try gpa.alloc(u8, big_len);
+    defer gpa.free(big);
+    var seed: u32 = 777;
+    for (big) |*b| {
+        seed = seed *% 1664525 +% 1013904223;
+        b.* = @intCast((seed >> 24) & 0xff);
+    }
+    try roundTripRecyclable(12345, &[_][]const u8{big});
+}
+
+test "recyclable round-trip: many records crossing several blocks" {
+    const gpa = std.testing.allocator;
+    var records: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (records.items) |rec| gpa.free(@constCast(rec));
+        records.deinit(gpa);
+    }
+    var i: usize = 0;
+    while (i < 200) : (i += 1) {
+        const len = 100 + (i * 37) % 5000;
+        const buf = try gpa.alloc(u8, len);
+        @memset(buf, @intCast('a' + (i % 26)));
+        try records.append(gpa, buf);
+    }
+    try roundTripRecyclable(0xABCD, records.items);
+}
+
+test "recyclable round-trip: trailer padding when < 11 bytes remain" {
+    const gpa = std.testing.allocator;
+    // Leave exactly 9 bytes (< kRecyclableHeaderSize, >= kHeaderSize) at the end
+    // of block 0 so the trailer is longer than a legacy header.
+    const filler_len = format.kBlockSize - format.kRecyclableHeaderSize - 9;
+    const filler = try gpa.alloc(u8, filler_len);
+    defer gpa.free(filler);
+    @memset(filler, 'Z');
+    try roundTripRecyclable(5, &[_][]const u8{ filler, "next block please", "and another" });
+}
+
+test "recyclable reader enforces expected log_number (stale record -> clean EOF)" {
+    const gpa = std.testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    // Write two records with log_number 7.
+    {
+        var wf = try e.newWritableFile(gpa, "wal");
+        var w = Writer.initRecyclable(wf, 7);
+        errdefer wf.close() catch {};
+        try w.addRecord(gpa, "record one");
+        try w.addRecord(gpa, "record two");
+        try wf.flush();
+        try wf.close();
+    }
+
+    // A reader expecting log_number 7 reads both records.
+    {
+        var sf = try e.newSequentialFile(gpa, "wal");
+        var r = Reader.initRecyclable(sf, 7);
+        defer sf.close() catch {};
+        var scratch: std.ArrayList(u8) = .empty;
+        defer scratch.deinit(gpa);
+        const a = try r.readRecord(gpa, &scratch);
+        try std.testing.expectEqualSlices(u8, "record one", a.?);
+        const b = try r.readRecord(gpa, &scratch);
+        try std.testing.expectEqualSlices(u8, "record two", b.?);
+        try std.testing.expect((try r.readRecord(gpa, &scratch)) == null);
+    }
+
+    // A reader expecting a different log_number sees the first record as stale
+    // and stops immediately (clean EOF, no error).
+    {
+        var sf = try e.newSequentialFile(gpa, "wal");
+        var r = Reader.initRecyclable(sf, 8);
+        defer sf.close() catch {};
+        var scratch: std.ArrayList(u8) = .empty;
+        defer scratch.deinit(gpa);
+        try std.testing.expect((try r.readRecord(gpa, &scratch)) == null);
+    }
+}
+
+test "recyclable: recycled block — fresh record then stale record from prior life" {
+    const gpa = std.testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    // Build a file whose block 0 begins with one fresh log-2 record immediately
+    // followed by a stale log-1 record (as if the block were recycled and only
+    // the head rewritten). Both records are individually well-formed; the
+    // reader rejects the stale one purely on the log_number mismatch — without
+    // this check it would otherwise parse and return it.
+    var fresh: std.ArrayList(u8) = .empty;
+    defer fresh.deinit(gpa);
+    var stale: std.ArrayList(u8) = .empty;
+    defer stale.deinit(gpa);
+    {
+        var w1 = try e.newWritableFile(gpa, "fresh_tmp");
+        var fw = Writer.initRecyclable(w1, 2);
+        errdefer w1.close() catch {};
+        try fw.addRecord(gpa, "fresh log-2 record");
+        try w1.flush();
+        try w1.close();
+        const f = try readAllBytes(e, gpa, "fresh_tmp");
+        defer gpa.free(f);
+        try fresh.appendSlice(gpa, f);
+
+        var w2 = try e.newWritableFile(gpa, "stale_tmp");
+        var sw = Writer.initRecyclable(w2, 1);
+        errdefer w2.close() catch {};
+        try sw.addRecord(gpa, "stale log-1 record");
+        try w2.flush();
+        try w2.close();
+        const s = try readAllBytes(e, gpa, "stale_tmp");
+        defer gpa.free(s);
+        try stale.appendSlice(gpa, s);
+    }
+
+    {
+        var wf = try e.newWritableFile(gpa, "wal");
+        errdefer wf.close() catch {};
+        try wf.append(fresh.items);
+        try wf.append(stale.items);
+        try wf.flush();
+        try wf.close();
+    }
+
+    // Reader expecting log_number 2: reads the fresh record, then sees the
+    // stale log-1 record and stops cleanly (null), not returning it.
+    {
+        var sf = try e.newSequentialFile(gpa, "wal");
+        var r = Reader.initRecyclable(sf, 2);
+        defer sf.close() catch {};
+        var scratch: std.ArrayList(u8) = .empty;
+        defer scratch.deinit(gpa);
+        const rec0 = try r.readRecord(gpa, &scratch);
+        try std.testing.expectEqualSlices(u8, "fresh log-2 record", rec0.?);
+        try std.testing.expect((try r.readRecord(gpa, &scratch)) == null);
+    }
+
+    // Sanity: a permissive reader (no expected log_number) returns BOTH, proving
+    // the stale record is otherwise well-formed and only the log_number check
+    // suppresses it.
+    {
+        var sf = try e.newSequentialFile(gpa, "wal");
+        var r = Reader.init(sf);
+        defer sf.close() catch {};
+        var scratch: std.ArrayList(u8) = .empty;
+        defer scratch.deinit(gpa);
+        const rec0 = try r.readRecord(gpa, &scratch);
+        try std.testing.expectEqualSlices(u8, "fresh log-2 record", rec0.?);
+        const rec1 = try r.readRecord(gpa, &scratch);
+        try std.testing.expectEqualSlices(u8, "stale log-1 record", rec1.?);
+        try std.testing.expect((try r.readRecord(gpa, &scratch)) == null);
+    }
+}
+
+test "recyclable corruption: flipping a payload byte yields error.Corruption" {
+    const gpa = std.testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    {
+        var wf = try e.newWritableFile(gpa, "wal");
+        var w = Writer.initRecyclable(wf, 3);
+        errdefer wf.close() catch {};
+        try w.addRecord(gpa, "corrupt me please");
+        try wf.flush();
+        try wf.close();
+    }
+
+    const bytes = try readAllBytes(e, gpa, "wal");
+    defer gpa.free(bytes);
+    bytes[format.kRecyclableHeaderSize + 3] ^= 0xff; // flip a payload byte
+
+    {
+        var wf = try e.newWritableFile(gpa, "wal");
+        errdefer wf.close() catch {};
+        try wf.append(bytes);
+        try wf.flush();
+        try wf.close();
+    }
+
+    var sf = try e.newSequentialFile(gpa, "wal");
+    var r = Reader.init(sf);
+    defer sf.close() catch {};
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(gpa);
+    try std.testing.expectError(error.Corruption, r.readRecord(gpa, &scratch));
+}
+
+test "default reader reads recyclable records (accepts any log_number)" {
+    // The plain `init` reader has no expected log_number and must transparently
+    // read recyclable records regardless of their stamped log number.
+    try roundTripRecyclable(0xDEADBEEF, &[_][]const u8{ "alpha", "beta", "gamma" });
+}
+
+test "mixed: legacy then recyclable records in the same file" {
+    const gpa = std.testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    // The default reader handles both formats; write a legacy record, then a
+    // recyclable record, in one file and read both back.
+    {
+        var wf = try e.newWritableFile(gpa, "wal");
+        errdefer wf.close() catch {};
+        var legacy = Writer.init(wf);
+        try legacy.addRecord(gpa, "legacy record");
+        // Continue at the same offset but in recyclable mode.
+        var recy = Writer.initRecyclableWithOffset(wf, legacy.log_number, legacy.block_offset);
+        recy.log_number = 9;
+        try recy.addRecord(gpa, "recyclable record");
+        try wf.flush();
+        try wf.close();
+    }
+
+    var sf = try e.newSequentialFile(gpa, "wal");
+    var r = Reader.init(sf);
+    defer sf.close() catch {};
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(gpa);
+
+    const a = try r.readRecord(gpa, &scratch);
+    try std.testing.expectEqualSlices(u8, "legacy record", a.?);
+    const b = try r.readRecord(gpa, &scratch);
+    try std.testing.expectEqualSlices(u8, "recyclable record", b.?);
+    try std.testing.expect((try r.readRecord(gpa, &scratch)) == null);
 }
