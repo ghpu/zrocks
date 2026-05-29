@@ -124,3 +124,12 @@ zrocks is a working, durable, crash-recoverable, leveled-compacting LSM key-valu
 - Canonical standalone-verify for a `../`-importing file (subagents use this for TDD; remove the temp file after):
   `printf 'test { _ = @import("format/internal_key.zig"); }' > src/_verify.zig && /home/ghpu/zig/zig test src/_verify.zig && rm src/_verify.zig`
 - The authoritative check is always `zig build test` on main after root.zig wiring (orchestrator runs it at every integration).
+
+## DIRECTIVE (2026-05-29): byte-exact RocksDB = the ONLY format
+After write-interop lands, REMOVE zrocks's native/clean formats and emit ONLY byte-exact RocksDB everywhere (real RocksDB must open everything zrocks writes). Scope (each gated by tools verify_open against real librocksdb):
+- SST: RocksDB index form only (drop native internal-key+value-len index); rocksdb.properties always; crc32c (or xxh3) per footer; FastLocalBloom full-filter only (drop legacy block-based + clean prefix filter).
+- WAL/WriteBatch: RocksDB CF value types (kTypeColumnFamilyValue family) — DROP the custom kColumnFamilyTag=0x10. Recyclable log default.
+- MANIFEST: single shared MANIFEST (DROP per-CF) with kNewFile4=103 + kColumnFamily/Add + the full tag set.
+- range tombstones: RocksDB range_del block format (drop clean format).
+- partitioned index: RocksDB byte-exact (supersedes the zrocks-clean two-level index).
+Approach: when write-interop lands, run a design+adversarial-verify workflow for the migration, then execute milestone-by-milestone, each verified that real RocksDB opens the output; rewrite all golden vectors. This likely retires/rewrites several "our own clean format" decisions in the Decision log.
