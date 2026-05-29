@@ -26,9 +26,10 @@
 //! builder must report `mayMatch` true under the reader.  False positives occur
 //! at a rate governed by bits_per_key / num_probes (≈1% at 10 bits, 6 probes).
 //!
-//! Gating: this is an ALTERNATE filter format, opt-in via `FilterMode` in the
-//! table builder/reader.  Existing on-disk SSTs (legacy "filter." block-based
-//! filters) are unaffected and still read through filter_block.zig.
+//! This is the ONLY filter format zrocks writes (filter-rocksdb-only): every
+//! SST carries one FastLocalBloom full filter under "fullfilter."++policy.name().
+//! External on-disk SSTs with legacy "filter." block-based filters are still
+//! READ through filter_block.zig (LevelDB interop); only the WRITE path dropped.
 //!
 //! Capability style: every allocating method takes an explicit allocator; no
 //! globals, no ambient authority.

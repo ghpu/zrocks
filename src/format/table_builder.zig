@@ -29,7 +29,6 @@
 const std = @import("std");
 
 const block = @import("block.zig");
-const filter_block = @import("filter_block.zig");
 const full_filter = @import("full_filter.zig");
 const bloom = @import("bloom.zig");
 const internal_key = @import("internal_key.zig");
@@ -45,7 +44,6 @@ const snappy = @import("../util/snappy.zig");
 const BlockBuilder = block.BlockBuilder;
 const BlockHandle = footer_mod.BlockHandle;
 const Footer = footer_mod.Footer;
-const FilterBlockBuilder = filter_block.FilterBlockBuilder;
 
 /// kNoCompression — block stored verbatim (compression type byte 0).
 pub const kNoCompression: u8 = 0;
@@ -55,12 +53,10 @@ pub const kSnappyCompression: u8 = 1;
 /// Restart interval used for the index and metaindex blocks (LevelDB uses 1).
 const kMetaIndexRestartInterval: usize = 1;
 
-/// Prefix of the metaindex key naming the table's (legacy block-based) filter.
-const kFilterMetaKeyPrefix: []const u8 = "filter.";
-/// Prefix of the metaindex key naming the table's FastLocalBloom full filter
-/// (fulllocalbloom).  Distinct from `kFilterMetaKeyPrefix` so the two formats
-/// never collide on disk and an old reader cannot mistake a full filter for a
-/// block-based one (it simply finds no "filter." entry).
+/// Prefix of the metaindex key naming the table's FastLocalBloom full filter.
+/// The legacy block-based filter ("filter."++name) WRITE path was dropped
+/// (filter-rocksdb-only); only the full filter is written now.  The full-filter
+/// prefix is distinct ('f'ull… vs 'f'ilter.) so no on-disk collision occurs.
 const kFullFilterMetaKeyPrefix: []const u8 = "fullfilter.";
 
 /// Metaindex key naming the table's range-del block (M7.5).  Our own clean
@@ -82,11 +78,10 @@ pub const TableBuilder = struct {
 
     /// Builder for the current data block (entries flushed at ~block_size).
     data_block: BlockBuilder,
-    /// Block-based bloom filter builder (one filter per 2KB data range).
-    /// Used only when `options.filter_mode == .block_based` (the default).
-    filter: FilterBlockBuilder,
-    /// FastLocalBloom full-filter builder (one filter over EVERY key).
-    /// Used only when `options.filter_mode == .full` (fulllocalbloom).
+    /// FastLocalBloom full-filter builder (one filter over EVERY key).  Written
+    /// into every SST under "fullfilter."++policy.name() (filter-rocksdb-only).
+    /// The legacy block-based bloom WRITE path was dropped; only the read side
+    /// (filter_block.zig FilterBlockReader) survives for LevelDB interop.
     full_filter: full_filter.FullFilterBuilder,
 
     /// The most recently added key (used for separators and the sorted assert).
@@ -145,9 +140,6 @@ pub const TableBuilder = struct {
         file: env.WritableFile,
         policy: bloom.BloomFilterPolicy,
     ) !TableBuilder {
-        var filter = FilterBlockBuilder.init(gpa, policy);
-        // LevelDB starts the first filter range at offset 0.
-        try filter.startBlock(gpa, 0);
         return .{
             .gpa = gpa,
             .options = options,
@@ -156,7 +148,6 @@ pub const TableBuilder = struct {
             // Data + index blocks hold keys ordered by the table's comparator
             // (an InternalKeyComparator for DB SSTs), so build them with it.
             .data_block = BlockBuilder.init(gpa, options.comparator, options.block_restart_interval),
-            .filter = filter,
             .full_filter = full_filter.FullFilterBuilder.init(policy.bits_per_key),
             .last_key = .empty,
             .offset = 0,
@@ -179,7 +170,6 @@ pub const TableBuilder = struct {
 
     pub fn deinit(self: *TableBuilder) void {
         self.data_block.deinit();
-        self.filter.deinit(self.gpa);
         self.full_filter.deinit(self.gpa);
         self.last_key.deinit(self.gpa);
         self.handle_encoding.deinit(self.gpa);
@@ -221,20 +211,12 @@ pub const TableBuilder = struct {
             try self.appendIndexEntry();
         }
 
-        // Record the key in the filter.  M7.2: when a prefix_extractor is
-        // configured, the filter is built over key PREFIXES — extract the user
-        // key from the internal key and, if it is in the extractor's domain, add
-        // its prefix; out-of-domain keys are simply not added (so they cannot be
-        // pruned, and the reader must never prune them either).  Without a prefix
-        // extractor the filter is built over the whole (internal) key as before.
-        if (self.options.prefix_extractor) |pe| {
-            const user_key = internal_key.extractUserKey(key);
-            if (pe.inDomain(user_key)) {
-                try self.addFilterKey(pe.transform(user_key));
-            }
-        } else {
-            try self.addFilterKey(key);
-        }
+        // Record the whole (internal) key in the FastLocalBloom full filter.
+        // filter-rocksdb-only dropped the clean prefix-keyed filter; the full
+        // filter is always built over whole keys and probed by whole key, so a
+        // present key never reports a false negative regardless of any configured
+        // prefix_extractor.
+        try self.full_filter.addKey(self.gpa, key);
 
         // Remember last_key = key.
         self.last_key.clearRetainingCapacity();
@@ -272,16 +254,6 @@ pub const TableBuilder = struct {
         }
     }
 
-    /// Route a filter key to the active filter format (fulllocalbloom gate).
-    /// Block-based mode accumulates per-2KB-range; full mode accumulates every
-    /// key into a single FastLocalBloom filter.
-    fn addFilterKey(self: *TableBuilder, key: []const u8) !void {
-        switch (self.options.filter_mode) {
-            .block_based => try self.filter.addKey(self.gpa, key),
-            .full => try self.full_filter.addKey(self.gpa, key),
-        }
-    }
-
     /// Emit the deferred index entry for the just-flushed data block:
     /// key = `last_key` (already narrowed to a short separator/successor by the
     /// caller), value = the pending data block's encoded BlockHandle. Clears
@@ -313,12 +285,8 @@ pub const TableBuilder = struct {
         self.pending_handle = try self.writeDataBlock(&self.data_block);
         self.pending_index_entry = true;
         try self.file.flush();
-
-        // Begin the next filter range at the new file offset (block-based only;
-        // the full filter is offset-agnostic — one filter over all keys).
-        if (self.options.filter_mode == .block_based) {
-            try self.filter.startBlock(self.gpa, self.offset);
-        }
+        // The FastLocalBloom full filter is offset-agnostic (one filter over all
+        // keys), so there is no per-data-block filter range to start here.
     }
 
     /// Finish a BlockBuilder, write it UNCOMPRESSED (with trailer) to the file,
@@ -391,13 +359,14 @@ pub const TableBuilder = struct {
     ///      requires to open the file (num_entries, comparator name, the index
     ///      shape flags index.key.is.user.key=1 + index.value.is.delta.encoded=1
     ///      + block.based.table.index.type=kBinarySearch, raw sizes, …);
-    ///   5. the metaindex block — `rocksdb.properties` -> handle and (when
-    ///      present) `rocksdb.range_del` -> handle, in ascending bytewise key
-    ///      order ("rocksdb.properties" < "rocksdb.range_del");
+    ///   5. the metaindex block — `fullfilter.`++policy.name() -> filter handle,
+    ///      `rocksdb.properties` -> handle and (when present) `rocksdb.range_del`
+    ///      -> handle, in ascending bytewise key order
+    ///      ("fullfilter." < "rocksdb.properties" < "rocksdb.range_del");
     ///   6. the fv5 / crc32c footer.
-    /// No filter block is written: RocksDB opens fine without one (the
-    /// filter-rocksdb-only milestone re-adds a FastLocalBloom full filter).
-    /// Does NOT close the file (caller owns).
+    /// A FastLocalBloom full filter is written in EVERY SST (filter-rocksdb-only):
+    /// one whole-SST filter over every key, registered under
+    /// "fullfilter."++policy.name().  Does NOT close the file (caller owns).
     pub fn finish(self: *TableBuilder) !void {
         std.debug.assert(!self.finished);
         try self.flush();
@@ -422,6 +391,12 @@ pub const TableBuilder = struct {
         const data_size = self.offset;
         const index_handle = try self.writeRawBlock(index_raw, kNoCompression);
 
+        // 2b. FastLocalBloom full-filter block (filter-rocksdb-only): one whole-SST
+        //     filter over every key, written uncompressed and registered in the
+        //     metaindex under "fullfilter."++policy.name().
+        const filter_raw = try self.full_filter.finish(self.gpa);
+        const filter_handle = try self.writeRawBlock(filter_raw, kNoCompression);
+
         // 3. Range-del block (M7.5): a serialized RangeTombstoneList, written only
         //    when the table carries tombstones.  Absent entry => no tombstones.
         var range_del_handle: ?BlockHandle = null;
@@ -436,16 +411,29 @@ pub const TableBuilder = struct {
         const props_raw = try self.buildRocksDbPropertiesBlock(
             data_size,
             index_handle.size,
+            filter_handle.size,
         );
         defer self.gpa.free(props_raw);
         const props_handle = try self.writeRawBlock(props_raw, kNoCompression);
 
-        // 5. Metaindex block: `rocksdb.properties` -> handle, then (when present)
+        // 5. Metaindex block: `fullfilter.`++name -> filter handle, then
+        //    `rocksdb.properties` -> handle, then (when present)
         //    `rocksdb.range_del` -> handle.  Keys are plain bytewise meta keys
         //    ordered/searched with the bytewise comparator, so they MUST be added
-        //    in ascending bytewise order ("rocksdb.properties" < "rocksdb.range_del").
+        //    in ascending bytewise order
+        //    ("fullfilter."++name < "rocksdb.properties" < "rocksdb.range_del";
+        //     'f' < 'r').
         var metaindex_block = BlockBuilder.init(self.gpa, comparator.bytewise, kMetaIndexRestartInterval);
         defer metaindex_block.deinit();
+        {
+            var filter_key: std.ArrayListUnmanaged(u8) = .empty;
+            defer filter_key.deinit(self.gpa);
+            try filter_key.appendSlice(self.gpa, kFullFilterMetaKeyPrefix);
+            try filter_key.appendSlice(self.gpa, self.policy.name());
+            self.handle_encoding.clearRetainingCapacity();
+            try filter_handle.encodeTo(&self.handle_encoding, self.gpa);
+            try metaindex_block.add(filter_key.items, self.handle_encoding.items);
+        }
         {
             self.handle_encoding.clearRetainingCapacity();
             try props_handle.encodeTo(&self.handle_encoding, self.gpa);
@@ -477,7 +465,7 @@ pub const TableBuilder = struct {
     /// Build the `rocksdb.properties` block contents (caller frees with gpa).
     /// Properties are emitted in ascending bytewise key order (the block builder
     /// requires sorted keys) with restart_interval=1, matching RocksDB.
-    fn buildRocksDbPropertiesBlock(self: *TableBuilder, data_size: u64, index_size: u64) ![]u8 {
+    fn buildRocksDbPropertiesBlock(self: *TableBuilder, data_size: u64, index_size: u64, filter_size: u64) ![]u8 {
         var pb = BlockBuilder.init(self.gpa, comparator.bytewise, kMetaIndexRestartInterval);
         defer pb.deinit();
 
@@ -521,7 +509,7 @@ pub const TableBuilder = struct {
         try putU64(&pb, &vbuf, self.gpa, "rocksdb.data.block.restart.interval", self.options.block_restart_interval);
         try putU64(&pb, &vbuf, self.gpa, "rocksdb.data.size", data_size);
         try putU64(&pb, &vbuf, self.gpa, "rocksdb.deleted.keys", self.rdb_deleted_keys);
-        try putU64(&pb, &vbuf, self.gpa, "rocksdb.filter.size", 0);
+        try putU64(&pb, &vbuf, self.gpa, "rocksdb.filter.size", filter_size);
         try putU64(&pb, &vbuf, self.gpa, "rocksdb.fixed.key.length", 0);
         // format.version: the block-based-table format version (5).
         try putU64(&pb, &vbuf, self.gpa, "rocksdb.format.version", 5);
@@ -540,7 +528,7 @@ pub const TableBuilder = struct {
         try pb.add("rocksdb.merge.operator", "nullptr");
         try putU64(&pb, &vbuf, self.gpa, "rocksdb.num.data.blocks", self.rdb_index_handles.items.len);
         try putU64(&pb, &vbuf, self.gpa, "rocksdb.num.entries", self.num_entries);
-        try putU64(&pb, &vbuf, self.gpa, "rocksdb.num.filter_entries", 0);
+        try putU64(&pb, &vbuf, self.gpa, "rocksdb.num.filter_entries", self.num_entries);
         try putU64(&pb, &vbuf, self.gpa, "rocksdb.num.range-deletions", self.range_tombstones.count());
         // prefix.extractor.name: the configured extractor's name, or "nullptr".
         try pb.add("rocksdb.prefix.extractor.name", if (self.options.prefix_extractor) |pe| pe.name() else "nullptr");
@@ -602,7 +590,6 @@ fn buildRocksDbIndexBlock(
 // ===========================================================================
 
 const testing = std.testing;
-const FilterBlockReader = filter_block.FilterBlockReader;
 
 const KV = struct { k: []const u8, v: []const u8 };
 
@@ -746,10 +733,15 @@ test "table builder: multi-block round-trip via Table.open (RocksDB-form), trail
         it.seek("rocksdb.properties");
         try testing.expect(it.valid());
         try testing.expectEqualStrings("rocksdb.properties", it.key());
-        // No legacy block-based filter entry: filters are not written here.
+        // No legacy block-based filter entry: the block-based bloom WRITE path
+        // is dropped (filter-rocksdb-only).  A FastLocalBloom full filter is
+        // written instead, under "fullfilter."++policy.name().
         it.seek("filter.leveldb.BuiltinBloomFilter2");
-        const has_filter = it.valid() and comparator.bytewise.compare(it.key(), "filter.leveldb.BuiltinBloomFilter2") == .eq;
-        try testing.expect(!has_filter);
+        const has_block_filter = it.valid() and comparator.bytewise.compare(it.key(), "filter.leveldb.BuiltinBloomFilter2") == .eq;
+        try testing.expect(!has_block_filter);
+        it.seek("fullfilter.leveldb.BuiltinBloomFilter2");
+        const has_full_filter = it.valid() and comparator.bytewise.compare(it.key(), "fullfilter.leveldb.BuiltinBloomFilter2") == .eq;
+        try testing.expect(has_full_filter);
     }
 
     // ---- Round-trip every entry + a full ordered scan through Table.open --
@@ -776,6 +768,78 @@ test "table builder: multi-block round-trip via Table.open (RocksDB-form), trail
         idx += 1;
     }
     try testing.expectEqual(entries.items.len, idx);
+}
+
+test "table builder: every SST carries a functional FastLocalBloom full filter (no false negatives)" {
+    // filter-rocksdb-only: `finish` writes a FastLocalBloom full filter under
+    // "fullfilter."++policy.name() in EVERY SST, regardless of the (now-removed)
+    // filter_mode.  The filter must report may-match for every inserted internal
+    // key (no false negatives) and prune at least one obviously-absent key.
+    const gpa = testing.allocator;
+
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    var ikc = internal_key.InternalKeyComparator{ .user = comparator.bytewise };
+    const opts = options_mod.Options{
+        .comparator = ikc.comparatorInterface(),
+        .block_size = 64, // several data blocks
+        .block_restart_interval = 4,
+    };
+    const policy = bloom.BloomFilterPolicy.init(10);
+
+    const users = [_][]const u8{ "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel" };
+    var ikeys: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (ikeys.items) |k| gpa.free(k);
+        ikeys.deinit(gpa);
+    }
+    {
+        var wf = try e.newWritableFile(gpa, "ff.sst");
+        errdefer wf.close() catch {};
+        var tb = try TableBuilder.init(gpa, opts, wf, policy);
+        defer tb.deinit();
+        for (users) |u| {
+            const ik = try gpa.alloc(u8, u.len + 8);
+            @memcpy(ik[0..u.len], u);
+            coding.encodeFixed64(ik[u.len..][0..8], internal_key.packSequenceAndType(1, .value));
+            try ikeys.append(gpa, ik);
+            try tb.add(ik, u);
+        }
+        try tb.finish();
+        try wf.close();
+    }
+
+    const file = try readAllFile(e, gpa, "ff.sst");
+    defer gpa.free(file);
+    const footer = try Footer.decodeFrom(file[file.len - footer_mod.kEncodedLength ..]);
+
+    // Locate the "fullfilter."++name metaindex entry, read the filter block, and
+    // verify the full-filter reader sees every inserted internal key.
+    const meta_contents = try readVerifiedBlock(file, footer.metaindex_handle);
+    const meta_blk = try block.Block.init(gpa, meta_contents);
+    var it = meta_blk.iterator(comparator.bytewise);
+    defer it.deinit();
+    it.seek("fullfilter.leveldb.BuiltinBloomFilter2");
+    try testing.expect(it.valid());
+    try testing.expectEqualStrings("fullfilter.leveldb.BuiltinBloomFilter2", it.key());
+
+    var hv: []const u8 = it.value();
+    const filter_handle = try BlockHandle.decodeFrom(&hv);
+    const filter_payload = try readVerifiedBlock(file, filter_handle);
+    var fr = full_filter.FullFilterReader.init(filter_payload);
+    try testing.expect(fr.valid);
+
+    for (ikeys.items) |ik| {
+        try testing.expect(fr.keyMayMatch(ik)); // no false negatives
+    }
+    // An obviously-absent internal key is pruned (not a hard guarantee, but the
+    // FP rate is ~1%, so a single distinctive key reliably prunes).
+    var absent: [13]u8 = undefined;
+    @memcpy(absent[0..5], "zzzzz");
+    coding.encodeFixed64(absent[5..][0..8], internal_key.packSequenceAndType(1, .value));
+    try testing.expect(!fr.keyMayMatch(&absent));
 }
 
 test "table builder: snappy data blocks — kSnappy trailer, CRC over compressed, handle = compressed size, decompresses to entries" {
