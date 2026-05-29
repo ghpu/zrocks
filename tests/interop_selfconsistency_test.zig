@@ -1,10 +1,11 @@
 //! interop_selfconsistency_test.zig — D1c self-consistency interop regression gate.
 //!
 //! HONEST SCOPE (see docs/roadmap-next-directions.md correction #6):
-//! This is NOT "open a real RocksDB database".  True RocksDB read-interop needs
-//! FastLocalBloom + recyclable WAL + a shared MANIFEST all byte-exact, and the
-//! zrocks WAL uses a custom kColumnFamilyTag=0x10 (not RocksDB
-//! kTypeColumnFamilyValue), so write-interop is a further milestone.
+//! This is NOT "open a real RocksDB database".  It locks in self-consistency
+//! invariants exercised through the public API on a real filesystem.  (The
+//! WriteBatch WAL form is now RocksDB-exact — the legacy custom
+//! kColumnFamilyTag=0x10 was replaced by RocksDB's kTypeColumnFamily* value
+//! types in the wal-writebatch-cf migration.)
 //!
 //! Instead this gate locks in the *self-consistency* invariants that real
 //! interop depends on, exercised through the PUBLIC `zrocks` module API on a
