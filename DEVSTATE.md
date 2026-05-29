@@ -76,7 +76,7 @@ RocksDB reference: https://github.com/facebook/rocksdb/wiki
 
 Phase 7 parallelization: core files (db.zig, compaction.zig, version_set.zig, memtable.zig) are shared — only run DISJOINT-footprint milestones in parallel. Compaction-modifiers (M7.3/M7.4/M7.5) one at a time; db/memtable-modifiers (M7.0 CF, M7.1 merge, M7.6 txn) one at a time. Wave A = M7.2 (SST-format/read-path) + M7.7 (standalone checkpoint, new file only) — disjoint.
 
-## STATUS: LevelDB-equivalent core COMPLETE (Phases 0–6). In Phase 7 (RocksDB extensions).
+## STATUS: Phases 0-7 COMPLETE + next-directions roadmap (27/27) + READ-interop with real LevelDB AND real RocksDB v11.4.0. 527 tests, main green.
 
 zrocks is a working, durable, crash-recoverable, leveled-compacting LSM key-value store with byte-compatible on-disk formats + a CLI. `zig build` → `libzrocks.a` + `zrocks` binary.
 
