@@ -59,10 +59,10 @@ const kMetaIndexRestartInterval: usize = 1;
 /// prefix is distinct ('f'ull… vs 'f'ilter.) so no on-disk collision occurs.
 const kFullFilterMetaKeyPrefix: []const u8 = "fullfilter.";
 
-/// Metaindex key naming the table's range-del block (M7.5).  Our own clean
-/// format (see delete_range.zig), NOT RocksDB byte-compatible.
-/// TODO(m7.x): RocksDB stores fragmented range tombstones in a dedicated
-/// "rocksdb.deletion_data" / range_del block with a different layout.
+/// Metaindex key naming the table's range-del block — RocksDB's
+/// `rocksdb.range_del` (range-del-rocksdb).  The block is the RocksDB on-disk
+/// format: a data block of `InternalKey(begin, seq, kTypeRangeDeletion) -> end`
+/// entries in InternalKeyComparator order (see delete_range.zig).
 const kRangeDelMetaKey: []const u8 = "rocksdb.range_del";
 
 /// Metaindex key naming the RocksDB table-properties block.  Every SST zrocks
@@ -352,9 +352,9 @@ pub const TableBuilder = struct {
     ///   1. the final pending index entry (user-key short successor);
     ///   2. the RocksDB-form INDEX block — USER-key separators (no trailer) +
     ///      bare 2-varint handles, restart_interval=1 (every entry a restart);
-    ///   3. (when the table carries tombstones) the range-del block — still the
-    ///      zrocks bespoke `RangeTombstoneList` layout (the range-del-rocksdb
-    ///      milestone converts it to RocksDB's fragmented format);
+    ///   3. (when the table carries tombstones) the RocksDB `rocksdb.range_del`
+    ///      block — a data block of `InternalKey(begin,seq,kTypeRangeDeletion)
+    ///      -> end` entries, fragmented + IKC-sorted (range-del-rocksdb);
     ///   4. the `rocksdb.properties` block — the table properties RocksDB
     ///      requires to open the file (num_entries, comparator name, the index
     ///      shape flags index.key.is.user.key=1 + index.value.is.delta.encoded=1
@@ -397,14 +397,20 @@ pub const TableBuilder = struct {
         const filter_raw = try self.full_filter.finish(self.gpa);
         const filter_handle = try self.writeRawBlock(filter_raw, kNoCompression);
 
-        // 3. Range-del block (M7.5): a serialized RangeTombstoneList, written only
-        //    when the table carries tombstones.  Absent entry => no tombstones.
+        // 3. RocksDB `rocksdb.range_del` block (range-del-rocksdb): a data block
+        //    of `InternalKey(begin,seq,kTypeRangeDeletion) -> end` entries,
+        //    fragmented + IKC-sorted.  Written only when the table carries at
+        //    least one non-degenerate tombstone; an absent meta entry => none.
         var range_del_handle: ?BlockHandle = null;
         if (!self.range_tombstones.isEmpty()) {
             var rd_buf: std.ArrayListUnmanaged(u8) = .empty;
             defer rd_buf.deinit(self.gpa);
             try self.range_tombstones.encode(&rd_buf, self.gpa);
-            range_del_handle = try self.writeRawBlock(rd_buf.items, kNoCompression);
+            // encode() yields no bytes when every tombstone is degenerate; only
+            // register a meta-block entry when an actual block was produced.
+            if (rd_buf.items.len > 0) {
+                range_del_handle = try self.writeRawBlock(rd_buf.items, kNoCompression);
+            }
         }
 
         // 4. Properties block.

@@ -9,10 +9,13 @@
 //! answers the core read query `covered(user_key, value_seq, snapshot, cmp)` —
 //! true iff some visible tombstone covers the key and shadows the value's seq.
 //!
-//! Serialization (our own clean format; NOT RocksDB byte-compatible — see the
-//! TODO in table_builder/table_reader): a count varint followed by, per
-//! tombstone, `lenpfx(begin) ++ lenpfx(end) ++ varint(seq)`.  This is what the
-//! "rocksdb.range_del" SST meta block carries.
+//! Serialization (range-del-rocksdb): the `rocksdb.range_del` meta block uses
+//! the EXACT RocksDB on-disk format — a block-based-table data block whose
+//! entries are, in InternalKeyComparator order, `InternalKey(begin, seq,
+//! kTypeRangeDeletion) -> end_user_key` (one entry per tombstone, fragmented to
+//! non-overlapping intervals before write).  Real RocksDB re-fragments these on
+//! read into a `FragmentedRangeTombstoneList`.  The bespoke
+//! `lenpfx(begin)/lenpfx(end)/varint(seq)` format was dropped.
 //!
 //! Standalone test note (Zig 0.16): `../...` imports only resolve inside the
 //! `src`-rooted module:
@@ -31,6 +34,8 @@ const std = @import("std");
 
 const comparator = @import("../util/comparator.zig");
 const coding = @import("../util/coding.zig");
+const block = @import("../format/block.zig");
+const internal_key = @import("../format/internal_key.zig");
 
 /// One range tombstone over USER keys: deletes `[begin, end)` as of `seq`.
 pub const RangeTombstone = struct {
@@ -129,32 +134,84 @@ pub const RangeTombstoneList = struct {
         return best;
     }
 
-    /// Serialize into `out` (our clean range-del meta-block format):
-    ///   varint(count) ++ [ lenpfx(begin) lenpfx(end) varint(seq) ]*
+    /// Serialize into `out` as the RocksDB `rocksdb.range_del` meta block
+    /// (range-del-rocksdb).  The block is a block-based-table data block whose
+    /// entries are, in InternalKeyComparator order under `user_cmp`:
+    ///   `InternalKey(start, seq, kTypeRangeDeletion) -> end_user_key`.
+    /// Overlapping tombstones are first fragmented into non-overlapping intervals
+    /// (matching RocksDB's flush output); each (fragment, seq) yields one entry.
+    /// Real RocksDB re-fragments these on read.  `out` is APPENDED to (it is
+    /// expected empty); `gpa` backs the temporary builders.  An empty list
+    /// produces no bytes (the caller omits the meta-block entry entirely).
     pub fn encode(self: *const RangeTombstoneList, out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator) !void {
-        try coding.putVarint64(out, gpa, @intCast(self.tombstones.items.len));
-        for (self.tombstones.items) |t| {
-            try coding.putLengthPrefixedSlice(out, gpa, t.begin);
-            try coding.putLengthPrefixedSlice(out, gpa, t.end);
-            try coding.putVarint64(out, gpa, t.seq);
+        if (self.isEmpty()) return;
+
+        // Fragment into non-overlapping intervals, ordered by start (ascending).
+        var frag = try FragmentedRangeTombstoneList.fromList(gpa, self, comparator.bytewise);
+        defer frag.deinit();
+        if (frag.isEmpty()) return; // every tombstone was degenerate
+
+        const ikc = internal_key.InternalKeyComparator{ .user = comparator.bytewise };
+        const ikc_cmp = ikc.comparatorInterface();
+
+        // Build the entry set: one InternalKey(start, seq, range_deletion)->end
+        // per (fragment, seq), then sort by IKC (user asc, seq DESC) so the
+        // block-builder's non-decreasing-order invariant holds.
+        const Entry = struct { ik: []u8, end: []const u8 };
+        var entries: std.ArrayListUnmanaged(Entry) = .empty;
+        defer {
+            for (entries.items) |e| gpa.free(e.ik);
+            entries.deinit(gpa);
         }
+        for (frag.fragments) |f| {
+            for (f.seqs) |s| {
+                var ikbuf: std.ArrayList(u8) = .empty;
+                errdefer ikbuf.deinit(gpa);
+                try internal_key.appendInternalKey(&ikbuf, gpa, .{
+                    .user_key = f.start,
+                    .sequence = s,
+                    .type = .range_deletion,
+                });
+                try entries.append(gpa, .{ .ik = try ikbuf.toOwnedSlice(gpa), .end = f.end });
+            }
+        }
+
+        const Less = struct {
+            cmp: comparator.Comparator,
+            fn lt(ctx: @This(), a: Entry, b: Entry) bool {
+                return ctx.cmp.compare(a.ik, b.ik) == .lt;
+            }
+        };
+        std.mem.sort(Entry, entries.items, Less{ .cmp = ikc_cmp }, Less.lt);
+
+        // restart_interval=1 matches RocksDB's range_del block (every entry is a
+        // restart, so no shared-prefix delta is applied across entries).
+        var bb = block.BlockBuilder.init(gpa, ikc_cmp, 1);
+        defer bb.deinit();
+        for (entries.items) |e| try bb.add(e.ik, e.end);
+        const bytes = bb.finish();
+        try out.appendSlice(gpa, bytes);
     }
 
-    /// Parse a range-del meta block (the inverse of `encode`) into a freshly
-    /// initialized list (caller `deinit`s).  An empty input yields an empty list.
+    /// Parse a RocksDB `rocksdb.range_del` meta block (the inverse of `encode`)
+    /// into a freshly initialized list (caller `deinit`s).  Each block entry's
+    /// key is an `InternalKey(begin, seq, kTypeRangeDeletion)` and value is the
+    /// `end` user key.  An empty input yields an empty list.
     pub fn decode(gpa: std.mem.Allocator, bytes: []const u8) !RangeTombstoneList {
         var list = RangeTombstoneList.init(gpa);
         errdefer list.deinit();
         if (bytes.len == 0) return list;
 
-        var input: []const u8 = bytes;
-        const n = try coding.getVarint64(&input);
-        var i: u64 = 0;
-        while (i < n) : (i += 1) {
-            const begin = try coding.getLengthPrefixedSlice(&input);
-            const end = try coding.getLengthPrefixedSlice(&input);
-            const seq = try coding.getVarint64(&input);
-            try list.add(begin, end, seq);
+        const ikc = internal_key.InternalKeyComparator{ .user = comparator.bytewise };
+        const ikc_cmp = ikc.comparatorInterface();
+
+        const b = try block.Block.init(gpa, bytes);
+        var it = b.iterator(ikc_cmp);
+        defer it.deinit();
+        it.seekToFirst();
+        while (it.valid()) : (it.next()) {
+            const pik = try internal_key.parseInternalKey(it.key());
+            try list.add(pik.user_key, it.value(), pik.sequence);
         }
         return list;
     }
@@ -410,6 +467,77 @@ test "decode empty yields empty list" {
     var back = try RangeTombstoneList.decode(gpa, "");
     defer back.deinit();
     try testing.expect(back.isEmpty());
+}
+
+test "encode produces a RocksDB range_del block: IKC-ordered range-deletion internal keys" {
+    const gpa = testing.allocator;
+    var list = RangeTombstoneList.init(gpa);
+    defer list.deinit();
+    try list.add("b", "d", 10);
+    try list.add("m", "p", 7);
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(gpa);
+    try list.encode(&buf, gpa);
+
+    // The bytes must be a valid block-based-table block; iterate it with the
+    // InternalKeyComparator and confirm each key is a kTypeRangeDeletion
+    // internal key (begin -> seq, value=end), ascending by user key.
+    const ikc = internal_key.InternalKeyComparator{ .user = comparator.bytewise };
+    const b = try block.Block.init(gpa, buf.items);
+    var it = b.iterator(ikc.comparatorInterface());
+    defer it.deinit();
+    it.seekToFirst();
+
+    try testing.expect(it.valid());
+    var pik = try internal_key.parseInternalKey(it.key());
+    try testing.expectEqualStrings("b", pik.user_key);
+    try testing.expectEqual(@as(u64, 10), pik.sequence);
+    try testing.expectEqual(internal_key.ValueType.range_deletion, pik.type);
+    try testing.expectEqualStrings("d", it.value());
+
+    it.next();
+    try testing.expect(it.valid());
+    pik = try internal_key.parseInternalKey(it.key());
+    try testing.expectEqualStrings("m", pik.user_key);
+    try testing.expectEqual(@as(u64, 7), pik.sequence);
+    try testing.expectEqual(internal_key.ValueType.range_deletion, pik.type);
+    try testing.expectEqualStrings("p", it.value());
+
+    it.next();
+    try testing.expect(!it.valid());
+}
+
+test "encode/decode round-trip through RocksDB block format (overlap fragmented)" {
+    const gpa = testing.allocator;
+    var list = RangeTombstoneList.init(gpa);
+    defer list.deinit();
+    // Overlapping [a,e)@5 and [c,g)@20 fragment to [a,c)@{5} [c,e)@{20,5} [e,g)@{20}.
+    try list.add("a", "e", 5);
+    try list.add("c", "g", 20);
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(gpa);
+    try list.encode(&buf, gpa);
+
+    var back = try RangeTombstoneList.decode(gpa, buf.items);
+    defer back.deinit();
+
+    // The fragmented form, re-fragmented from the decoded entries, must answer
+    // coverage identically to the original linear list.
+    var frag_orig = try FragmentedRangeTombstoneList.fromList(gpa, &list, comparator.bytewise);
+    defer frag_orig.deinit();
+    var frag_back = try FragmentedRangeTombstoneList.fromList(gpa, &back, comparator.bytewise);
+    defer frag_back.deinit();
+
+    var k: u8 = 'a';
+    while (k <= 'h') : (k += 1) {
+        const key: [1]u8 = .{k};
+        try testing.expectEqual(
+            frag_orig.maxCoveringSeq(&key, 100, comparator.bytewise),
+            frag_back.maxCoveringSeq(&key, 100, comparator.bytewise),
+        );
+    }
 }
 
 test "covered: multiple tombstones, newest applicable wins coverage" {
