@@ -84,6 +84,17 @@ pub const Options = struct {
     create_if_missing: bool = false,
     error_if_exists: bool = false,
     paranoid_checks: bool = false,
+
+    /// Open the database READ-ONLY and NON-DESTRUCTIVELY (leveldb-interop, Wave
+    /// A).  When true, `DB.open` recovers the MANIFEST + replays the WAL into the
+    /// memtable to serve reads, but performs ZERO directory mutations: it does
+    /// NOT create or rotate a WAL, does NOT write a new MANIFEST/CURRENT, and
+    /// does NOT GC/delete any file.  `get`/`newIterator` work; `put`/`delete`/
+    /// `merge`/`deleteRange`/`write` return `error.ReadOnly`; flush/compaction
+    /// are suppressed.  This is what lets zrocks open a database written by an
+    /// external LevelDB (Chromium/Electron) without modifying it.  Default false
+    /// keeps the normal read/write behaviour unchanged.
+    read_only: bool = false,
     write_buffer_size: usize = 64 * 1024 * 1024,
     max_open_files: i32 = 1000,
     block_size: usize = 4096,

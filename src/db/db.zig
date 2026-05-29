@@ -201,7 +201,10 @@ pub const DB = struct {
         self.write_stalls = 0;
         self.options = options;
         self.last_sequence = 0;
-        self.owns_wal = true;
+        // A read-only DB (leveldb-interop, Wave A) NEVER manages a WAL: it does
+        // not create/rotate/append/GC one.  `owns_wal == false` makes `close`
+        // skip the WAL teardown (no WAL file is ever opened below in this mode).
+        self.owns_wal = !options.read_only;
         // ikcmp must live at a stable address (the memtable's entry comparator
         // points at it); `self` is heap-allocated so &self.ikcmp is stable.
         self.ikcmp = .{ .user = options.comparator };
@@ -209,8 +212,10 @@ pub const DB = struct {
         self.name = try gpa.dupe(u8, name);
         errdefer gpa.free(self.name);
 
-        // Directory (no-op success if it already exists on MemEnv).
-        try e.makeDir(name);
+        // Directory (no-op success if it already exists on MemEnv).  In
+        // read-only mode we must NOT mutate the directory at all — the foreign
+        // DB's directory already exists — so skip the makeDir.
+        if (!options.read_only) try e.makeDir(name);
 
         self.mem = try MemTable.init(gpa, options.comparator);
         errdefer self.mem.deinit();
@@ -243,31 +248,54 @@ pub const DB = struct {
             // ----- recover an existing DB -----------------------------------
             try vs.recover();
 
+            // Replay EVERY WAL whose number is >= the recovered log_number, in
+            // ascending order (LevelDB/RocksDB recovery semantics) — NOT just
+            // `logFileName(log_number)`.  An externally-written LevelDB DB may
+            // record log_number=0 in its MANIFEST while the live WriteBatch sits
+            // in a higher-numbered log (e.g. 000003.log); replaying only the
+            // named log would silently miss it (leveldb-interop, Wave A).  Use
+            // the smaller of log_number / prev_log_number as the floor so an
+            // in-flight previous log is never skipped.
             const log_number = vs.logNumber();
-            const log_path = try filename.logFileName(gpa, name, log_number);
-            defer gpa.free(log_path);
-
-            // Replay the active WAL into the memtable.  Sequences are assigned
-            // from each batch's own header; max_seq is the highest seen.
-            const max_seq = try recovery.replayLog(
+            const prev_log_number = vs.prevLogNumber();
+            const min_log: u64 = if (prev_log_number != 0)
+                @min(log_number, prev_log_number)
+            else
+                log_number;
+            const max_seq = try recovery.replayAllLogs(
                 gpa,
                 e,
-                log_path,
+                name,
+                min_log,
                 self.mem,
                 vs.lastSequence() + 1,
             );
             self.last_sequence = @max(vs.lastSequence(), max_seq);
 
+            if (options.read_only) {
+                // READ-ONLY: do NOT open/append/create any WAL.  Reads are served
+                // from the recovered memtable + the current Version's SSTs.  The
+                // directory is left byte-for-byte unchanged.
+                return self;
+            }
+
             // Reuse the SAME log: reopen it for appending and resume the writer
             // mid-block so the next reopen replays everything (reuse-logs).
-            const file_size = e.getFileSize(log_path) catch 0;
-            self.wal_file = try e.newAppendableFile(gpa, log_path);
+            const active_log_path = try filename.logFileName(gpa, name, log_number);
+            defer gpa.free(active_log_path);
+            const file_size = e.getFileSize(active_log_path) catch 0;
+            self.wal_file = try e.newAppendableFile(gpa, active_log_path);
             errdefer self.wal_file.close() catch {};
             self.wal = log_writer.Writer.initWithOffset(
                 self.wal_file,
                 @intCast(file_size % log_format.kBlockSize),
             );
         } else {
+            if (options.read_only) {
+                // READ-ONLY open of a non-existent DB: there is nothing to read
+                // and we must not create anything.
+                return error.NotFound;
+            }
             // ----- fresh DB --------------------------------------------------
             const log_number = vs.newFileNumber();
 
@@ -507,6 +535,12 @@ pub const DB = struct {
     /// (unless disabled), insert its records into the MemTable, and advance the
     /// last sequence by the batch's record count.
     pub fn write(self: *DB, wopts: WriteOptions, batch: *WriteBatch) !void {
+        // Reject every mutation on a read-only DB (leveldb-interop, Wave A): a
+        // foreign LevelDB database opened read_only must never be modified.  This
+        // is the single funnel for put/delete/merge/deleteRange, so the guard
+        // here covers them all.
+        if (self.options.read_only) return error.ReadOnly;
+
         // Serialize writers (D2a-1).  Single-threaded today (always uncontended,
         // so `lock` is a cmpxchg with no cancelation point reached), but holding
         // the mutex across the WAL append + memtable insert + flush/compaction

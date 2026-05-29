@@ -123,6 +123,7 @@ pub const MemEnv = struct {
         .fileExists = fileExists,
         .getFileSize = getFileSize,
         .makeDir = makeDir,
+        .listDir = listDir,
         .lockFile = lockFile,
         .unlockFile = unlockFile,
         .io = ioCapability,
@@ -252,6 +253,39 @@ pub const MemEnv = struct {
         // so callers that "ensure the DB dir exists" work uniformly.
         _ = ptr;
         _ = path;
+    }
+
+    /// List the basenames of the DIRECT children of directory `path`
+    /// (leveldb-interop, Wave A).  The map is flat (keys are full `dir/base`
+    /// paths), so we select every key with the `path ++ "/"` prefix whose
+    /// remainder has no further `/`, and dupe that remainder.  Caller frees with
+    /// `Env.freeListing`.
+    fn listDir(ptr: *anyopaque, gpa: std.mem.Allocator, path: []const u8) Error![][]u8 {
+        const self: *MemEnv = @ptrCast(@alignCast(ptr));
+        self.mutex.lockUncancelable(lockIo());
+        defer self.mutex.unlock(lockIo());
+
+        const prefix = std.fmt.allocPrint(gpa, "{s}/", .{path}) catch return Error.IoError;
+        defer gpa.free(prefix);
+
+        var names: std.ArrayListUnmanaged([]u8) = .empty;
+        errdefer {
+            for (names.items) |n| gpa.free(n);
+            names.deinit(gpa);
+        }
+
+        var it = self.files.iterator();
+        while (it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            if (!std.mem.startsWith(u8, key, prefix)) continue;
+            const base = key[prefix.len..];
+            if (base.len == 0) continue;
+            if (std.mem.indexOfScalar(u8, base, '/') != null) continue; // not a direct child
+            const dup = try gpa.dupe(u8, base);
+            errdefer gpa.free(dup);
+            try names.append(gpa, dup);
+        }
+        return names.toOwnedSlice(gpa);
     }
 
     fn lockFile(ptr: *anyopaque, path: []const u8) Error!void {

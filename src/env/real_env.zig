@@ -67,6 +67,14 @@ fn mapCreateDirErr(e: Dir.CreateDirError) Error {
     };
 }
 
+fn mapOpenDirErr(e: Dir.OpenError) Error {
+    return switch (e) {
+        error.FileNotFound => error.NotFound,
+        error.AccessDenied, error.PermissionDenied => error.PermissionDenied,
+        else => error.IoError,
+    };
+}
+
 fn mapReadErr(e: File.ReadPositionalError) Error {
     return switch (e) {
         error.AccessDenied => error.PermissionDenied,
@@ -123,6 +131,7 @@ pub const RealEnv = struct {
         .fileExists = fileExists,
         .getFileSize = getFileSize,
         .makeDir = makeDir,
+        .listDir = listDir,
         .lockFile = lockFile,
         .unlockFile = unlockFile,
         .io = ioCapability,
@@ -219,6 +228,29 @@ pub const RealEnv = struct {
             error.PathAlreadyExists => return,
             else => return mapCreateDirErr(e),
         };
+    }
+
+    /// List the basenames directly under directory `path` (leveldb-interop,
+    /// Wave A).  Opens the directory with `.iterate`, dupes each entry name via
+    /// `gpa`, and returns the owned slice (caller frees with `Env.freeListing`).
+    fn listDir(ptr: *anyopaque, gpa: std.mem.Allocator, path: []const u8) Error![][]u8 {
+        const self: *RealEnv = @ptrCast(@alignCast(ptr));
+        var dir = self.root.openDir(self.io, path, .{ .iterate = true }) catch |e| return mapOpenDirErr(e);
+        defer dir.close(self.io);
+
+        var names: std.ArrayListUnmanaged([]u8) = .empty;
+        errdefer {
+            for (names.items) |n| gpa.free(n);
+            names.deinit(gpa);
+        }
+
+        var it = dir.iterate();
+        while (it.next(self.io) catch return Error.IoError) |entry| {
+            const dup = try gpa.dupe(u8, entry.name);
+            errdefer gpa.free(dup);
+            try names.append(gpa, dup);
+        }
+        return names.toOwnedSlice(gpa);
     }
 
     // Advisory file locking.  std 0.16 exposes File.lock / Dir open `lock`

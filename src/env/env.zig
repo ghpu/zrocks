@@ -125,6 +125,13 @@ pub const Env = struct {
         fileExists: *const fn (ptr: *anyopaque, path: []const u8) bool,
         getFileSize: *const fn (ptr: *anyopaque, path: []const u8) Error!u64,
         makeDir: *const fn (ptr: *anyopaque, path: []const u8) Error!void,
+        // List the basenames of the entries directly under directory `path`
+        // (leveldb-interop, Wave A).  Allocates the returned slice AND each
+        // basename via `gpa`; the caller frees them with `freeListing`.  Used by
+        // recovery to discover ALL `NNNNNN.log` WAL files present (LevelDB
+        // recovery replays every log whose number is >= the recovered
+        // log_number, not just the one named in the MANIFEST).
+        listDir: *const fn (ptr: *anyopaque, gpa: std.mem.Allocator, path: []const u8) Error![][]u8,
         // Advisory file locking.  See note in RealEnv/MemEnv: stubbed for now
         // (TODO M5/M6 — DB-level single-process lock).  No-op success.
         lockFile: *const fn (ptr: *anyopaque, path: []const u8) Error!void,
@@ -172,6 +179,17 @@ pub const Env = struct {
     /// Create a directory; success if it already exists.
     pub fn makeDir(self: Env, path: []const u8) Error!void {
         return self.vtable.makeDir(self.ptr, path);
+    }
+    /// List the basenames of the entries directly under directory `path`
+    /// (leveldb-interop, Wave A).  Each returned name AND the outer slice are
+    /// allocated via `gpa`; free with `freeListing`.  Order is unspecified.
+    pub fn listDir(self: Env, gpa: std.mem.Allocator, path: []const u8) Error![][]u8 {
+        return self.vtable.listDir(self.ptr, gpa, path);
+    }
+    /// Free a listing previously returned by `listDir`.
+    pub fn freeListing(gpa: std.mem.Allocator, list: [][]u8) void {
+        for (list) |name| gpa.free(name);
+        gpa.free(list);
     }
     pub fn lockFile(self: Env, path: []const u8) Error!void {
         return self.vtable.lockFile(self.ptr, path);
