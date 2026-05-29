@@ -39,14 +39,17 @@ const options_mod = @import("../options.zig");
 const internal_key = @import("internal_key.zig");
 const prefix = @import("../rocks/prefix.zig");
 const delete_range = @import("../rocks/delete_range.zig");
+const snappy = @import("../util/snappy.zig");
 
 const BlockHandle = footer_mod.BlockHandle;
 const Footer = footer_mod.Footer;
 const Block = block.Block;
 const FilterBlockReader = filter_block.FilterBlockReader;
 
-/// kNoCompression — the only compression type the reader accepts.
+/// kNoCompression — block stored verbatim (compression type byte 0).
 pub const kNoCompression: u8 = 0;
+/// kSnappyCompression — block stored as a Snappy block-format payload (byte 1).
+pub const kSnappyCompression: u8 = 1;
 
 /// Length of the 5-byte block trailer (compression type + masked crc32c).
 const kBlockTrailerSize: usize = 5;
@@ -454,29 +457,41 @@ fn readBlockCached(
     return owned;
 }
 
-/// Read the block at `handle` (contents + 5-byte trailer), verify the trailer's
-/// compression type and masked crc32c, and return an OWNED copy of the contents
-/// (caller frees with `gpa`). Always hits the file (no cache).
+/// Read the block at `handle` (on-disk payload + 5-byte trailer), verify the
+/// trailer's masked crc32c (over the ON-DISK payload, exactly as the builder
+/// wrote it), decompress when the trailer marks the block Snappy, and return the
+/// OWNED uncompressed contents (caller frees with `gpa`). Always hits the file
+/// (no cache).
+///
+/// `handle.size` is the on-disk payload length — for a compressed block that is
+/// the COMPRESSED length, so the read window is sized off it directly.
 fn readBlockRaw(gpa: std.mem.Allocator, file: env.RandomAccessFile, handle: BlockHandle) ![]u8 {
     const size: usize = @intCast(handle.size);
 
-    // Read the contents plus the 5-byte trailer in one positional read.
+    // Read the on-disk payload plus the 5-byte trailer in one positional read.
     const raw = try gpa.alloc(u8, size + kBlockTrailerSize);
     defer gpa.free(raw);
     try readFully(file, handle.offset, raw);
 
-    const contents = raw[0..size];
+    const payload = raw[0..size];
     const trailer = raw[size..][0..kBlockTrailerSize];
 
     // trailer[0] = compression type; trailer[1..5] = fixed32_LE(masked crc32c).
+    // The CRC always covers the on-disk (possibly compressed) payload.
     const compression_type = trailer[0];
-    if (compression_type != kNoCompression) return error.NotSupported;
-
     const stored_masked = coding.decodeFixed32(trailer[1..5]);
-    const expected = crc32c.extend(crc32c.value(contents), &[_]u8{compression_type});
+    const expected = crc32c.extend(crc32c.value(payload), &[_]u8{compression_type});
     if (crc32c.unmask(stored_masked) != expected) return error.Corruption;
 
-    return gpa.dupe(u8, contents);
+    return switch (compression_type) {
+        kNoCompression => try gpa.dupe(u8, payload),
+        kSnappyCompression => snappy.decompress(gpa, payload) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // Malformed Snappy payload behaves like block corruption.
+            error.Corrupt, error.InputTooLarge => return error.Corruption,
+        },
+        else => error.NotSupported,
+    };
 }
 
 // ===========================================================================
@@ -777,6 +792,119 @@ test "table reader: single small block round-trips" {
         idx += 1;
     }
     try testing.expectEqual(pairs.len, idx);
+}
+
+test "table reader: snappy round-trip — get + full scan identical to uncompressed, blocks shrink on disk" {
+    const gpa = testing.allocator;
+
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    const policy = bloom.BloomFilterPolicy.init(10);
+
+    // Highly compressible payloads so data blocks actually shrink.
+    var entries: std.ArrayListUnmanaged(KV) = .empty;
+    defer freeEntries(gpa, &entries);
+    {
+        var i: usize = 0;
+        while (i < 60) : (i += 1) {
+            const k = try std.fmt.allocPrint(gpa, "key{d:0>5}", .{i});
+            const v = try std.fmt.allocPrint(gpa, "{s}", .{"Z" ** 90});
+            try entries.append(gpa, .{ .k = k, .v = v });
+        }
+    }
+
+    const base = options_mod.Options{ .block_size = 256, .block_restart_interval = 4 };
+    const snap = options_mod.Options{ .block_size = 256, .block_restart_interval = 4, .compression = .snappy };
+
+    try buildTable(gpa, e, "plain.sst", base, policy, entries.items);
+    try buildTable(gpa, e, "snap.sst", snap, policy, entries.items);
+
+    // The compressed SST is smaller on disk than the uncompressed one.
+    try testing.expect((try e.getFileSize("snap.sst")) < (try e.getFileSize("plain.sst")));
+
+    const snap_size = try e.getFileSize("snap.sst");
+    var raf = try e.newRandomAccessFile(gpa, "snap.sst");
+    defer raf.close() catch {};
+    var table = try Table.open(gpa, raf, snap_size, snap, policy, null, 0);
+    defer table.deinit();
+
+    // get: every key round-trips to its exact value.
+    for (entries.items) |kv| {
+        const got = try table.get(gpa, kv.k) orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings(kv.v, got);
+    }
+    // Absent key returns null.
+    {
+        const got = try table.get(gpa, "key99999");
+        if (got) |g| {
+            gpa.free(g);
+            return error.TestExpectedNull;
+        }
+    }
+
+    // Full scan yields all entries in order.
+    var it = table.iterator(gpa);
+    defer it.deinit();
+    var idx: usize = 0;
+    it.seekToFirst();
+    while (it.valid()) : (it.next()) {
+        try testing.expect(idx < entries.items.len);
+        try testing.expectEqualStrings(entries.items[idx].k, it.key());
+        try testing.expectEqualStrings(entries.items[idx].v, it.value());
+        idx += 1;
+    }
+    try testing.expectEqual(entries.items.len, idx);
+    try testing.expect(it.status() == null);
+}
+
+test "table reader: snappy round-trip through the block cache (hits on reread)" {
+    const gpa = testing.allocator;
+
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    const policy = bloom.BloomFilterPolicy.init(10);
+    const opts = options_mod.Options{ .block_size = 256, .block_restart_interval = 4, .compression = .snappy };
+
+    var entries: std.ArrayListUnmanaged(KV) = .empty;
+    defer freeEntries(gpa, &entries);
+    {
+        var i: usize = 0;
+        while (i < 40) : (i += 1) {
+            const k = try std.fmt.allocPrint(gpa, "key{d:0>5}", .{i});
+            const v = try std.fmt.allocPrint(gpa, "{s}", .{"Q" ** 64});
+            try entries.append(gpa, .{ .k = k, .v = v });
+        }
+    }
+    try buildTable(gpa, e, "snapc.sst", opts, policy, entries.items);
+
+    const file_size = try e.getFileSize("snapc.sst");
+    var cache = cache_mod.Cache.init(gpa, 1 << 20);
+    defer cache.deinit();
+
+    var raf = try e.newRandomAccessFile(gpa, "snapc.sst");
+    defer raf.close() catch {};
+    var table = try Table.open(gpa, raf, file_size, opts, policy, &cache, 3);
+    defer table.deinit();
+
+    // First pass populates the cache with DECOMPRESSED blocks.
+    for (entries.items) |kv| {
+        const got = try table.get(gpa, kv.k) orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings(kv.v, got);
+    }
+    const hits_before = cache.hits;
+    // Second pass: cache hits serve the decompressed blocks; values identical.
+    for (entries.items) |kv| {
+        const got = try table.get(gpa, kv.k) orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings(kv.v, got);
+    }
+    try testing.expect(cache.hits > hits_before);
 }
 
 // ===========================================================================
