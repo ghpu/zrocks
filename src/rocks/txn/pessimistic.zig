@@ -2,16 +2,15 @@
 //!
 //! A pessimistic transaction acquires an exclusive lock on each key the FIRST
 //! time it writes that key (`put`/`delete`/`merge`), via a shared `LockManager`.
-//! If another open transaction already holds the key the write fails immediately
-//! with `error.Busy` (the DB is single-threaded, so locks detect conflicts
-//! between INTERLEAVED open txns rather than blocking — see lock_manager.zig).
-//! Holding the lock for the txn's lifetime means commit never needs the
+//! Acquisition is BLOCKING (D2b2): if another open transaction holds the key,
+//! the caller's fiber sleeps on the key's condition until the holder commits or
+//! rolls back, then proceeds.  (`tryPut`/`tryDelete`/`tryMerge` keep the older
+//! non-blocking behaviour — `error.Busy` on contention — for callers that want
+//! it.)  Holding the lock for the txn's lifetime means commit never needs the
 //! optimistic sequence-based validation: by construction no other txn could have
 //! written a locked key.  `commit` applies the buffered batch atomically then
-//! releases all locks; `rollback` discards the batch and releases all locks.
-//!
-//! TODO(concurrency): real blocking acquisition (wait instead of Busy) once the
-//! DB has a write mutex / background threads.
+//! releases all locks (waking any blocked txn); `rollback` discards the batch
+//! and releases all locks.
 
 const std = @import("std");
 
@@ -49,9 +48,15 @@ pub const PessimisticTransaction = struct {
         self.base.deinit();
     }
 
-    /// Acquire the exclusive lock on `key` for this txn; `error.Busy` if another
-    /// open txn holds it.  Re-locking a key this txn already owns is a no-op.
+    /// BLOCKING acquire of the exclusive lock on `key` for this txn: if another
+    /// open txn holds it, this fiber sleeps until that txn commits/rolls back.
+    /// Re-locking a key this txn already owns is a no-op.
     fn lockKey(self: *PessimisticTransaction, key: []const u8) !void {
+        try self.locks.lock(key, self.id);
+    }
+
+    /// Non-blocking acquire: `error.Busy` if another open txn holds `key`.
+    fn tryLockKey(self: *PessimisticTransaction, key: []const u8) !void {
         if (!(try self.locks.tryLock(key, self.id))) return error.Busy;
     }
 
@@ -67,6 +72,22 @@ pub const PessimisticTransaction = struct {
 
     pub fn merge(self: *PessimisticTransaction, key: []const u8, value: []const u8) !void {
         try self.lockKey(key);
+        return self.base.merge(key, value);
+    }
+
+    /// Non-blocking variants: raise `error.Busy` instead of waiting on contention.
+    pub fn tryPut(self: *PessimisticTransaction, key: []const u8, value: []const u8) !void {
+        try self.tryLockKey(key);
+        return self.base.put(key, value);
+    }
+
+    pub fn tryDelete(self: *PessimisticTransaction, key: []const u8) !void {
+        try self.tryLockKey(key);
+        return self.base.delete(key);
+    }
+
+    pub fn tryMerge(self: *PessimisticTransaction, key: []const u8, value: []const u8) !void {
+        try self.tryLockKey(key);
         return self.base.merge(key, value);
     }
 
@@ -100,7 +121,9 @@ pub const PessimisticTransactionDB = struct {
     next_id: u64 = 1,
 
     pub fn init(gpa: std.mem.Allocator, db: *DB) PessimisticTransactionDB {
-        return .{ .db = db, .locks = LockManager.init(gpa) };
+        // The lock manager's condition/mutex use the SAME `io` the DB owns (no
+        // ambient io), so a blocked txn parks on the DB's concurrency runtime.
+        return .{ .db = db, .locks = LockManager.init(gpa, db.io) };
     }
 
     pub fn deinit(self: *PessimisticTransactionDB) void {
@@ -127,7 +150,7 @@ fn openTestDB(gpa: std.mem.Allocator, me: *MemEnv) !*DB {
     return DB.open(gpa, me.env(), "ptxndb", .{});
 }
 
-test "pessimistic: lock blocks a second txn, then succeeds after the first commits" {
+test "pessimistic: tryPut reports Busy, then succeeds after the holder commits" {
     const gpa = testing.allocator;
     var me = MemEnv.init(gpa);
     defer me.deinit();
@@ -143,11 +166,11 @@ test "pessimistic: lock blocks a second txn, then succeeds after the first commi
     defer b.deinit();
 
     try a.put("k", "a"); // a locks k
-    try testing.expectError(error.Busy, b.put("k", "b")); // lock held by a
+    try testing.expectError(error.Busy, b.tryPut("k", "b")); // non-blocking probe
 
     try a.commit(.{}); // releases the lock
 
-    try b.put("k", "b"); // now b can lock + write
+    try b.tryPut("k", "b"); // now b can lock + write
     try b.commit(.{});
 
     const got = try db.get(.{}, "k") orelse return error.TestExpectedFound;
@@ -243,4 +266,59 @@ test "pessimistic: read-your-own-writes + snapshot isolation" {
     try testing.expect((try t.get(gpa, "ext")) == null);
 
     try t.rollback();
+}
+
+// A pessimistic `put` BLOCKS while another txn holds the key, then proceeds once
+// the holder commits (D2b2).  The blocked txn runs on its own fiber; the main
+// fiber commits the holder only after the blocked txn is provably parked on the
+// key's condition (deterministic — no sleeps).
+const builtin = @import("builtin");
+
+const Blocked = struct {
+    tdb: *PessimisticTransactionDB,
+    gpa: std.mem.Allocator,
+    /// proves the put returned AFTER the holder released (was blocking).
+    proceeded_after_release: bool = false,
+    released: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *Blocked) void {
+        var b = self.tdb.beginTransaction(self.gpa) catch unreachable;
+        defer b.deinit();
+        b.put("k", "b") catch unreachable; // blocks until holder commits
+        self.proceeded_after_release = self.released.load(.acquire);
+        b.commit(.{}) catch unreachable;
+    }
+};
+
+test "pessimistic: a blocked put proceeds after the holder commits" {
+    if (!builtin.is_test) return;
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const db = try openTestDB(gpa, &me);
+    defer db.close();
+
+    var tdb = PessimisticTransactionDB.init(gpa, db);
+    defer tdb.deinit();
+
+    var a = try tdb.beginTransaction(gpa);
+    defer a.deinit();
+    try a.put("k", "a"); // a locks k
+
+    var bl = Blocked{ .tdb = &tdb, .gpa = gpa };
+    var bf = try std.Io.concurrent(db.io, Blocked.run, .{&bl});
+
+    // Wait until the other txn is parked on k's condition (it took a fresh id).
+    while (tdb.locks.waiterCount("k") != 1) {}
+
+    bl.released.store(true, .release); // mark: we are about to release the lock
+    try a.commit(.{}); // releases k -> wakes the blocked txn
+
+    bf.await(db.io);
+
+    try testing.expect(bl.proceeded_after_release);
+
+    const got = try db.get(.{}, "k") orelse return error.TestExpectedFound;
+    defer gpa.free(got);
+    try testing.expectEqualStrings("b", got); // the blocked txn's write won
 }
