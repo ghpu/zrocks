@@ -284,6 +284,7 @@ pub const SkipList = struct {
 // =============================================================================
 
 const testing = std.testing;
+const builtin = @import("builtin");
 
 /// Collect the full iteration order (seekToFirst → next…) into an owned list.
 fn collect(gpa: std.mem.Allocator, list: *const SkipList) !std.ArrayListUnmanaged([]const u8) {
@@ -507,4 +508,209 @@ test "randomized stress: 1000 distinct keys cross-checked against sorted referen
             try testing.expectEqualSlices(u8, ref_keys.items[ref_idx], it.key());
         }
     }
+}
+
+// -----------------------------------------------------------------------------
+// SWMR (single-writer / multi-reader) concurrency audit — D2b4
+//
+// The skiplist's documented contract (module header) is LevelDB's: ONE writer
+// (which is also the sole arena allocator), arbitrarily many concurrent readers.
+// `next` links are published `.release` by the writer and loaded `.acquire` by
+// readers, and `max_height` is an atomic so a reader that observes a raised
+// height also observes the new levels' links (or null, in which case it simply
+// drops down — never a torn pointer).  The single-threaded tests above encode
+// the *ordering* invariants; the test below exercises the *runtime* invariant
+// under genuine concurrency on the Threaded io.
+//
+// Invariants asserted by the reader fibers (any of which, if violated, would
+// expose a missing/misordered atomic — a torn key, a node reachable before its
+// key/next array were written, or an out-of-order splice):
+//   1. seekToFirst→next yields a STRICTLY INCREASING key sequence at all times
+//      (the sorted invariant is never transiently broken by an in-flight splice).
+//   2. Every observed key is a well-formed 10-digit value < N — i.e. its bytes
+//      were fully written before the node became reachable (no torn key).
+//   3. seek(target), when valid, returns a key >= target.
+//   4. contains() is monotonic: a key seen present is present on every later read
+//      (the writer only ever inserts; a published node never disappears).
+// -----------------------------------------------------------------------------
+
+/// Number of distinct keys the writer fiber inserts in the SWMR stress test.
+const swmr_n: u32 = 4000;
+
+/// Format `v` as a fixed-width 10-digit zero-padded decimal so that BYTE order
+/// equals NUMERIC order (lets readers validate sortedness + well-formedness).
+fn swmrKey(buf: *[10]u8, v: u32) []const u8 {
+    _ = std.fmt.bufPrint(buf, "{d:0>10}", .{v}) catch unreachable;
+    return buf[0..];
+}
+
+/// Parse a 10-digit key back to its numeric value; errors out the reader if the
+/// key is malformed (which would mean a torn / partially-published key).
+fn swmrParse(key: []const u8) !u32 {
+    if (key.len != 10) return error.TornKey;
+    return std.fmt.parseInt(u32, key, 10) catch error.TornKey;
+}
+
+/// The lone writer: inserts 0..swmr_n in a shuffled order so splices happen at
+/// every level and position.  It is the ONLY thread that mutates the list or
+/// touches the arena (SWMR contract).
+const SwmrWriter = struct {
+    list: *SkipList,
+    seed: u64,
+    /// Published `.release` after each insert so readers can bound their probes
+    /// to the highest value definitely inserted (purely to tighten assertions;
+    /// correctness does not depend on it).
+    high_water: *std.atomic.Value(u32),
+    /// Set true (`.release`) when every key has been inserted; readers spin on
+    /// this with `.acquire` to know when to stop.
+    done: *std.atomic.Value(bool),
+    ok: bool = false,
+
+    fn run(self: *SwmrWriter) void {
+        // A shuffled permutation of 0..swmr_n.
+        var order: [swmr_n]u32 = undefined;
+        for (&order, 0..) |*o, i| o.* = @intCast(i);
+        var prng = std.Random.DefaultPrng.init(self.seed);
+        prng.random().shuffle(u32, &order);
+
+        var buf: [10]u8 = undefined;
+        for (order) |v| {
+            const k = swmrKey(&buf, v);
+            self.list.insert(k) catch return; // ok stays false → test fails
+            // Track the max value inserted so far (monotone enough for readers).
+            var cur = self.high_water.load(.monotonic);
+            while (v > cur) {
+                if (self.high_water.cmpxchgWeak(cur, v, .release, .monotonic)) |seen| {
+                    cur = seen;
+                } else break;
+            }
+        }
+        self.done.store(true, .release);
+        self.ok = true;
+    }
+};
+
+/// A read-only fiber hammering the list concurrently with the writer.  Spins
+/// until the writer signals `done`, doing a full forward scan + a batch of seeks
+/// + monotonic-presence checks on every pass.
+const SwmrReader = struct {
+    list: *SkipList,
+    seed: u64,
+    high_water: *std.atomic.Value(u32),
+    done: *std.atomic.Value(bool),
+    ok: bool = false,
+
+    fn run(self: *SwmrReader) void {
+        var prng = std.Random.DefaultPrng.init(self.seed);
+        const rnd = prng.random();
+        // The largest value this reader has EVER seen present, per the monotonic
+        // contract: once present, always present.
+        var ever_seen: i64 = -1;
+
+        var passes: usize = 0;
+        while (true) : (passes += 1) {
+            const finished = self.done.load(.acquire);
+
+            // (1)+(2) Full forward scan: strictly increasing, well-formed keys.
+            var prev: i64 = -1;
+            var it = SkipList.Iterator.init(self.list);
+            it.seekToFirst();
+            while (it.valid()) : (it.next()) {
+                const v = swmrParse(it.key()) catch return; // torn key → fail
+                if (@as(i64, v) <= prev) return; // not strictly increasing → fail
+                prev = v;
+                if (v >= swmr_n) return; // value out of range → fail
+            }
+
+            // (3) seek(target) returns a key >= target (or invalid).
+            var s: usize = 0;
+            while (s < 64) : (s += 1) {
+                const target_v = rnd.intRangeLessThan(u32, 0, swmr_n + 16);
+                var tbuf: [10]u8 = undefined;
+                const target = swmrKey(&tbuf, target_v);
+                var sit = SkipList.Iterator.init(self.list);
+                sit.seek(target);
+                if (sit.valid()) {
+                    const got = swmrParse(sit.key()) catch return;
+                    if (got < target_v) return; // seek landed BEFORE target → fail
+                }
+            }
+
+            // (4) Monotonic presence: a value <= high_water that we PROBE and
+            // find present must remain present on subsequent passes.  We track
+            // the max value found present and re-assert it is still present.
+            const hw = self.high_water.load(.acquire);
+            if (hw > 0) {
+                const probe_v = rnd.intRangeAtMost(u32, 0, hw);
+                var pbuf: [10]u8 = undefined;
+                const pk = swmrKey(&pbuf, probe_v);
+                if (self.list.contains(pk)) {
+                    if (@as(i64, probe_v) > ever_seen) ever_seen = probe_v;
+                }
+            }
+            if (ever_seen >= 0) {
+                var ebuf: [10]u8 = undefined;
+                const ek = swmrKey(&ebuf, @intCast(ever_seen));
+                if (!self.list.contains(ek)) return; // disappeared → fail
+            }
+
+            if (finished) break; // writer done AND we did one final post-pass
+        }
+        self.ok = passes > 0;
+    }
+};
+
+test "SWMR: one writer + many concurrent readers — no torn reads, sortedness holds" {
+    if (!builtin.is_test) return;
+    const gpa = testing.allocator;
+    const io = std.testing.io;
+
+    var a = arena.Arena.init(gpa);
+    defer a.deinit();
+    var list = SkipList.init(&a, comparator.bytewise, 0xA11CE);
+
+    var high_water = std.atomic.Value(u32).init(0);
+    var done = std.atomic.Value(bool).init(false);
+
+    var w = SwmrWriter{
+        .list = &list,
+        .seed = 0xC0FFEE,
+        .high_water = &high_water,
+        .done = &done,
+    };
+    var r0 = SwmrReader{ .list = &list, .seed = 1, .high_water = &high_water, .done = &done };
+    var r1 = SwmrReader{ .list = &list, .seed = 2, .high_water = &high_water, .done = &done };
+    var r2 = SwmrReader{ .list = &list, .seed = 3, .high_water = &high_water, .done = &done };
+
+    // Launch readers first so they race the writer from the very first insert.
+    var fr0 = try std.Io.concurrent(io, SwmrReader.run, .{&r0});
+    var fr1 = try std.Io.concurrent(io, SwmrReader.run, .{&r1});
+    var fr2 = try std.Io.concurrent(io, SwmrReader.run, .{&r2});
+    var fw = try std.Io.concurrent(io, SwmrWriter.run, .{&w});
+
+    fw.await(io);
+    fr0.await(io);
+    fr1.await(io);
+    fr2.await(io);
+
+    try testing.expect(w.ok);
+    try testing.expect(r0.ok and r1.ok and r2.ok);
+
+    // Final consistency: the whole permutation is present and in sorted order.
+    var buf: [10]u8 = undefined;
+    var v: u32 = 0;
+    while (v < swmr_n) : (v += 1) {
+        try testing.expect(list.contains(swmrKey(&buf, v)));
+    }
+    var prev: i64 = -1;
+    var count: u32 = 0;
+    var it = SkipList.Iterator.init(&list);
+    it.seekToFirst();
+    while (it.valid()) : (it.next()) {
+        const cur = try swmrParse(it.key());
+        try testing.expect(@as(i64, cur) > prev);
+        prev = cur;
+        count += 1;
+    }
+    try testing.expectEqual(swmr_n, count);
 }

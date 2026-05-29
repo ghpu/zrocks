@@ -506,6 +506,104 @@ test "M7.5: add with range_deletion records a tombstone (key=begin, value=end)" 
     }
 }
 
+test "D2b4: seal marks the memtable immutable and rejects further adds" {
+    const gpa = testing.allocator;
+    const mt = try MemTable.init(gpa, comparator.bytewise);
+    defer mt.deinit();
+
+    // Fresh memtable is active (not sealed): adds succeed.
+    try testing.expect(!mt.isSealed());
+    try mt.add(1, .value, "k", "v1");
+    try mt.add(2, .value, "k", "v2");
+
+    // Seal it (active -> immutable promotion).  Idempotent.
+    mt.seal();
+    try testing.expect(mt.isSealed());
+    mt.seal();
+    try testing.expect(mt.isSealed());
+
+    // A sealed memtable rejects mutations: the immutable snapshot is frozen so a
+    // concurrent flush reader sees a stable set of entries.
+    try testing.expectError(error.MemTableSealed, mt.add(3, .value, "k", "v3"));
+    try testing.expectError(error.MemTableSealed, mt.add(4, .range_deletion, "a", "z"));
+
+    // Reads still work on the sealed (immutable) memtable: the entries written
+    // before sealing remain visible.
+    var lk = try LookupKey.init(gpa, "k", 100);
+    defer lk.deinit(gpa);
+    const r = mt.get(lk) orelse return error.TestExpectedFound;
+    try testing.expectEqualStrings("v2", r.found);
+}
+
+test "D2b4: concurrent readers see a sealed memtable's frozen contents consistently" {
+    const builtin = @import("builtin");
+    if (!builtin.is_test) return;
+    const gpa = testing.allocator;
+    const io = std.testing.io;
+
+    const mt = try MemTable.init(gpa, comparator.bytewise);
+    defer mt.deinit();
+
+    // Populate, then seal (atomic active->immutable promotion).
+    var i: u64 = 0;
+    while (i < 256) : (i += 1) {
+        var kbuf: [8]u8 = undefined;
+        const k = std.fmt.bufPrint(&kbuf, "k{d:0>5}", .{i}) catch unreachable;
+        var vbuf: [8]u8 = undefined;
+        const v = std.fmt.bufPrint(&vbuf, "v{d:0>5}", .{i}) catch unreachable;
+        try mt.add(i + 1, .value, k, v);
+    }
+    mt.seal();
+
+    const Reader = struct {
+        mt: *MemTable,
+        ok: bool = false,
+        /// Build a memtable lookup key entirely on the stack (no heap), so the
+        /// reader fibers never touch the (non-thread-safe) shared allocator.
+        ///   memtable_key := varint32(user_key.len+8) ++ user_key ++ fixed64(trailer)
+        fn stackLookup(scratch: []u8, user_key: []const u8) LookupKey {
+            var list: std.ArrayListUnmanaged(u8) = .{ .items = scratch[0..0], .capacity = scratch.len };
+            coding.putVarint32(&list, undefined, @intCast(user_key.len + 8)) catch unreachable;
+            const ikey_start = list.items.len;
+            list.appendSliceAssumeCapacity(user_key);
+            const trailer = internal_key.packSequenceAndType(1000, internal_key.kValueTypeForSeek);
+            var tbuf: [8]u8 = undefined;
+            coding.encodeFixed64(&tbuf, trailer);
+            list.appendSliceAssumeCapacity(&tbuf);
+            return .{ .buf = list.items, .ikey_start = ikey_start };
+        }
+        fn run(self: *@This()) void {
+            var pass: usize = 0;
+            while (pass < 50) : (pass += 1) {
+                var n: u64 = 0;
+                while (n < 256) : (n += 1) {
+                    var kbuf: [8]u8 = undefined;
+                    const k = std.fmt.bufPrint(&kbuf, "k{d:0>5}", .{n}) catch unreachable;
+                    var sbuf: [32]u8 = undefined;
+                    const lk = stackLookup(&sbuf, k);
+                    const r = self.mt.get(lk) orelse return;
+                    var vbuf: [8]u8 = undefined;
+                    const want = std.fmt.bufPrint(&vbuf, "v{d:0>5}", .{n}) catch unreachable;
+                    if (!std.mem.eql(u8, want, r.found)) return;
+                }
+            }
+            self.ok = true;
+        }
+    };
+
+    var r0 = Reader{ .mt = mt };
+    var r1 = Reader{ .mt = mt };
+    var r2 = Reader{ .mt = mt };
+    var f0 = try std.Io.concurrent(io, Reader.run, .{&r0});
+    var f1 = try std.Io.concurrent(io, Reader.run, .{&r1});
+    var f2 = try std.Io.concurrent(io, Reader.run, .{&r2});
+    f0.await(io);
+    f1.await(io);
+    f2.await(io);
+
+    try testing.expect(r0.ok and r1.ok and r2.ok);
+}
+
 test "LookupKey: layout — memtableKey, internalKey, userKey" {
     const gpa = testing.allocator;
     var lk = try LookupKey.init(gpa, "foo", 5);
