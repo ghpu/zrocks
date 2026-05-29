@@ -525,8 +525,22 @@ pub const VersionSet = struct {
     prev_log_number: u64,
 
     // Open MANIFEST descriptor log (lazily created on the first logAndApply).
+    // In SHARED-MANIFEST mode (`shared != null`) these stay null: the single
+    // SharedManifest owns the descriptor + CURRENT, the file-number space, and
+    // the global last_sequence; this VersionSet only tracks its own CF's
+    // Version, routing every logAndApply edit to the shared descriptor tagged
+    // with `cf_id`.
     descriptor_file: ?env.WritableFile,
     descriptor_log: ?log_writer.Writer,
+
+    /// Shared-MANIFEST coordinator (D1b-M4).  Null for a standalone single-CF
+    /// VersionSet (the legacy per-DB path, unchanged).  Non-null when this
+    /// VersionSet is one column family inside a multi-CF database sharing ONE
+    /// MANIFEST: `logAndApply`/`newFileNumber`/`lastSequence` delegate to it.
+    shared: ?*SharedManifest = null,
+    /// Column-family id this VersionSet represents (0 = default).  Only
+    /// meaningful in shared mode; every edit logged is tagged with it.
+    cf_id: u32 = 0,
 
     pub fn init(
         gpa: std.mem.Allocator,
@@ -549,6 +563,8 @@ pub const VersionSet = struct {
             .prev_log_number = 0,
             .descriptor_file = null,
             .descriptor_log = null,
+            .shared = null,
+            .cf_id = 0,
         };
     }
 
@@ -562,6 +578,9 @@ pub const VersionSet = struct {
     }
 
     pub fn newFileNumber(self: *VersionSet) u64 {
+        // Shared mode: one global file-number space across all CFs (RocksDB
+        // semantics — file numbers are unique database-wide).
+        if (self.shared) |sm| return sm.newFileNumber();
         const n = self.next_file_number;
         self.next_file_number += 1;
         return n;
@@ -579,6 +598,7 @@ pub const VersionSet = struct {
     }
 
     pub fn lastSequence(self: *const VersionSet) u64 {
+        if (self.shared) |sm| return sm.last_sequence;
         return self.last_sequence;
     }
 
@@ -595,10 +615,15 @@ pub const VersionSet = struct {
     }
 
     pub fn nextFileNumber(self: *const VersionSet) u64 {
+        if (self.shared) |sm| return sm.next_file_number;
         return self.next_file_number;
     }
 
     pub fn setLastSequence(self: *VersionSet, v: u64) void {
+        if (self.shared) |sm| {
+            sm.last_sequence = v;
+            return;
+        }
         self.last_sequence = v;
     }
 
@@ -656,6 +681,29 @@ pub const VersionSet = struct {
     /// Build a new current Version = apply(edit, current), append the encoded
     /// edit to the MANIFEST, install the new Version, and free the old one.
     pub fn logAndApply(self: *VersionSet, edit: *VersionEdit) !void {
+        // Shared-MANIFEST mode (D1b-M4): the single SharedManifest owns the
+        // descriptor + CURRENT + global scalars.  Tag the edit with this CF's
+        // id, route the write to the shared descriptor, then apply the Version
+        // locally.
+        if (self.shared) |sm| {
+            var next = try applyEdit(self.gpa, &self.current, edit, self.cmp);
+            errdefer next.deinit(self.gpa);
+
+            edit.setColumnFamilyId(self.cf_id);
+            try sm.writeEdit(edit);
+
+            // Local CF scalars that the edit carries (log_number is per-CF for
+            // a shared WAL design but recorded in the shared MANIFEST tagged by
+            // cf).  Global scalars (file numbers, last_sequence) live in `sm`.
+            if (edit.log_number) |v| self.log_number = v;
+            if (edit.prev_log_number) |v| self.prev_log_number = v;
+
+            var old = self.current;
+            self.current = next;
+            old.deinit(self.gpa);
+            return;
+        }
+
         // 1. Build the new Version from the current one + the edit.
         var next = try applyEdit(self.gpa, &self.current, edit, self.cmp);
         errdefer next.deinit(self.gpa);
@@ -923,6 +971,281 @@ pub const VersionSet = struct {
         var old = self.current;
         self.current = built;
         old.deinit(self.gpa);
+    }
+
+    /// Apply a decoded `edit` to this VersionSet's current Version IN PLACE,
+    /// without writing to any MANIFEST (used by SharedManifest.recover to
+    /// replay CF-tagged records into the right CF's Version).  Also folds the
+    /// edit's per-CF log_number into local bookkeeping and reserves any file
+    /// numbers it references.
+    pub fn applyEditInPlace(self: *VersionSet, edit: *const VersionEdit) !void {
+        var next = try applyEdit(self.gpa, &self.current, edit, self.cmp);
+        errdefer next.deinit(self.gpa);
+        if (edit.log_number) |v| self.log_number = v;
+        if (edit.prev_log_number) |v| self.prev_log_number = v;
+        for (edit.new_files.items) |nf| self.markFileNumberUsed(nf.meta.number);
+        var old = self.current;
+        self.current = next;
+        old.deinit(self.gpa);
+    }
+};
+
+// ===========================================================================
+// SharedManifest (D1b-M4) — ONE MANIFEST for a multi-CF database
+// ===========================================================================
+//
+// In the multi-CF design every column family is its own sub-LSM (own subdir,
+// memtable, table_cache, flush/compaction), but they SHARE one MANIFEST in the
+// database root: each VersionEdit is tagged with `kColumnFamily` (its cf id)
+// and appended to ONE descriptor log.  The SharedManifest owns:
+//   * the descriptor (MANIFEST) writer + the CURRENT pointer (in `dbroot`);
+//   * the GLOBAL file-number space (file numbers are unique database-wide);
+//   * the GLOBAL last_sequence (the shared sequence space across all CFs).
+// Each per-CF `VersionSet` keeps only its own `current` Version and points at
+// this SharedManifest via `vs.shared`; `vs.logAndApply` tags + routes here.
+//
+// CF identity (name<->id) is tracked separately by CfDB's CF_LIST sidecar; the
+// shared MANIFEST stores the per-CF FILE/Version state (tagged by cf id) plus a
+// kColumnFamilyAdd record per CF in each snapshot so the descriptor is
+// self-describing for a RocksDB-aware reader.
+
+pub const SharedManifest = struct {
+    gpa: std.mem.Allocator,
+    env: env.Env,
+    dbroot: []u8, // owned
+    options: options.Options,
+    cmp: comparator.Comparator,
+
+    next_file_number: u64,
+    manifest_file_number: u64,
+    last_sequence: u64,
+
+    descriptor_file: ?env.WritableFile,
+    descriptor_log: ?log_writer.Writer,
+
+    /// Registered per-CF VersionSets, keyed by cf id.  Borrowed pointers (owned
+    /// by their DBs); the SharedManifest only routes edits/recovery to them.
+    cfs: std.AutoHashMapUnmanaged(u32, *VersionSet),
+
+    pub fn init(
+        gpa: std.mem.Allocator,
+        e: env.Env,
+        dbroot: []const u8,
+        opts: options.Options,
+    ) !SharedManifest {
+        const owned = try gpa.dupe(u8, dbroot);
+        return .{
+            .gpa = gpa,
+            .env = e,
+            .dbroot = owned,
+            .options = opts,
+            .cmp = opts.comparator,
+            .next_file_number = 2, // 1 reserved for the first MANIFEST.
+            .manifest_file_number = 0,
+            .last_sequence = 0,
+            .descriptor_file = null,
+            .descriptor_log = null,
+            .cfs = .empty,
+        };
+    }
+
+    pub fn deinit(self: *SharedManifest) void {
+        if (self.descriptor_file) |f| f.close() catch {};
+        self.descriptor_file = null;
+        self.descriptor_log = null;
+        self.cfs.deinit(self.gpa);
+        self.gpa.free(self.dbroot);
+        self.* = undefined;
+    }
+
+    /// Register a per-CF VersionSet, wiring it into shared mode (sets
+    /// `vs.shared = self`, `vs.cf_id = cf_id`).
+    pub fn registerCf(self: *SharedManifest, cf_id: u32, vs: *VersionSet) !void {
+        vs.shared = self;
+        vs.cf_id = cf_id;
+        try self.cfs.put(self.gpa, cf_id, vs);
+    }
+
+    /// Unregister a CF (on drop).  The VS is closed by its owner separately.
+    pub fn unregisterCf(self: *SharedManifest, cf_id: u32) void {
+        _ = self.cfs.remove(cf_id);
+    }
+
+    pub fn newFileNumber(self: *SharedManifest) u64 {
+        const n = self.next_file_number;
+        self.next_file_number += 1;
+        return n;
+    }
+
+    fn markFileNumberUsed(self: *SharedManifest, number: u64) void {
+        if (self.next_file_number <= number) self.next_file_number = number + 1;
+    }
+
+    /// Append one (already CF-tagged) VersionEdit to the shared descriptor,
+    /// creating it (and writing CURRENT + a self-describing snapshot) on the
+    /// first call.  Folds the edit's global scalars (next_file_number,
+    /// last_sequence) into the shared bookkeeping.
+    pub fn writeEdit(self: *SharedManifest, edit: *VersionEdit) !void {
+        if (self.descriptor_log == null) try self.createDescriptor();
+
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(self.gpa);
+        try edit.encodeTo(&buf, self.gpa);
+        try self.descriptor_log.?.addRecord(self.gpa, buf.items);
+        try self.descriptor_file.?.flush();
+
+        if (edit.next_file_number) |v| self.markFileNumberUsed(v -| 1);
+        if (edit.last_sequence) |v| self.last_sequence = v;
+        for (edit.new_files.items) |nf| self.markFileNumberUsed(nf.meta.number);
+    }
+
+    /// Create a fresh MANIFEST in `dbroot`, write a self-describing snapshot of
+    /// every registered CF's current state, and point CURRENT at it.
+    fn createDescriptor(self: *SharedManifest) !void {
+        const number = self.newFileNumber();
+        self.manifest_file_number = number;
+
+        const path = try filename.manifestFileName(self.gpa, self.dbroot, number);
+        defer self.gpa.free(path);
+
+        var wf = try self.env.newWritableFile(self.gpa, path);
+        errdefer wf.close() catch {};
+        var writer = log_writer.Writer.init(wf);
+
+        try self.writeSnapshot(&writer, wf);
+
+        self.descriptor_file = wf;
+        self.descriptor_log = writer;
+
+        try self.setCurrentFile(number);
+    }
+
+    /// Snapshot every registered CF: for each, a kColumnFamilyAdd record
+    /// (placeholder name = the CF id) followed by a full file/scalar snapshot
+    /// tagged with that CF id.  CF NAMES live in CF_LIST; the snapshot's add
+    /// record carries a synthetic name only so the descriptor parses as
+    /// RocksDB-shaped — recovery routes by id, not name.
+    fn writeSnapshot(self: *SharedManifest, writer: *log_writer.Writer, wf: env.WritableFile) !void {
+        var it = self.cfs.iterator();
+        while (it.next()) |entry| {
+            const cf_id = entry.key_ptr.*;
+            const vs = entry.value_ptr.*;
+
+            var edit = VersionEdit.init();
+            defer edit.deinit(self.gpa);
+            edit.setColumnFamilyId(cf_id);
+            try edit.setComparatorName(self.gpa, self.cmp.name());
+            if (vs.log_number != 0) edit.setLogNumber(vs.log_number);
+            edit.setNextFileNumber(self.next_file_number);
+            edit.setLastSequence(self.last_sequence);
+
+            var level: usize = 0;
+            while (level < kNumLevels) : (level += 1) {
+                for (vs.current.files[level].items) |f| {
+                    try edit.addFile(self.gpa, @intCast(level), f.number, f.file_size, f.smallest, f.largest);
+                    edit.setLastFileHasRangeTombstones(f.has_range_tombstones);
+                }
+            }
+
+            var buf: std.ArrayListUnmanaged(u8) = .empty;
+            defer buf.deinit(self.gpa);
+            try edit.encodeTo(&buf, self.gpa);
+            try writer.addRecord(self.gpa, buf.items);
+        }
+        try wf.flush();
+    }
+
+    fn setCurrentFile(self: *SharedManifest, manifest_number: u64) !void {
+        const manifest_path = try filename.manifestFileName(self.gpa, self.dbroot, manifest_number);
+        defer self.gpa.free(manifest_path);
+        const basename = std.fs.path.basename(manifest_path);
+
+        const tmp = try filename.tempFileName(self.gpa, self.dbroot, manifest_number);
+        defer self.gpa.free(tmp);
+
+        {
+            var wf = try self.env.newWritableFile(self.gpa, tmp);
+            errdefer wf.close() catch {};
+            try wf.append(basename);
+            try wf.append("\n");
+            try wf.flush();
+            try wf.close();
+        }
+        errdefer self.env.deleteFile(tmp) catch {};
+
+        const current_path = try filename.currentFileName(self.gpa, self.dbroot);
+        defer self.gpa.free(current_path);
+        try self.env.renameFile(tmp, current_path);
+    }
+
+    /// Whether a shared MANIFEST already exists for this dbroot.
+    pub fn exists(self: *SharedManifest) bool {
+        const current_path = filename.currentFileName(self.gpa, self.dbroot) catch return false;
+        defer self.gpa.free(current_path);
+        return self.env.fileExists(current_path);
+    }
+
+    /// Recover all registered CFs from the shared MANIFEST: read CURRENT ->
+    /// MANIFEST, decode each record (a CF-tagged VersionEdit) and apply it to
+    /// the matching registered CF's Version, restoring the global
+    /// next_file_number + last_sequence.  CFs must be registered BEFORE calling
+    /// (CfDB registers every CF_LIST entry first).  Records for an unregistered
+    /// cf id are skipped defensively.
+    pub fn recover(self: *SharedManifest) !void {
+        const current_path = try filename.currentFileName(self.gpa, self.dbroot);
+        defer self.gpa.free(current_path);
+
+        const current_contents = try readWholeFile(self.env, self.gpa, current_path);
+        defer self.gpa.free(current_contents);
+
+        var basename: []const u8 = current_contents;
+        if (basename.len > 0 and basename[basename.len - 1] == '\n') {
+            basename = basename[0 .. basename.len - 1];
+        }
+        if (basename.len == 0) return error.Corruption;
+
+        const manifest_path = try std.fmt.allocPrint(self.gpa, "{s}/{s}", .{ self.dbroot, basename });
+        defer self.gpa.free(manifest_path);
+
+        var sf = try self.env.newSequentialFile(self.gpa, manifest_path);
+        defer sf.close() catch {};
+        var reader = log_reader.Reader.init(sf);
+
+        var scratch: std.ArrayList(u8) = .empty;
+        defer scratch.deinit(self.gpa);
+
+        var max_next_file: u64 = self.next_file_number;
+        var max_last_seq: u64 = self.last_sequence;
+
+        while (try reader.readRecord(self.gpa, &scratch)) |record| {
+            var edit = try VersionEdit.decodeFrom(self.gpa, record);
+            defer edit.deinit(self.gpa);
+
+            if (edit.next_file_number) |v| max_next_file = @max(max_next_file, v);
+            if (edit.last_sequence) |v| max_last_seq = @max(max_last_seq, v);
+            for (edit.new_files.items) |nf| max_next_file = @max(max_next_file, nf.meta.number + 1);
+
+            // Route the file/version mutations to the matching CF.  A record
+            // with no cf id targets the default CF (0).  Add/drop records carry
+            // no file mutations here (CF identity is tracked by CF_LIST), so
+            // they are harmless to apply.
+            const cf_id = edit.column_family_id orelse 0;
+            if (self.cfs.get(cf_id)) |vs| {
+                try vs.applyEditInPlace(&edit);
+            }
+        }
+
+        self.next_file_number = @max(self.next_file_number, max_next_file);
+        self.last_sequence = max_last_seq;
+
+        // Reserve every surviving file number across all CFs.
+        var it = self.cfs.valueIterator();
+        while (it.next()) |vs_ptr| {
+            const vs = vs_ptr.*;
+            for (&vs.current.files) |*level| {
+                for (level.items) |f| self.markFileNumberUsed(f.number);
+            }
+        }
     }
 };
 

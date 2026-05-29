@@ -7,40 +7,43 @@
 //! writes atomic.
 //!
 //! ---------------------------------------------------------------------------
-//! Design (tractable + correct — a deliberate divergence from RocksDB's single
-//! shared MANIFEST):
+//! Design (D1b-M4 — ONE shared MANIFEST with CF-tagged VersionEdits):
 //!
 //!   * Each CF is a self-contained sub-LSM rooted in its OWN subdirectory
-//!     `<dbroot>/<cfname>/`.  We REUSE the existing single-CF `DB` for all of a
-//!     CF's per-family machinery — {memtable, imm, VersionSet (its own
-//!     MANIFEST/CURRENT under the subdir), table_cache, flush, leveled/universal/
-//!     fifo compaction, snapshot-aware get + merging iterator} — by opening it
-//!     via `DB.openCf`, which is exactly `DB.open` MINUS its own WAL.
+//!     `<dbroot>/<cfname>/` for its SST files.  We REUSE the existing single-CF
+//!     `DB` for all of a CF's per-family machinery — {memtable, imm, VersionSet,
+//!     table_cache, flush, leveled/universal/fifo compaction, snapshot-aware get
+//!     + merging iterator} — by opening it via `DB.openCfShared`, which is
+//!     `DB.open` MINUS its own WAL and MINUS its own MANIFEST.
 //!
-//!   * The multi-CF `CfDB` owns the cross-cutting pieces a single `DB` would
-//!     normally own per-instance: the dbroot directory, ONE shared WAL at
-//!     `<dbroot>/000001.log`, and ONE `last_sequence` (the sequence space is
+//!   * The multi-CF `CfDB` owns the cross-cutting pieces: the dbroot directory,
+//!     ONE shared WAL at `<dbroot>/000001.log`, and ONE `SharedManifest` at
+//!     `<dbroot>/MANIFEST-*` + `<dbroot>/CURRENT`.  Every per-CF flush/compaction
+//!     VersionEdit is TAGGED with its CF id (kColumnFamily=200) and appended to
+//!     this single descriptor.  The SharedManifest also owns the GLOBAL
+//!     file-number space and the GLOBAL `last_sequence` (the sequence space is
 //!     shared across all CFs, so a global write order exists).
 //!
 //!   * A persisted CF registry `<dbroot>/CF_LIST` maps cf name <-> id so a reopen
-//!     knows which CFs exist (and at which subdir).  The default CF (id 0, name
-//!     "default") always exists.
+//!     knows which CFs exist (and at which subdir).  CF identity lives here; the
+//!     shared MANIFEST stores each CF's FILE/Version state, tagged by id.  The
+//!     default CF (id 0, name "default") always exists.
 //!
 //!   * Atomic cross-CF writes come from the SHARED WAL: one `write` appends the
 //!     whole CF-tagged batch to the shared log with a single flush/sync, THEN
 //!     fans the records out to each target CF's memtable.  Atomicity does NOT
-//!     depend on a shared MANIFEST — per-CF MANIFESTs only track that CF's SST
-//!     files, and a crash either has the whole batch in the shared WAL (replayed
-//!     into every CF on reopen) or none of it.
+//!     depend on the MANIFEST — a crash either has the whole batch in the shared
+//!     WAL (replayed into every CF on reopen) or none of it.
 //!
-//! Recovery: read CF_LIST, `openCf` each CF (recovering its per-CF VersionSet =
-//! its SSTs + sequences), then replay the ENTIRE shared WAL routing each record
-//! to its CF's memtable by cf id (default 0 for untagged records).  Because the
-//! shared WAL is never truncated by a per-CF flush, replayed records that were
-//! already flushed to a CF's SSTs simply re-enter that CF's memtable; newest-wins
-//! reads stay correct (the memtable copy and the SST copy carry the same
-//! sequence/value).  TODO(perf): WAL recycling/truncation once the OLDEST CF has
-//! flushed past a log boundary.
+//! Recovery: read CF_LIST, `openCfShared` each CF (registering it with the
+//! SharedManifest, cf Version starts empty), then `SharedManifest.recover()`
+//! replays the ONE MANIFEST routing each CF-tagged record to the matching CF's
+//! Version (restoring its SSTs + the global next_file_number/last_sequence).
+//! Then replay the ENTIRE shared WAL routing each record to its CF's memtable by
+//! cf id (default 0 for untagged records).  Because the shared WAL is never
+//! truncated by a per-CF flush, replayed records that were already flushed to a
+//! CF's SSTs simply re-enter that CF's memtable; newest-wins reads stay correct.
+//! TODO(perf): WAL recycling/truncation once the OLDEST CF has flushed.
 //!
 //! Standalone test note (Zig 0.16): `../...` imports only resolve inside the
 //! `src`-rooted module:
@@ -57,6 +60,7 @@ const log_writer = @import("../format/log_writer.zig");
 const log_reader = @import("../format/log_reader.zig");
 const log_format = @import("../format/log_format.zig");
 const filename = @import("../version/filename.zig");
+const version_set = @import("../version/version_set.zig");
 
 const db_mod = @import("../db/db.zig");
 const write_path = @import("../db/write_path.zig");
@@ -81,8 +85,8 @@ pub const ColumnFamilyHandle = struct {
 };
 
 /// Per-family LSM state: a stable id, an owned name, and the per-CF sub-LSM
-/// `*DB` rooted at `<dbroot>/<name>/` (opened via `DB.openCf`, sharing the
-/// CfDB's WAL + sequence space).
+/// `*DB` rooted at `<dbroot>/<name>/` (opened via `DB.openCfShared`, sharing
+/// the CfDB's WAL, sequence space, and ONE MANIFEST).
 const ColumnFamily = struct {
     id: u32,
     name: []u8, // owned
@@ -104,6 +108,11 @@ pub const CfDB = struct {
     cfs: std.StringHashMapUnmanaged(*ColumnFamily),
     /// Next CF id to hand out (default CF takes 0).
     next_cf_id: u32,
+
+    /// The single shared MANIFEST across all CFs (D1b-M4): owns the descriptor +
+    /// CURRENT in `<dbroot>`, the global file-number space, and the global
+    /// last_sequence.  Each CF's VersionSet routes its (CF-tagged) edits here.
+    manifest: *version_set.SharedManifest,
 
     // Shared WAL (one log across all CFs).
     wal_file: env.WritableFile,
@@ -134,6 +143,14 @@ pub const CfDB = struct {
 
         try e.makeDir(dbroot);
 
+        // The single shared MANIFEST.  Created before any CF so addCf can
+        // register each CF's VersionSet into it.
+        const sm = try gpa.create(version_set.SharedManifest);
+        errdefer gpa.destroy(sm);
+        sm.* = try version_set.SharedManifest.init(gpa, e, dbroot, options);
+        errdefer sm.deinit();
+        self.manifest = sm;
+
         const cf_list_path = try filename.cfListFileName(gpa, dbroot);
         defer gpa.free(cf_list_path);
 
@@ -144,10 +161,26 @@ pub const CfDB = struct {
 
         if (reopening) {
             // ----- reopen an existing multi-CF database --------------------
-            // 1. Read CF_LIST and open each CF's sub-LSM (recovering its SSTs).
+            // 1. Read CF_LIST and open (register) each CF's sub-LSM.  Each CF's
+            //    Version starts empty; it is filled by the shared-MANIFEST replay.
             try self.loadCfList(cf_list_path);
 
-            // 2. Reopen the shared WAL appendably and resume the writer mid-block.
+            // 2. Recover the shared MANIFEST: replay the ONE descriptor routing
+            //    each CF-tagged record to its CF's Version, restoring the global
+            //    file-number space + last_sequence.  A DB whose CFs never flushed
+            //    has no descriptor yet (it is created lazily on the first edit);
+            //    in that case there is nothing on-disk to recover.
+            if (sm.exists()) try sm.recover();
+
+            // 3. Propagate the recovered sequence to each CF so its reads see all
+            //    SST data before WAL replay further advances it.
+            {
+                var it = self.cfs.valueIterator();
+                while (it.next()) |cf_ptr| cf_ptr.*.db.last_sequence = sm.last_sequence;
+            }
+            self.last_sequence = sm.last_sequence;
+
+            // 4. Reopen the shared WAL appendably and resume the writer mid-block.
             const file_size = e.getFileSize(log_path) catch 0;
             self.wal_file = try e.newAppendableFile(gpa, log_path);
             errdefer self.wal_file.close() catch {};
@@ -156,7 +189,7 @@ pub const CfDB = struct {
                 @intCast(file_size % log_format.kBlockSize),
             );
 
-            // 3. Replay the whole shared WAL into the CFs' memtables, restoring
+            // 5. Replay the whole shared WAL into the CFs' memtables, restoring
             //    last_sequence from the highest replayed sequence.
             try self.replaySharedLog(log_path);
         } else {
@@ -175,11 +208,16 @@ pub const CfDB = struct {
         return self;
     }
 
-    /// Close the shared WAL and tear down every CF.
+    /// Close the shared WAL, tear down every CF, and free the shared MANIFEST.
     pub fn close(self: *CfDB) void {
         const gpa = self.gpa;
         self.wal_file.close() catch {};
+        // Tear down CFs first (frees each VersionSet that the SharedManifest
+        // borrows by pointer), then free the manifest (clears its CF map +
+        // closes the descriptor).
         self.deinitCfs();
+        self.manifest.deinit();
+        gpa.destroy(self.manifest);
         gpa.free(self.dbroot);
         gpa.destroy(self);
     }
@@ -215,7 +253,7 @@ pub const CfDB = struct {
         const dir = try self.cfDir(name);
         defer self.gpa.free(dir);
 
-        const sub = try DB.openCf(self.gpa, self.env, dir, self.options);
+        const sub = try DB.openCfShared(self.gpa, self.env, dir, self.options, self.manifest, id);
         errdefer sub.close();
 
         const cf = try self.gpa.create(ColumnFamily);
@@ -250,6 +288,9 @@ pub const CfDB = struct {
         if (h.id == 0) return error.CannotDropDefault;
         const entry = self.cfs.fetchRemove(h.name) orelse return error.ColumnFamilyNotFound;
         const cf = entry.value;
+        // Unregister from the shared MANIFEST BEFORE closing the CF DB (closing
+        // frees the VersionSet the manifest borrows by pointer).
+        self.manifest.unregisterCf(cf.id);
         cf.db.close();
         self.gpa.free(cf.name);
         self.gpa.destroy(cf);
@@ -756,5 +797,170 @@ fn verifyAll(
             seen += 1;
         }
         try testing.expectEqual(refs[ci].count(), seen);
+    }
+}
+
+// ===========================================================================
+// Shared-MANIFEST invariant tests (D1b-M4)
+// ===========================================================================
+
+const version_edit = @import("../version/version_edit.zig");
+
+/// Read every CF id that appears (via kColumnFamily tag) in the shared
+/// MANIFEST records of `dbroot`.  Returns a set-like AutoHashMap the caller
+/// deinits.  Asserts CURRENT names a MANIFEST that exists.
+fn manifestCfIds(gpa: std.mem.Allocator, e: env.Env, dbroot: []const u8) !std.AutoHashMapUnmanaged(u32, void) {
+    var ids: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    errdefer ids.deinit(gpa);
+
+    const current_path = try filename.currentFileName(gpa, dbroot);
+    defer gpa.free(current_path);
+
+    var sf = try e.newSequentialFile(gpa, current_path);
+    var contents: std.ArrayListUnmanaged(u8) = .empty;
+    defer contents.deinit(gpa);
+    var chunk: [256]u8 = undefined;
+    while (true) {
+        const n = try sf.read(&chunk);
+        if (n == 0) break;
+        try contents.appendSlice(gpa, chunk[0..n]);
+    }
+    sf.close() catch {};
+
+    var basename: []const u8 = contents.items;
+    if (basename.len > 0 and basename[basename.len - 1] == '\n') basename = basename[0 .. basename.len - 1];
+
+    const manifest_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ dbroot, basename });
+    defer gpa.free(manifest_path);
+
+    var msf = try e.newSequentialFile(gpa, manifest_path);
+    defer msf.close() catch {};
+    var reader = log_reader.Reader.init(msf);
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(gpa);
+
+    while (try reader.readRecord(gpa, &scratch)) |record| {
+        var edit = try version_edit.VersionEdit.decodeFrom(gpa, record);
+        defer edit.deinit(gpa);
+        if (edit.column_family_id) |id| try ids.put(gpa, id, {});
+    }
+    return ids;
+}
+
+test "D1b-M4: ONE shared MANIFEST in dbroot, none in CF subdirs" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    // Small write buffer so each CF flushes at least one SST (forcing the
+    // shared MANIFEST/CURRENT to be created via a CF-tagged edit).
+    const opts = Options{ .write_buffer_size = 256 };
+
+    const cdb = try CfDB.open(gpa, e, "cfmanifest", opts);
+    defer cdb.close();
+
+    const users = try cdb.createColumnFamily("users", .{});
+    const orders = try cdb.createColumnFamily("orders", .{});
+
+    var i: usize = 0;
+    var kbuf: [16]u8 = undefined;
+    while (i < 40) : (i += 1) {
+        const k = try std.fmt.bufPrint(&kbuf, "k{d:0>4}", .{i});
+        try cdb.put(.{}, users, k, "uvalue-padding-to-force-flush");
+        try cdb.put(.{}, orders, k, "ovalue-padding-to-force-flush");
+    }
+
+    // The single shared MANIFEST/CURRENT lives in the database root...
+    try testing.expect(e.fileExists("cfmanifest/CURRENT"));
+    // ...and NO per-CF MANIFEST/CURRENT exists under any CF subdirectory
+    // (proves CFs no longer own their own MANIFEST).
+    try testing.expect(!e.fileExists("cfmanifest/users/CURRENT"));
+    try testing.expect(!e.fileExists("cfmanifest/orders/CURRENT"));
+    try testing.expect(!e.fileExists("cfmanifest/default/CURRENT"));
+}
+
+test "D1b-M4: the one MANIFEST carries CF-tagged edits for multiple CFs" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    const opts = Options{ .write_buffer_size = 256 };
+
+    {
+        const cdb = try CfDB.open(gpa, e, "cftagged", opts);
+        defer cdb.close();
+
+        const users = try cdb.createColumnFamily("users", .{}); // id 1
+        const orders = try cdb.createColumnFamily("orders", .{}); // id 2
+
+        var i: usize = 0;
+        var kbuf: [16]u8 = undefined;
+        while (i < 40) : (i += 1) {
+            const k = try std.fmt.bufPrint(&kbuf, "k{d:0>4}", .{i});
+            try cdb.put(.{}, users, k, "padding-value-forces-an-l0-flush");
+            try cdb.put(.{}, orders, k, "padding-value-forces-an-l0-flush");
+        }
+        // Default CF too.
+        const def = cdb.defaultColumnFamily();
+        try cdb.put(.{}, def, "d", "x");
+    }
+
+    // The single MANIFEST must contain CF-tagged records for users (1) and
+    // orders (2) — i.e. distinct CFs share ONE descriptor.
+    var ids = try manifestCfIds(gpa, e, "cftagged");
+    defer ids.deinit(gpa);
+    try testing.expect(ids.contains(1));
+    try testing.expect(ids.contains(2));
+}
+
+test "D1b-M4: SST data for all CFs recovers through the one shared MANIFEST" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    // Tiny buffer so data is flushed to SSTs (recorded ONLY in the shared
+    // MANIFEST, not the WAL — recovery must come from the MANIFEST replay).
+    const opts = Options{ .write_buffer_size = 256 };
+
+    {
+        const cdb = try CfDB.open(gpa, e, "cfsstrec", opts);
+        defer cdb.close();
+        const a = try cdb.createColumnFamily("a", .{});
+        const b = try cdb.createColumnFamily("b", .{});
+
+        var i: usize = 0;
+        var kbuf: [16]u8 = undefined;
+        var vbuf: [40]u8 = undefined;
+        while (i < 50) : (i += 1) {
+            const k = try std.fmt.bufPrint(&kbuf, "k{d:0>4}", .{i});
+            const va = try std.fmt.bufPrint(&vbuf, "a-{d}-padding-padding-padding", .{i});
+            try cdb.put(.{}, a, k, va);
+            const vb = try std.fmt.bufPrint(&vbuf, "b-{d}-padding-padding-padding", .{i});
+            try cdb.put(.{}, b, k, vb);
+        }
+    }
+
+    // Reopen: SST contents for both CFs must come back via the shared MANIFEST.
+    {
+        const cdb = try CfDB.open(gpa, e, "cfsstrec", opts);
+        defer cdb.close();
+        const a = try cdb.columnFamily("a");
+        const b = try cdb.columnFamily("b");
+
+        const va = try cdb.get(.{}, a, "k0000") orelse return error.TestExpectedFound;
+        defer gpa.free(va);
+        try testing.expectEqualStrings("a-0-padding-padding-padding", va);
+
+        const vb = try cdb.get(.{}, b, "k0049") orelse return error.TestExpectedFound;
+        defer gpa.free(vb);
+        try testing.expectEqualStrings("b-49-padding-padding-padding", vb);
+
+        // Cross-CF isolation survives recovery: a's value is not in b.
+        const cross = try cdb.get(.{}, b, "k0000") orelse return error.TestExpectedFound;
+        defer gpa.free(cross);
+        try testing.expectEqualStrings("b-0-padding-padding-padding", cross);
     }
 }
