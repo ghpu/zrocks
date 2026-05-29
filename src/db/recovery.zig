@@ -145,3 +145,80 @@ pub fn replayLog(
 
     return max_seq;
 }
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+test "parseLogNumber accepts NNNNNN.log and rejects everything else" {
+    try std.testing.expectEqual(@as(?u64, 3), parseLogNumber("000003.log"));
+    try std.testing.expectEqual(@as(?u64, 0), parseLogNumber("000000.log"));
+    try std.testing.expectEqual(@as(?u64, 1234567), parseLogNumber("1234567.log"));
+    try std.testing.expectEqual(@as(?u64, 7), parseLogNumber("7.log"));
+    // Non-WAL names are rejected.
+    try std.testing.expectEqual(@as(?u64, null), parseLogNumber("CURRENT"));
+    try std.testing.expectEqual(@as(?u64, null), parseLogNumber("MANIFEST-000001"));
+    try std.testing.expectEqual(@as(?u64, null), parseLogNumber("000003.sst"));
+    try std.testing.expectEqual(@as(?u64, null), parseLogNumber("LOG"));
+    try std.testing.expectEqual(@as(?u64, null), parseLogNumber(".log"));
+    try std.testing.expectEqual(@as(?u64, null), parseLogNumber("00x3.log"));
+    try std.testing.expectEqual(@as(?u64, null), parseLogNumber("000003.log.old"));
+}
+
+test "replayAllLogs replays every log >= floor in ascending order" {
+    const env_mod = @import("../env/env.zig");
+    const log_writer = @import("../format/log_writer.zig");
+    const filename_mod = @import("../version/filename.zig");
+    const gpa = std.testing.allocator;
+
+    var me = env_mod.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    // Write three logs: 000001 (below floor), 000003, 000005 — each one batch.
+    const Spec = struct { num: u64, seq: u64, key: []const u8, val: []const u8 };
+    const specs = [_]Spec{
+        .{ .num = 1, .seq = 1, .key = "old", .val = "skipme" },
+        .{ .num = 5, .seq = 7, .key = "newer", .val = "five" },
+        .{ .num = 3, .seq = 3, .key = "mid", .val = "three" },
+    };
+    for (specs) |s| {
+        var batch = try WriteBatch.init(gpa);
+        defer batch.deinit(gpa);
+        try batch.put(gpa, s.key, s.val);
+        batch.setSequence(s.seq);
+        const path = try filename_mod.logFileName(gpa, "rad", s.num);
+        defer gpa.free(path);
+        var wf = try e.newWritableFile(gpa, path);
+        var w = log_writer.Writer.init(wf);
+        try w.addRecord(gpa, batch.contents());
+        try wf.close();
+    }
+
+    const bytewise = @import("../util/comparator.zig").bytewise;
+    var mem = try MemTable.init(gpa, bytewise);
+    defer mem.deinit();
+
+    // Floor = 3: 000001.log is skipped, 000003 + 000005 replayed.
+    const max_seq = try replayAllLogs(gpa, e, "rad", 3, mem, 1);
+    try std.testing.expectEqual(@as(u64, 7), max_seq);
+
+    // "old" (from the skipped log) is absent; "mid" and "newer" are present.
+    {
+        var lk = try memtable_mod.LookupKey.init(gpa, "old", 1000);
+        defer lk.deinit(gpa);
+        try std.testing.expect(mem.get(lk) == null);
+    }
+    {
+        var lk = try memtable_mod.LookupKey.init(gpa, "mid", 1000);
+        defer lk.deinit(gpa);
+        const r = mem.get(lk) orelse return error.TestExpectedFound;
+        try std.testing.expectEqualStrings("three", r.found);
+    }
+    {
+        var lk = try memtable_mod.LookupKey.init(gpa, "newer", 1000);
+        defer lk.deinit(gpa);
+        const r = mem.get(lk) orelse return error.TestExpectedFound;
+        try std.testing.expectEqualStrings("five", r.found);
+    }
+}
