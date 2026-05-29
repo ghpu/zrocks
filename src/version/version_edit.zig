@@ -58,6 +58,15 @@ const Tag = struct {
     const kNewFile: u32 = 7;
     const kPrevLogNumber: u32 = 9;
     const kNewFile4: u32 = 100;
+    // RocksDB column-family lifecycle tags (version_edit.cc).
+    /// Identifies which CF this VersionEdit applies to (CF id, varint32).
+    const kColumnFamily: u32 = 200;
+    /// Creates a new CF: carries the CF name (length-prefixed string).
+    const kColumnFamilyAdd: u32 = 201;
+    /// Drops (deletes) a CF: no payload.
+    const kColumnFamilyDrop: u32 = 202;
+    /// High-water mark for CF ids: carries the maximum CF id in use (varint32).
+    const kMaxColumnFamily: u32 = 203;
 };
 
 /// kNewFile4 custom-field sub-tags (RocksDB version_edit.cc CustomTag enum).
@@ -106,6 +115,16 @@ pub const VersionEdit = struct {
     next_file_number: ?u64 = null,
     last_sequence: ?u64 = null,
 
+    // Column-family lifecycle fields (RocksDB tags 200-203).
+    /// kColumnFamily (200): which CF this edit targets (null = default / unset).
+    column_family_id: ?u32 = null,
+    /// kColumnFamilyAdd (201): name of the CF being created (owned, duped).
+    column_family_name: ?[]const u8 = null,
+    /// kColumnFamilyDrop (202): true iff this edit drops the targeted CF.
+    is_column_family_drop: bool = false,
+    /// kMaxColumnFamily (203): high-water mark for CF ids.
+    max_column_family: ?u32 = null,
+
     // File mutation lists.
     deleted_files: std.ArrayListUnmanaged(DeletedFile) = .empty,
     new_files: std.ArrayListUnmanaged(NewFileEntry) = .empty,
@@ -128,6 +147,7 @@ pub const VersionEdit = struct {
     /// Free all owned memory.  Must be called exactly once.
     pub fn deinit(self: *VersionEdit, gpa: std.mem.Allocator) void {
         if (self.comparator_name) |s| gpa.free(s);
+        if (self.column_family_name) |s| gpa.free(s);
         for (self.new_files.items) |entry| {
             gpa.free(entry.meta.smallest);
             gpa.free(entry.meta.largest);
@@ -159,6 +179,28 @@ pub const VersionEdit = struct {
 
     pub fn setLastSequence(self: *VersionEdit, v: u64) void {
         self.last_sequence = v;
+    }
+
+    /// Set the column-family id this edit targets (kColumnFamily tag=200).
+    pub fn setColumnFamilyId(self: *VersionEdit, id: u32) void {
+        self.column_family_id = id;
+    }
+
+    /// Mark this edit as creating a new CF with `name` (kColumnFamilyAdd tag=201).
+    /// `name` is duped into edit-owned memory.
+    pub fn setColumnFamilyAdd(self: *VersionEdit, gpa: std.mem.Allocator, name: []const u8) !void {
+        if (self.column_family_name) |old| gpa.free(old);
+        self.column_family_name = try dupSlice(gpa, name);
+    }
+
+    /// Mark this edit as dropping the targeted CF (kColumnFamilyDrop tag=202).
+    pub fn setColumnFamilyDrop(self: *VersionEdit) void {
+        self.is_column_family_drop = true;
+    }
+
+    /// Set the max column-family id high-water mark (kMaxColumnFamily tag=203).
+    pub fn setMaxColumnFamily(self: *VersionEdit, max: u32) void {
+        self.max_column_family = max;
     }
 
     /// Add a new SSTable file.  `smallest` and `largest` are duped into
@@ -265,6 +307,25 @@ pub const VersionEdit = struct {
             try coding.putVarint32(buf, gpa, Tag.kLastSequence);
             try coding.putVarint64(buf, gpa, v);
         }
+        // kColumnFamily (200): which CF this edit applies to.
+        if (self.column_family_id) |id| {
+            try coding.putVarint32(buf, gpa, Tag.kColumnFamily);
+            try coding.putVarint32(buf, gpa, id);
+        }
+        // kColumnFamilyAdd (201): create a new CF with this name.
+        if (self.column_family_name) |name| {
+            try coding.putVarint32(buf, gpa, Tag.kColumnFamilyAdd);
+            try coding.putLengthPrefixedSlice(buf, gpa, name);
+        }
+        // kColumnFamilyDrop (202): drop the targeted CF (no payload).
+        if (self.is_column_family_drop) {
+            try coding.putVarint32(buf, gpa, Tag.kColumnFamilyDrop);
+        }
+        // kMaxColumnFamily (203): high-water mark for CF ids.
+        if (self.max_column_family) |max| {
+            try coding.putVarint32(buf, gpa, Tag.kMaxColumnFamily);
+            try coding.putVarint32(buf, gpa, max);
+        }
         // kDeletedFile entries
         for (self.deleted_files.items) |df| {
             try coding.putVarint32(buf, gpa, Tag.kDeletedFile);
@@ -357,6 +418,20 @@ pub const VersionEdit = struct {
                             .largest = largest,
                         },
                     });
+                },
+                Tag.kColumnFamily => {
+                    edit.column_family_id = try coding.getVarint32(&input);
+                },
+                Tag.kColumnFamilyAdd => {
+                    const raw = try coding.getLengthPrefixedSlice(&input);
+                    if (edit.column_family_name) |old| gpa.free(old);
+                    edit.column_family_name = try dupSlice(gpa, raw);
+                },
+                Tag.kColumnFamilyDrop => {
+                    edit.is_column_family_drop = true;
+                },
+                Tag.kMaxColumnFamily => {
+                    edit.max_column_family = try coding.getVarint32(&input);
                 },
                 Tag.kNewFile4 => {
                     const level = try coding.getVarint32(&input);
@@ -551,7 +626,8 @@ test "corruption: truncated length-prefixed string" {
 
 test "corruption: unknown tag" {
     const gpa = std.testing.allocator;
-    // Tag 42 is not defined.
+    // Tag 42 is not defined (known tags: 1-9, 100, 200-203).
+    // Tags in the CF range (200-203) are now handled; 42 is still a corruption.
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(gpa);
     try coding.putVarint32(&buf, gpa, 42);
@@ -671,6 +747,174 @@ test "newfile4: decode rejects unknown non-safe-to-ignore custom field" {
     try coding.putLengthPrefixedSlice(&buf, gpa, &[_]u8{0x01});
 
     try std.testing.expectError(error.Corruption, VersionEdit.decodeFrom(gpa, buf.items));
+}
+
+// ===========================================================================
+// CF lifecycle tags (200-203) tests
+// ===========================================================================
+
+test "cf: golden encode kColumnFamily=200 (id=3) is {0xC8,0x01,0x03}" {
+    const gpa = std.testing.allocator;
+    var edit = VersionEdit.init();
+    defer edit.deinit(gpa);
+    edit.setColumnFamilyId(3);
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(gpa);
+    try edit.encodeTo(&buf, gpa);
+
+    // tag 200 = 0xC8,0x01 (2-byte varint), payload = 0x03
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xC8, 0x01, 0x03 }, buf.items);
+}
+
+test "cf: golden encode kColumnFamilyAdd=201 (name='default')" {
+    const gpa = std.testing.allocator;
+    var edit = VersionEdit.init();
+    defer edit.deinit(gpa);
+    try edit.setColumnFamilyAdd(gpa, "default");
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(gpa);
+    try edit.encodeTo(&buf, gpa);
+
+    // tag 201 = 0xC9,0x01; length-prefixed "default" (7 bytes)
+    var expected: std.ArrayListUnmanaged(u8) = .empty;
+    defer expected.deinit(gpa);
+    try expected.appendSlice(gpa, &[_]u8{ 0xC9, 0x01, 0x07 });
+    try expected.appendSlice(gpa, "default");
+    try std.testing.expectEqualSlices(u8, expected.items, buf.items);
+}
+
+test "cf: golden encode kColumnFamilyDrop=202 (no payload)" {
+    const gpa = std.testing.allocator;
+    var edit = VersionEdit.init();
+    defer edit.deinit(gpa);
+    edit.setColumnFamilyDrop();
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(gpa);
+    try edit.encodeTo(&buf, gpa);
+
+    // tag 202 = 0xCA,0x01; no payload
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xCA, 0x01 }, buf.items);
+}
+
+test "cf: golden encode kMaxColumnFamily=203 (max=5) is {0xCB,0x01,0x05}" {
+    const gpa = std.testing.allocator;
+    var edit = VersionEdit.init();
+    defer edit.deinit(gpa);
+    edit.setMaxColumnFamily(5);
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(gpa);
+    try edit.encodeTo(&buf, gpa);
+
+    // tag 203 = 0xCB,0x01; payload = 0x05
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xCB, 0x01, 0x05 }, buf.items);
+}
+
+test "cf: round-trip kColumnFamily + kColumnFamilyAdd" {
+    const gpa = std.testing.allocator;
+    var edit = VersionEdit.init();
+    defer edit.deinit(gpa);
+    edit.setColumnFamilyId(1);
+    try edit.setColumnFamilyAdd(gpa, "my_cf");
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(gpa);
+    try edit.encodeTo(&buf, gpa);
+
+    var edit2 = try VersionEdit.decodeFrom(gpa, buf.items);
+    defer edit2.deinit(gpa);
+
+    try std.testing.expectEqual(@as(?u32, 1), edit2.column_family_id);
+    try std.testing.expectEqualStrings("my_cf", edit2.column_family_name.?);
+    try std.testing.expect(!edit2.is_column_family_drop);
+    try std.testing.expect(edit2.max_column_family == null);
+}
+
+test "cf: round-trip kColumnFamily + kColumnFamilyDrop" {
+    const gpa = std.testing.allocator;
+    var edit = VersionEdit.init();
+    defer edit.deinit(gpa);
+    edit.setColumnFamilyId(2);
+    edit.setColumnFamilyDrop();
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(gpa);
+    try edit.encodeTo(&buf, gpa);
+
+    var edit2 = try VersionEdit.decodeFrom(gpa, buf.items);
+    defer edit2.deinit(gpa);
+
+    try std.testing.expectEqual(@as(?u32, 2), edit2.column_family_id);
+    try std.testing.expect(edit2.is_column_family_drop);
+    try std.testing.expect(edit2.column_family_name == null);
+}
+
+test "cf: round-trip kMaxColumnFamily" {
+    const gpa = std.testing.allocator;
+    var edit = VersionEdit.init();
+    defer edit.deinit(gpa);
+    edit.setMaxColumnFamily(7);
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(gpa);
+    try edit.encodeTo(&buf, gpa);
+
+    var edit2 = try VersionEdit.decodeFrom(gpa, buf.items);
+    defer edit2.deinit(gpa);
+
+    try std.testing.expectEqual(@as(?u32, 7), edit2.max_column_family);
+}
+
+test "cf: all four CF tags together round-trip" {
+    const gpa = std.testing.allocator;
+    var edit = VersionEdit.init();
+    defer edit.deinit(gpa);
+    edit.setColumnFamilyId(3);
+    try edit.setColumnFamilyAdd(gpa, "write_cf");
+    // Note: adding both Add and Drop in one edit is unusual but tests decode coverage.
+    edit.setMaxColumnFamily(10);
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(gpa);
+    try edit.encodeTo(&buf, gpa);
+
+    var edit2 = try VersionEdit.decodeFrom(gpa, buf.items);
+    defer edit2.deinit(gpa);
+
+    try std.testing.expectEqual(@as(?u32, 3), edit2.column_family_id);
+    try std.testing.expectEqualStrings("write_cf", edit2.column_family_name.?);
+    try std.testing.expect(!edit2.is_column_family_drop);
+    try std.testing.expectEqual(@as(?u32, 10), edit2.max_column_family);
+}
+
+test "cf: CF tags coexist with regular edit fields" {
+    const gpa = std.testing.allocator;
+    var edit = VersionEdit.init();
+    defer edit.deinit(gpa);
+
+    try edit.setComparatorName(gpa, "leveldb.BytewiseComparator");
+    edit.setLogNumber(7);
+    edit.setNextFileNumber(20);
+    edit.setColumnFamilyId(0);
+    try edit.setColumnFamilyAdd(gpa, "default");
+    edit.setMaxColumnFamily(1);
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(gpa);
+    try edit.encodeTo(&buf, gpa);
+
+    var edit2 = try VersionEdit.decodeFrom(gpa, buf.items);
+    defer edit2.deinit(gpa);
+
+    try std.testing.expectEqualStrings("leveldb.BytewiseComparator", edit2.comparator_name.?);
+    try std.testing.expectEqual(@as(u64, 7), edit2.log_number.?);
+    try std.testing.expectEqual(@as(u64, 20), edit2.next_file_number.?);
+    try std.testing.expectEqual(@as(?u32, 0), edit2.column_family_id);
+    try std.testing.expectEqualStrings("default", edit2.column_family_name.?);
+    try std.testing.expectEqual(@as(?u32, 1), edit2.max_column_family);
 }
 
 test "newfile4 and newfile (v7) coexist; default seqnos are zero" {
