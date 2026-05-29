@@ -160,6 +160,10 @@ pub const DB = struct {
     /// the cancelable `lock`; the void-returning `close`/`releaseSnapshot` cannot
     /// propagate `error.Canceled`, so they use `lockUncancelable`.
     write_mutex: std.Io.Mutex = .init,
+    /// D2a-3 diagnostic counter: number of compaction BUILD phases that ran on
+    /// the background worker (`io.concurrent`).  Used by tests to confirm
+    /// compaction actually backgrounds; not load-bearing for correctness.
+    bg_compactions: u64 = 0,
 
     /// Open a DB rooted at directory `name` on `e`, recovering durable state.
     ///
@@ -184,6 +188,7 @@ pub const DB = struct {
         // the field's default initializer is NOT applied; set it explicitly.
         self.io = e.io();
         self.write_mutex = .init;
+        self.bg_compactions = 0;
         self.options = options;
         self.last_sequence = 0;
         self.owns_wal = true;
@@ -321,6 +326,7 @@ pub const DB = struct {
         self.env = e;
         self.io = e.io();
         self.write_mutex = .init;
+        self.bg_compactions = 0;
         self.options = options;
         self.last_sequence = 0;
         self.owns_wal = false;
@@ -558,19 +564,7 @@ pub const DB = struct {
                     )) orelse break;
                     defer c.deinit(self.gpa);
 
-                    try compaction.doCompaction(
-                        self.gpa,
-                        self.env,
-                        self.name,
-                        self.options,
-                        self.ikcmp.comparatorInterface(),
-                        self.options.comparator,
-                        self.versions,
-                        &self.table_cache,
-                        &c,
-                        smallest_snapshot,
-                        has_live_snapshot,
-                    );
+                    try self.runCompaction(&c, smallest_snapshot, has_live_snapshot);
                 }
             },
             .universal => {
@@ -582,19 +576,7 @@ pub const DB = struct {
                     )) orelse break;
                     defer c.deinit(self.gpa);
 
-                    try compaction.doCompaction(
-                        self.gpa,
-                        self.env,
-                        self.name,
-                        self.options,
-                        self.ikcmp.comparatorInterface(),
-                        self.options.comparator,
-                        self.versions,
-                        &self.table_cache,
-                        &c,
-                        smallest_snapshot,
-                        has_live_snapshot,
-                    );
+                    try self.runCompaction(&c, smallest_snapshot, has_live_snapshot);
                 }
             },
             .fifo => {
@@ -611,6 +593,106 @@ pub const DB = struct {
                 }
             },
         }
+    }
+
+    /// Run ONE picked compaction (D2a-3): the heavy merge/output-SST BUILD phase
+    /// runs on a BACKGROUND worker (`io.concurrent`), then the foreground COMMITS
+    /// the result to the VersionSet (`logAndApply` + obsolete-file reclaim).
+    ///
+    /// The caller holds the DB write mutex, which — together with the
+    /// single-flush + single-compact + flush-then-compact sequencing — makes the
+    /// single-writer-MANIFEST invariant explicit (roadmap hazard (c)):
+    ///   * SINGLE-FLUSH: `maybeFlush` keeps at most one flush in flight and DRAINS
+    ///     it (`awaitFlush`, which commits to the MANIFEST) before returning.
+    ///   * FLUSH-THEN-COMPACT: `write`/`applyBatchNoWal` call `maybeFlush` (which
+    ///     drains the flush) BEFORE `maybeScheduleCompaction`, so no flush commit
+    ///     can interleave with a compaction commit.
+    ///   * SINGLE-COMPACT: this helper builds AND commits one compaction before
+    ///     the loop picks the next, so two compactions never run concurrently.
+    /// Thus while the build worker runs, the foreground (the sole other potential
+    /// VersionSet writer) is blocked here in `await`, and `logAndApply` is only
+    /// ever called from the foreground — the MANIFEST has a single writer.
+    ///
+    /// The build worker numbers its outputs via `versions.newFileNumber` (a
+    /// counter bump only); the sequencing above guarantees it is the lone
+    /// VersionSet accessor during the build, so that is not a data race.  If the
+    /// concurrency primitive is unavailable, the build runs inline (correctness
+    /// over backgrounding), still through the same build→commit split.
+    fn runCompaction(
+        self: *DB,
+        c: *compaction.Compaction,
+        smallest_snapshot: u64,
+        has_live_snapshot: bool,
+    ) !void {
+        const args = .{
+            self.gpa,
+            self.env,
+            @as([]const u8, self.name),
+            self.options,
+            self.ikcmp.comparatorInterface(),
+            self.options.comparator,
+            self.versions,
+            c,
+            smallest_snapshot,
+            has_live_snapshot,
+        };
+
+        // Launch the BUILD phase on a concurrent worker fiber; fall back to an
+        // inline build (resolved future) when concurrency is unavailable.
+        var fut: std.Io.Future(compaction.BuildError!compaction.CompactionBuildResult) = blk: {
+            if (std.Io.concurrent(self.io, compactionBuildWorker, args)) |f| {
+                self.bg_compactions += 1;
+                break :blk f;
+            } else |_| {
+                const res = @call(.auto, compactionBuildWorker, args);
+                break :blk .{ .any_future = null, .result = res };
+            }
+        };
+
+        // Await the build on the foreground (we still hold the write mutex), then
+        // commit it to the VersionSet single-writer.
+        var result = try fut.await(self.io);
+        errdefer result.deinit(self.gpa);
+        try compaction.commitCompaction(
+            self.gpa,
+            self.env,
+            self.name,
+            self.versions,
+            &self.table_cache,
+            c,
+            &result,
+        );
+    }
+
+    /// The background compaction BUILD phase (D2a-3): runs on a concurrent fiber
+    /// and produces the output SSTs' metadata.  Touches only the allocator + Env
+    /// filesystem + a private table cache + `versions.newFileNumber` (a counter
+    /// bump) — never the MANIFEST/Version (the foreground commits via
+    /// `commitCompaction`).  See `runCompaction` for the sequencing invariant.
+    fn compactionBuildWorker(
+        gpa: std.mem.Allocator,
+        e: env.Env,
+        dbname: []const u8,
+        options: Options,
+        ikc: comparator.Comparator,
+        user_cmp: comparator.Comparator,
+        versions: *version_set.VersionSet,
+        c: *compaction.Compaction,
+        smallest_snapshot: u64,
+        has_live_snapshot: bool,
+    ) compaction.BuildError!compaction.CompactionBuildResult {
+        return compaction.buildCompaction(
+            gpa,
+            e,
+            dbname,
+            options,
+            ikc,
+            user_cmp,
+            versions,
+            c,
+            smallest_snapshot,
+            has_live_snapshot,
+        );
     }
 
     /// If the live memtable has exceeded `write_buffer_size`, rotate it out and

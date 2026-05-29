@@ -431,6 +431,13 @@ const Output = struct {
 ///
 /// The build either commits its outputs (via `commitCompaction`, which consumes
 /// them) or, on an error / abandonment path, frees them via `deinit`.
+/// Error set the compaction BUILD phase can yield (D2a-3).  Kept as `anyerror`
+/// for the same reason as `FlushBuildError`: the build touches the allocator,
+/// the Env filesystem, the table builder, and the merging iterator, whose
+/// combined error sets are broad; the foreground re-raises whatever the worker
+/// returned, so no information is lost.
+pub const BuildError = anyerror;
+
 pub const CompactionBuildResult = struct {
     outputs: std.ArrayListUnmanaged(Output),
     /// True iff the outputs were seeded with surviving range tombstones, so the
@@ -519,7 +526,7 @@ pub fn buildCompaction(
     compaction: *Compaction,
     smallest_snapshot: u64,
     has_live_snapshot: bool,
-) !CompactionBuildResult {
+) BuildError!CompactionBuildResult {
     // --- 1. Build child iterators over every input file --------------------
     var children: std.ArrayListUnmanaged(iterator.Iterator) = .empty;
     // On any error before the merger takes ownership, tear the children down.
