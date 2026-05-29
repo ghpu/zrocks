@@ -81,6 +81,7 @@ pub const Version = struct {
             .largest = l,
             .smallest_seqno = meta.smallest_seqno,
             .largest_seqno = meta.largest_seqno,
+            .has_range_tombstones = meta.has_range_tombstones,
         });
     }
 

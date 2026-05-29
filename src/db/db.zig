@@ -680,11 +680,41 @@ pub const DB = struct {
     /// `key`, or 0 if none.  Builds the snapshot-scoped aggregator (live MemTable
     /// + imm + every SST's range-del block) and folds its covering tombstones
     /// into one effective deletion sequence.
+    /// D3a-M1 fast path: skip the aggregator entirely when no source carries any
+    /// range tombstone.
     /// TODO(perf): prune by file key-range overlap; cache per-Version aggregation.
     fn maxCoveringTombstoneSeq(self: *DB, key: []const u8, snapshot: u64) !u64 {
+        if (!self.hasAnyRangeTombstones()) return 0;
         var agg = try self.buildRangeAggregator(self.gpa, snapshot);
         defer agg.deinit();
         return agg.maxCoveringSeq(key, snapshot, self.options.comparator);
+    }
+
+    /// Fast pre-check: returns true iff at least one of {live MemTable, immutable
+    /// MemTable, current Version's SST files} carries at least one range tombstone
+    /// visible at ANY snapshot.  A `false` result means the range-tombstone
+    /// aggregator will always be empty, so it can be skipped entirely.
+    ///
+    /// D3a-M1 guard.  Correctness note: SST files use a conservative
+    /// `has_range_tombstones = true` default (set at flush time to the actual
+    /// value; after MANIFEST recovery the field defaults to `true`), so this
+    /// never produces a false negative — it may produce a false positive (causing
+    /// a wasted aggregator build), but never incorrectly skips a real tombstone.
+    pub fn hasAnyRangeTombstones(self: *const DB) bool {
+        // 1. Live MemTable.
+        if (!self.mem.range_tombstones.isEmpty()) return true;
+        // 2. Immutable MemTable being flushed (if any).
+        if (self.imm) |imm| {
+            if (!imm.range_tombstones.isEmpty()) return true;
+        }
+        // 3. Every SST file in the current Version.
+        const v = self.versions.currentVersion();
+        for (&v.files) |level| {
+            for (level.items) |f| {
+                if (f.has_range_tombstones) return true;
+            }
+        }
+        return false;
     }
 
     /// Merge-aware point lookup (M7.1).  Builds an internal MergingIterator over
@@ -797,7 +827,10 @@ pub const DB = struct {
         // M7.5: a snapshot-scoped range-tombstone aggregator so the scan skips
         // any surfaced user key whose value is covered by a visible tombstone.
         // The DBIterator owns it (deinits + frees it).
-        {
+        // D3a-M1 fast path: skip building the aggregator when no source carries
+        // any range tombstone — `range_aggregator` stays null and the DBIterator
+        // treats a null aggregator as "no tombstones, nothing hidden".
+        if (self.hasAnyRangeTombstones()) {
             const agg = try gpa.create(delete_range.RangeTombstoneList);
             errdefer gpa.destroy(agg);
             agg.* = try self.buildRangeAggregator(gpa, seq);
@@ -2566,5 +2599,132 @@ test "gc3-wal: reopen recovers correctly after old log deleted" {
             defer gpa.free(got);
             try testing.expectEqualStrings("gamma", got);
         }
+    }
+}
+
+// ===========================================================================
+// D3a-M1 — range-tombstone guard (fast path when no tombstones exist).
+// ===========================================================================
+
+test "rangetomb-guard: no-tombstone fast path — get and newIterator skip aggregator build" {
+    // This test verifies the D3a-M1 optimisation: when no range tombstones exist
+    // in any source (memtable, imm, SST files), DB.hasAnyRangeTombstones returns
+    // false, and neither get() nor newIterator() build a RangeTombstoneList.
+    // Correctness is unchanged: all gets and scans return the right values.
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    // Use a tiny write buffer so flushes fire and SSTs are produced — the guard
+    // must remain correct even when SST files are present (but carry no tombstones).
+    const db = try DB.open(gpa, e, "rtGuardDb", .{ .write_buffer_size = 64 });
+    defer db.close();
+
+    // No tombstones yet: fast path must be taken (no-op, no aggregator).
+    try testing.expect(!db.hasAnyRangeTombstones());
+
+    // Write several keys and trigger multiple flushes.
+    try db.put(.{}, "a", "av");
+    try db.put(.{}, "b", "bv");
+    try db.put(.{}, "c", "cv");
+    try db.put(.{}, "d", "dv");
+    try db.put(.{}, "e", "ev");
+    // Force at least one flush by writing a large value.
+    var big: [128]u8 = undefined;
+    @memset(&big, 'x');
+    try db.put(.{}, "big", &big);
+
+    // Point lookups via the fast path (no aggregator build).
+    try testing.expect(!db.hasAnyRangeTombstones());
+    {
+        const got = try db.get(.{}, "a") orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings("av", got);
+    }
+    {
+        const got = try db.get(.{}, "c") orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings("cv", got);
+    }
+    try testing.expect((try db.get(.{}, "missing")) == null);
+
+    // Scan via the fast path (range_aggregator stays null in the DBIterator).
+    {
+        var it = try db.newIterator(gpa, .{});
+        defer it.deinit();
+        // The iterator must have no aggregator (null pointer = fast path taken).
+        try testing.expect(it.range_aggregator == null);
+        var seen: usize = 0;
+        it.seekToFirst();
+        while (it.valid()) : (it.next()) seen += 1;
+        // At least the 5 puts above must all be visible.
+        try testing.expect(seen >= 5);
+        try testing.expect(it.status() == null);
+    }
+
+    // Now introduce a range tombstone: the fast path must no longer be taken.
+    try db.deleteRange(.{}, "b", "d"); // hides b, c
+    try testing.expect(db.hasAnyRangeTombstones());
+
+    // Correctness: get + scan must respect the tombstone even after the guard
+    // transitions from fast to slow path.
+    try testing.expect((try db.get(.{}, "b")) == null);
+    try testing.expect((try db.get(.{}, "c")) == null);
+    {
+        const got = try db.get(.{}, "a") orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings("av", got);
+    }
+    {
+        const got = try db.get(.{}, "d") orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings("dv", got);
+    }
+    {
+        var it = try db.newIterator(gpa, .{});
+        defer it.deinit();
+        // Aggregator must now be set (slow path taken).
+        try testing.expect(it.range_aggregator != null);
+    }
+}
+
+test "rangetomb-guard: fast path with flushed SSTs — hasAnyRangeTombstones false" {
+    // After flushing a tombstone-free memtable, the produced SST's
+    // has_range_tombstones flag is false.  hasAnyRangeTombstones must return
+    // false even when SST files exist.
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    // Force flushes by using a minimal write buffer.
+    const db = try DB.open(gpa, e, "rtGuardSstDb", .{ .write_buffer_size = 1 });
+    defer db.close();
+
+    try db.put(.{}, "x", "xv");
+    try db.put(.{}, "y", "yv"); // triggers flush of {x}
+    try db.put(.{}, "z", "zv"); // triggers flush of {y}
+
+    // At least one SST must exist.
+    try testing.expect(totalSSTFiles(db) >= 1);
+    // But no tombstones anywhere — fast path must hold.
+    try testing.expect(!db.hasAnyRangeTombstones());
+
+    // All values must still be readable.
+    {
+        const got = try db.get(.{}, "x") orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings("xv", got);
+    }
+    {
+        const got = try db.get(.{}, "y") orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings("yv", got);
+    }
+    {
+        const got = try db.get(.{}, "z") orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings("zv", got);
     }
 }
