@@ -139,6 +139,8 @@ pub fn pickCompaction(
             .file_size = first.file_size,
             .smallest = try gpa.dupe(u8, first.smallest),
             .largest = try gpa.dupe(u8, first.largest),
+            .smallest_seqno = first.smallest_seqno,
+            .largest_seqno = first.largest_seqno,
         });
     }
 
@@ -401,6 +403,8 @@ pub fn pickUniversalCompaction(
             .file_size = f.file_size,
             .smallest = try gpa.dupe(u8, f.smallest),
             .largest = try gpa.dupe(u8, f.largest),
+            .smallest_seqno = f.smallest_seqno,
+            .largest_seqno = f.largest_seqno,
         });
     }
 
