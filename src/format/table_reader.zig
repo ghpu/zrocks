@@ -16,14 +16,18 @@
 /// `fixed32_LE(mask(extend(crc(contents), &[compression_type])))`. A mismatch
 /// is reported as `error.Corruption`.
 ///
-/// Optional block cache (M3.5): when a `*cache_mod.Cache` is supplied to
-/// `open`, each block read first consults the cache keyed by
-/// `cache_id (8 bytes LE) ++ handle.offset (8 bytes LE)`. On a hit the cached
-/// contents are duped and returned (skipping the file read + CRC verify); on a
-/// miss the block is read, verified, a COPY is inserted into the cache, and the
-/// owned contents are returned to the caller. Ownership contracts are
-/// unchanged: the caller still owns and frees the returned block contents.
-/// A null cache reproduces the original always-read-the-file behaviour.
+/// Optional block cache (M3.5; zero-copy pinned-handle path): when a
+/// `*cache_mod.Cache` is supplied to `open`, each block read first consults the
+/// cache keyed by `cache_id (8 bytes LE) ++ handle.offset (8 bytes LE)`. On a
+/// HIT the read returns a `BlockContents` that BORROWS the cached buffer behind
+/// a pinned handle (no copy, no file read, no CRC verify); the handle is
+/// released when the `BlockContents` is released (on iterator/handle deinit).
+/// On a MISS the block is read, verified, and the freshly decoded buffer is
+/// inserted into the cache; the returned `BlockContents` then borrows that same
+/// cached buffer behind its pinned insert handle. With a null cache (or when a
+/// best-effort cache insert fails) the `BlockContents` simply OWNS the decoded
+/// buffer and frees it on release — reproducing the original behaviour. Either
+/// way the round-trip bytes are identical; only the ownership/lifetime differs.
 const std = @import("std");
 
 const footer_mod = @import("footer.zig");
@@ -67,13 +71,14 @@ pub const Table = struct {
     /// `options.prefix_extractor`; null reproduces whole-key bloom behaviour.
     prefix_extractor: ?prefix.PrefixExtractor,
 
-    /// Owned contents of the index block (kept resident for its lifetime).
-    index_contents: []u8,
+    /// Contents of the index block (kept resident for the table's lifetime;
+    /// owned outright or pinned in the block cache — released in `deinit`).
+    index_contents: BlockContents,
     index_block: Block,
 
-    /// Owned contents of the filter block, if the table carries one (shared by
-    /// whichever filter format the table was built with).
-    filter_contents: ?[]u8,
+    /// Contents of the filter block, if the table carries one (shared by
+    /// whichever filter format the table was built with; released in `deinit`).
+    filter_contents: ?BlockContents,
     /// Legacy LevelDB block-based filter reader ("filter."++name entry).
     filter_reader: ?FilterBlockReader,
     /// FastLocalBloom full-filter reader ("fullfilter."++name entry).  At most
@@ -118,9 +123,9 @@ pub const Table = struct {
         const footer = try Footer.decodeFrom(&footer_buf);
 
         // ---- Index block ------------------------------------------------
-        const index_contents = try readBlockCached(gpa, file, footer.index_handle, block_cache, cache_id);
-        errdefer gpa.free(index_contents);
-        const index_block = try Block.init(gpa, index_contents);
+        var index_contents = try readBlockCached(gpa, file, footer.index_handle, block_cache, cache_id);
+        errdefer index_contents.release(gpa, block_cache);
+        const index_block = try Block.init(gpa, index_contents.bytes);
 
         var self = Table{
             .gpa = gpa,
@@ -144,14 +149,16 @@ pub const Table = struct {
     }
 
     pub fn deinit(self: *Table) void {
-        if (self.filter_contents) |fc| self.gpa.free(fc);
-        self.gpa.free(self.index_contents);
+        if (self.filter_contents) |*fc| fc.release(self.gpa, self.block_cache);
+        self.index_contents.release(self.gpa, self.block_cache);
         self.* = undefined;
     }
 
     /// Read the block at `handle`, consulting/populating this table's optional
-    /// block cache. Returns OWNED contents the caller frees with `self.gpa`.
-    fn readBlock(self: *Table, handle: BlockHandle) ![]u8 {
+    /// block cache. Returns a `BlockContents` that either owns the decoded
+    /// buffer (no/failed cache) or borrows it behind a pinned cache handle. The
+    /// caller MUST `release` the result with `self.gpa` and `self.block_cache`.
+    fn readBlockContents(self: *Table, handle: BlockHandle) !BlockContents {
         return readBlockCached(self.gpa, self.file, handle, self.block_cache, self.cache_id);
     }
 
@@ -164,9 +171,9 @@ pub const Table = struct {
     /// own `options.filter_mode` is irrelevant here — what is on disk wins, so
     /// reopening a DB with a different mode never misreads old SSTs.
     fn readFilter(self: *Table, metaindex_handle: BlockHandle) !void {
-        const meta_contents = try self.readBlock(metaindex_handle);
-        defer self.gpa.free(meta_contents);
-        const meta_block = try Block.init(self.gpa, meta_contents);
+        var meta_contents = try self.readBlockContents(metaindex_handle);
+        defer meta_contents.release(self.gpa, self.block_cache);
+        const meta_block = try Block.init(self.gpa, meta_contents.bytes);
 
         // The metaindex is built with the BYTEWISE comparator over plain meta
         // keys (NOT internal keys), so it must be searched bytewise — using the
@@ -186,9 +193,9 @@ pub const Table = struct {
             if (it.valid() and comparator.bytewise.compare(it.key(), key_buf.items) == .eq) {
                 var hv: []const u8 = it.value();
                 const filter_handle = try BlockHandle.decodeFrom(&hv);
-                const filter_contents = try self.readBlock(filter_handle);
+                const filter_contents = try self.readBlockContents(filter_handle);
                 self.filter_contents = filter_contents;
-                self.full_filter_reader = FullFilterReader.init(filter_contents);
+                self.full_filter_reader = FullFilterReader.init(filter_contents.bytes);
                 return;
             }
         }
@@ -210,9 +217,9 @@ pub const Table = struct {
 
             var hv: []const u8 = it.value();
             const filter_handle = try BlockHandle.decodeFrom(&hv);
-            const filter_contents = try self.readBlock(filter_handle);
+            const filter_contents = try self.readBlockContents(filter_handle);
             self.filter_contents = filter_contents;
-            self.filter_reader = FilterBlockReader.init(self.policy, filter_contents);
+            self.filter_reader = FilterBlockReader.init(self.policy, filter_contents.bytes);
         }
     }
 
@@ -221,9 +228,9 @@ pub const Table = struct {
     /// initialized `RangeTombstoneList` the CALLER OWNS (must `deinit`); an empty
     /// list when the table carries no range-del block.
     pub fn rangeTombstones(self: *Table, gpa: std.mem.Allocator) !delete_range.RangeTombstoneList {
-        const meta_contents = try self.readBlock(self.metaindex_handle);
-        defer self.gpa.free(meta_contents);
-        const meta_block = try Block.init(self.gpa, meta_contents);
+        var meta_contents = try self.readBlockContents(self.metaindex_handle);
+        defer meta_contents.release(self.gpa, self.block_cache);
+        const meta_block = try Block.init(self.gpa, meta_contents.bytes);
 
         // Metaindex keys are plain bytewise meta keys; search bytewise.
         var it = meta_block.iterator(comparator.bytewise);
@@ -236,9 +243,9 @@ pub const Table = struct {
 
         var hv: []const u8 = it.value();
         const handle = try BlockHandle.decodeFrom(&hv);
-        const rd_contents = try self.readBlock(handle);
-        defer self.gpa.free(rd_contents);
-        return delete_range.RangeTombstoneList.decode(gpa, rd_contents);
+        var rd_contents = try self.readBlockContents(handle);
+        defer rd_contents.release(self.gpa, self.block_cache);
+        return delete_range.RangeTombstoneList.decode(gpa, rd_contents.bytes);
     }
 
     /// Point lookup. Returns a freshly allocated copy of the value (caller owns
@@ -285,9 +292,9 @@ pub const Table = struct {
             }
         }
 
-        const data_contents = try self.readBlock(handle);
-        defer self.gpa.free(data_contents);
-        const data_block = try Block.init(self.gpa, data_contents);
+        var data_contents = try self.readBlockContents(handle);
+        defer data_contents.release(self.gpa, self.block_cache);
+        const data_block = try Block.init(self.gpa, data_contents.bytes);
         var it = data_block.iterator(self.comparator);
         defer it.deinit();
         it.seek(key);
@@ -313,8 +320,9 @@ pub const Table = struct {
         gpa: std.mem.Allocator,
         /// Outer iterator over the index block.
         index_it: Block.Iter,
-        /// Owned contents of the current data block (null when not positioned).
-        data_contents: ?[]u8,
+        /// Contents of the current data block (null when not positioned); owned
+        /// outright or pinned in the block cache, released via `releaseData`.
+        data_contents: ?BlockContents,
         /// Parsed current data block (valid while data_contents != null).
         data_block: Block,
         /// Inner iterator over the current data block.
@@ -346,8 +354,8 @@ pub const Table = struct {
                 di.deinit();
                 self.data_it = null;
             }
-            if (self.data_contents) |dc| {
-                self.gpa.free(dc);
+            if (self.data_contents) |*dc| {
+                dc.release(self.table.gpa, self.table.block_cache);
                 self.data_contents = null;
             }
         }
@@ -361,17 +369,16 @@ pub const Table = struct {
                 self.err = e;
                 return;
             };
-            const contents = self.table.readBlock(handle) catch |e| {
+            var contents = self.table.readBlockContents(handle) catch |e| {
                 self.err = e;
+                return;
+            };
+            self.data_block = Block.init(self.table.gpa, contents.bytes) catch |e| {
+                self.err = e;
+                contents.release(self.table.gpa, self.table.block_cache);
                 return;
             };
             self.data_contents = contents;
-            self.data_block = Block.init(self.table.gpa, contents) catch |e| {
-                self.err = e;
-                self.gpa.free(contents);
-                self.data_contents = null;
-                return;
-            };
             self.data_it = self.data_block.iterator(self.table.comparator);
         }
 
@@ -469,41 +476,68 @@ fn blockCacheKey(cache_id: u64, offset: u64) [16]u8 {
     return key;
 }
 
+/// Decoded contents of one block, plus the ownership token needed to release
+/// them. `bytes` is always the (decompressed) block payload to parse; the
+/// `owner` variant says how to free/release it:
+///   - `.owned`: a `gpa.alloc`'d buffer this struct must `gpa.free` (no cache,
+///     or a best-effort cache insert that failed);
+///   - `.pinned`: a cache-owned buffer borrowed behind a pinned handle that
+///     this struct must `cache.release` (zero-copy hit OR post-insert handle).
+/// Callers MUST call `release` exactly once with the same gpa/cache used to
+/// produce the contents.
+pub const BlockContents = struct {
+    bytes: []const u8,
+    owner: union(enum) {
+        owned: []u8,
+        pinned: *cache_mod.Cache.Handle,
+    },
+
+    pub fn release(self: *BlockContents, gpa: std.mem.Allocator, block_cache: ?*cache_mod.Cache) void {
+        switch (self.owner) {
+            .owned => |buf| gpa.free(buf),
+            .pinned => |h| block_cache.?.release(h),
+        }
+        self.* = undefined;
+    }
+};
+
 /// Read the block at `handle` (contents + 5-byte trailer), verify the trailer's
-/// compression type and masked crc32c, and return an OWNED copy of the contents
-/// (caller frees with `gpa`). When `block_cache` is set this is the
-/// "copy-on-hit" block cache: a HIT dupes the cached contents (skipping the
-/// file read + CRC verify); a MISS reads+verifies, inserts a COPY into the
-/// cache (charge = contents.len), then returns the owned contents as before.
-//
-// TODO(m3.x): zero-copy pinned-handle block cache to avoid the dup on hit.
+/// compression type and masked crc32c, and return a `BlockContents` over the
+/// decoded payload (consolidates the former D3c-1/D3a-M3 dup-on-hit paths).
+///
+/// Zero-copy pinned-handle cache: a HIT pins the cached entry and borrows its
+/// buffer (no copy, no file read, no CRC verify). A MISS reads + verifies, then
+/// inserts the freshly decoded buffer into the cache (the cache TAKES OWNERSHIP)
+/// and borrows it back behind the pinned insert handle — so the returned bytes
+/// and the cached bytes are the SAME memory. With a null cache (or if the
+/// best-effort insert fails) the contents simply own the decoded buffer.
 fn readBlockCached(
     gpa: std.mem.Allocator,
     file: env.RandomAccessFile,
     handle: BlockHandle,
     block_cache: ?*cache_mod.Cache,
     cache_id: u64,
-) ![]u8 {
+) !BlockContents {
     if (block_cache) |bc| {
         const key = blockCacheKey(cache_id, handle.offset);
         if (bc.lookup(&key)) |h| {
-            defer bc.release(h);
-            return gpa.dupe(u8, bc.value(h));
+            // Zero-copy hit: borrow the cached buffer behind the pinned handle.
+            return .{ .bytes = bc.value(h), .owner = .{ .pinned = h } };
         }
     }
 
     const owned = try readBlockRaw(gpa, file, handle);
     if (block_cache) |bc| {
-        // Insert a COPY so the cache and the caller own independent buffers.
-        const copy = gpa.dupe(u8, owned) catch return owned; // cache is best-effort
+        // Hand the decoded buffer to the cache (it takes ownership), then borrow
+        // it back behind the returned pinned handle — no copy on either side.
         const key = blockCacheKey(cache_id, handle.offset);
-        const h = bc.insert(&key, copy, copy.len) catch {
-            gpa.free(copy);
-            return owned;
+        const h = bc.insert(&key, owned, owned.len) catch {
+            // Best-effort: cache full/OOM -> just own the buffer ourselves.
+            return .{ .bytes = owned, .owner = .{ .owned = owned } };
         };
-        bc.release(h); // the cache retains its own reference
+        return .{ .bytes = bc.value(h), .owner = .{ .pinned = h } };
     }
-    return owned;
+    return .{ .bytes = owned, .owner = .{ .owned = owned } };
 }
 
 /// Read the block at `handle` (on-disk payload + 5-byte trailer), verify the
@@ -954,6 +988,63 @@ test "table reader: snappy round-trip through the block cache (hits on reread)" 
         try testing.expectEqualStrings(kv.v, got);
     }
     try testing.expect(cache.hits > hits_before);
+}
+
+test "table reader: cache hit serves the SAME buffer (zero-copy pinned handle)" {
+    const gpa = testing.allocator;
+
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    const opts = options_mod.Options{ .block_size = 200, .block_restart_interval = 4 };
+    const policy = bloom.BloomFilterPolicy.init(10);
+
+    var entries = try makeSortedEntries(gpa, 50);
+    defer freeEntries(gpa, &entries);
+
+    try buildTable(gpa, e, "pin.sst", opts, policy, entries.items);
+
+    const file_size = try e.getFileSize("pin.sst");
+    var cache = cache_mod.Cache.init(gpa, 1 << 20);
+    defer cache.deinit();
+
+    var raf = try e.newRandomAccessFile(gpa, "pin.sst");
+    defer raf.close() catch {};
+    var table = try Table.open(gpa, raf, file_size, opts, policy, &cache, 11);
+    defer table.deinit();
+
+    // First read of a data block: a MISS that inserts into the cache.
+    const handle = blk: {
+        var index_it = table.index_block.iterator(table.comparator);
+        defer index_it.deinit();
+        index_it.seekToFirst();
+        try testing.expect(index_it.valid());
+        var hv: []const u8 = index_it.value();
+        break :blk try BlockHandle.decodeFrom(&hv);
+    };
+
+    // Prime the cache by reading the block once (the bytes are owned/copied out).
+    {
+        var bc = try table.readBlockContents(handle);
+        defer bc.release(table.gpa, table.block_cache);
+        try testing.expect(bc.bytes.len > 0);
+    }
+
+    // Capture the pointer the cache itself stores for this block.
+    const key = blockCacheKey(11, handle.offset);
+    const cached_ptr = blk: {
+        const h = cache.lookup(&key) orelse return error.TestExpectedFound;
+        defer cache.release(h);
+        break :blk cache.value(h).ptr;
+    };
+
+    // A subsequent read is a HIT: it must borrow the SAME buffer, not a copy.
+    {
+        var bc = try table.readBlockContents(handle);
+        defer bc.release(table.gpa, table.block_cache);
+        try testing.expectEqual(cached_ptr, bc.bytes.ptr); // zero-copy: same memory
+    }
 }
 
 // ===========================================================================
