@@ -2898,3 +2898,44 @@ test "compress-perlevel: deeper-level compaction output is compressed, data corr
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// D2a-1 — io capability + write mutex (prerequisite for background workers)
+// ---------------------------------------------------------------------------
+
+test "D2a-1: DB carries an io capability obtained from its Env" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const db = try openTestDB(gpa, &me);
+    defer db.close();
+
+    // The DB holds an `io` capability (used by the write mutex's futex paths
+    // once background workers contend).  It must be the SAME io the Env exposes.
+    try testing.expect(db.io.userdata == me.env().io().userdata);
+    try testing.expect(db.io.vtable == me.env().io().vtable);
+}
+
+test "D2a-1: write mutex serializes the write path; single-thread round-trips" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const db = try openTestDB(gpa, &me);
+    defer db.close();
+
+    // Between writes the mutex is free (no write in flight): tryLock succeeds,
+    // and releasing it leaves writes working normally.
+    try testing.expect(db.write_mutex.tryLock());
+    db.write_mutex.unlock(db.io);
+
+    // Normal single-threaded writes/reads still work with the mutex in place.
+    try db.put(.{}, "k", "v1");
+    try db.put(.{}, "k", "v2");
+    const got = try db.get(.{}, "k") orelse return error.TestExpectedFound;
+    defer gpa.free(got);
+    try testing.expectEqualStrings("v2", got);
+
+    // After the writes complete, the mutex is released again.
+    try testing.expect(db.write_mutex.tryLock());
+    db.write_mutex.unlock(db.io);
+}
