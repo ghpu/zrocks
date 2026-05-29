@@ -799,3 +799,168 @@ fn verifyAll(
         try testing.expectEqual(refs[ci].count(), seen);
     }
 }
+
+// ===========================================================================
+// Shared-MANIFEST invariant tests (D1b-M4)
+// ===========================================================================
+
+const version_edit = @import("../version/version_edit.zig");
+
+/// Read every CF id that appears (via kColumnFamily tag) in the shared
+/// MANIFEST records of `dbroot`.  Returns a set-like AutoHashMap the caller
+/// deinits.  Asserts CURRENT names a MANIFEST that exists.
+fn manifestCfIds(gpa: std.mem.Allocator, e: env.Env, dbroot: []const u8) !std.AutoHashMapUnmanaged(u32, void) {
+    var ids: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    errdefer ids.deinit(gpa);
+
+    const current_path = try filename.currentFileName(gpa, dbroot);
+    defer gpa.free(current_path);
+
+    var sf = try e.newSequentialFile(gpa, current_path);
+    var contents: std.ArrayListUnmanaged(u8) = .empty;
+    defer contents.deinit(gpa);
+    var chunk: [256]u8 = undefined;
+    while (true) {
+        const n = try sf.read(&chunk);
+        if (n == 0) break;
+        try contents.appendSlice(gpa, chunk[0..n]);
+    }
+    sf.close() catch {};
+
+    var basename: []const u8 = contents.items;
+    if (basename.len > 0 and basename[basename.len - 1] == '\n') basename = basename[0 .. basename.len - 1];
+
+    const manifest_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ dbroot, basename });
+    defer gpa.free(manifest_path);
+
+    var msf = try e.newSequentialFile(gpa, manifest_path);
+    defer msf.close() catch {};
+    var reader = log_reader.Reader.init(msf);
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(gpa);
+
+    while (try reader.readRecord(gpa, &scratch)) |record| {
+        var edit = try version_edit.VersionEdit.decodeFrom(gpa, record);
+        defer edit.deinit(gpa);
+        if (edit.column_family_id) |id| try ids.put(gpa, id, {});
+    }
+    return ids;
+}
+
+test "D1b-M4: ONE shared MANIFEST in dbroot, none in CF subdirs" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    // Small write buffer so each CF flushes at least one SST (forcing the
+    // shared MANIFEST/CURRENT to be created via a CF-tagged edit).
+    const opts = Options{ .write_buffer_size = 256 };
+
+    const cdb = try CfDB.open(gpa, e, "cfmanifest", opts);
+    defer cdb.close();
+
+    const users = try cdb.createColumnFamily("users", .{});
+    const orders = try cdb.createColumnFamily("orders", .{});
+
+    var i: usize = 0;
+    var kbuf: [16]u8 = undefined;
+    while (i < 40) : (i += 1) {
+        const k = try std.fmt.bufPrint(&kbuf, "k{d:0>4}", .{i});
+        try cdb.put(.{}, users, k, "uvalue-padding-to-force-flush");
+        try cdb.put(.{}, orders, k, "ovalue-padding-to-force-flush");
+    }
+
+    // The single shared MANIFEST/CURRENT lives in the database root...
+    try testing.expect(e.fileExists("cfmanifest/CURRENT"));
+    // ...and NO per-CF MANIFEST/CURRENT exists under any CF subdirectory
+    // (proves CFs no longer own their own MANIFEST).
+    try testing.expect(!e.fileExists("cfmanifest/users/CURRENT"));
+    try testing.expect(!e.fileExists("cfmanifest/orders/CURRENT"));
+    try testing.expect(!e.fileExists("cfmanifest/default/CURRENT"));
+}
+
+test "D1b-M4: the one MANIFEST carries CF-tagged edits for multiple CFs" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    const opts = Options{ .write_buffer_size = 256 };
+
+    {
+        const cdb = try CfDB.open(gpa, e, "cftagged", opts);
+        defer cdb.close();
+
+        const users = try cdb.createColumnFamily("users", .{}); // id 1
+        const orders = try cdb.createColumnFamily("orders", .{}); // id 2
+
+        var i: usize = 0;
+        var kbuf: [16]u8 = undefined;
+        while (i < 40) : (i += 1) {
+            const k = try std.fmt.bufPrint(&kbuf, "k{d:0>4}", .{i});
+            try cdb.put(.{}, users, k, "padding-value-forces-an-l0-flush");
+            try cdb.put(.{}, orders, k, "padding-value-forces-an-l0-flush");
+        }
+        // Default CF too.
+        const def = cdb.defaultColumnFamily();
+        try cdb.put(.{}, def, "d", "x");
+    }
+
+    // The single MANIFEST must contain CF-tagged records for users (1) and
+    // orders (2) — i.e. distinct CFs share ONE descriptor.
+    var ids = try manifestCfIds(gpa, e, "cftagged");
+    defer ids.deinit(gpa);
+    try testing.expect(ids.contains(1));
+    try testing.expect(ids.contains(2));
+}
+
+test "D1b-M4: SST data for all CFs recovers through the one shared MANIFEST" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    // Tiny buffer so data is flushed to SSTs (recorded ONLY in the shared
+    // MANIFEST, not the WAL — recovery must come from the MANIFEST replay).
+    const opts = Options{ .write_buffer_size = 256 };
+
+    {
+        const cdb = try CfDB.open(gpa, e, "cfsstrec", opts);
+        defer cdb.close();
+        const a = try cdb.createColumnFamily("a", .{});
+        const b = try cdb.createColumnFamily("b", .{});
+
+        var i: usize = 0;
+        var kbuf: [16]u8 = undefined;
+        var vbuf: [40]u8 = undefined;
+        while (i < 50) : (i += 1) {
+            const k = try std.fmt.bufPrint(&kbuf, "k{d:0>4}", .{i});
+            const va = try std.fmt.bufPrint(&vbuf, "a-{d}-padding-padding-padding", .{i});
+            try cdb.put(.{}, a, k, va);
+            const vb = try std.fmt.bufPrint(&vbuf, "b-{d}-padding-padding-padding", .{i});
+            try cdb.put(.{}, b, k, vb);
+        }
+    }
+
+    // Reopen: SST contents for both CFs must come back via the shared MANIFEST.
+    {
+        const cdb = try CfDB.open(gpa, e, "cfsstrec", opts);
+        defer cdb.close();
+        const a = try cdb.columnFamily("a");
+        const b = try cdb.columnFamily("b");
+
+        const va = try cdb.get(.{}, a, "k0000") orelse return error.TestExpectedFound;
+        defer gpa.free(va);
+        try testing.expectEqualStrings("a-0-padding-padding-padding", va);
+
+        const vb = try cdb.get(.{}, b, "k0049") orelse return error.TestExpectedFound;
+        defer gpa.free(vb);
+        try testing.expectEqualStrings("b-49-padding-padding-padding", vb);
+
+        // Cross-CF isolation survives recovery: a's value is not in b.
+        const cross = try cdb.get(.{}, b, "k0000") orelse return error.TestExpectedFound;
+        defer gpa.free(cross);
+        try testing.expectEqualStrings("b-0-padding-padding-padding", cross);
+    }
+}
