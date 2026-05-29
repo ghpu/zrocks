@@ -2622,6 +2622,78 @@ test "M6.1 flush: reopen recovers SST data + unflushed WAL data" {
     }
 }
 
+test "partitioned-idx: DB with two-level index flushes SSTs, get/scan correct, reopen recovers" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    // Two-level index with a tiny metadata_block_size + small write_buffer_size so
+    // each flushed SST carries a partitioned (multi-partition) index.  zrocks's
+    // own clean two-level format (see format/partitioned_index.zig).
+    const opts = options_mod.Options{
+        .write_buffer_size = 512,
+        .index_type = .two_level,
+        .metadata_block_size = 128,
+        .block_size = 128,
+        .block_restart_interval = 2,
+    };
+
+    const N = 120;
+    {
+        const db = try DB.open(gpa, e, "pidxdb", opts);
+        defer db.close();
+        var i: usize = 0;
+        while (i < N) : (i += 1) {
+            var kbuf: [16]u8 = undefined;
+            var vbuf: [24]u8 = undefined;
+            const k = try std.fmt.bufPrint(&kbuf, "key{d:0>5}", .{i});
+            const v = try std.fmt.bufPrint(&vbuf, "val{d:0>5}payload", .{i});
+            try db.put(.{}, k, v);
+        }
+        // At least one SST was flushed (the two-level index path exercised).
+        try testing.expect(totalSSTFiles(db) >= 1);
+
+        // get: every key resolves to its value through the two-level SST index
+        // (and/or the still-resident memtable).
+        i = 0;
+        while (i < N) : (i += 1) {
+            var kbuf: [16]u8 = undefined;
+            var vbuf: [24]u8 = undefined;
+            const k = try std.fmt.bufPrint(&kbuf, "key{d:0>5}", .{i});
+            const want = try std.fmt.bufPrint(&vbuf, "val{d:0>5}payload", .{i});
+            const got = try db.get(.{}, k) orelse return error.TestExpectedFound;
+            defer gpa.free(got);
+            try testing.expectEqualStrings(want, got);
+        }
+
+        // Full scan yields all N keys in sorted order.
+        var it = try db.newIterator(gpa, .{});
+        defer it.deinit();
+        var idx: usize = 0;
+        it.seekToFirst();
+        while (it.valid()) : (it.next()) idx += 1;
+        try testing.expectEqual(@as(usize, N), idx);
+        try testing.expect(it.status() == null);
+    }
+
+    // Reopen: SST (two-level index, auto-detected) + WAL replay reconstruct all.
+    {
+        const db = try DB.open(gpa, e, "pidxdb", opts);
+        defer db.close();
+        var i: usize = 0;
+        while (i < N) : (i += 1) {
+            var kbuf: [16]u8 = undefined;
+            var vbuf: [24]u8 = undefined;
+            const k = try std.fmt.bufPrint(&kbuf, "key{d:0>5}", .{i});
+            const want = try std.fmt.bufPrint(&vbuf, "val{d:0>5}payload", .{i});
+            const got = try db.get(.{}, k) orelse return error.TestExpectedFound;
+            defer gpa.free(got);
+            try testing.expectEqualStrings(want, got);
+        }
+    }
+}
+
 test "M6.1 flush: multiple L0 files merge newest-first" {
     const gpa = testing.allocator;
     var me = MemEnv.init(gpa);
