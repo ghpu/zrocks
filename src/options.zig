@@ -59,6 +59,18 @@ pub const Options = struct {
     block_size: usize = 4096,
     block_restart_interval: u32 = 16,
     compression: CompressionType = .none,
+
+    /// Optional per-level compression override (compress-perlevel).  When set, the
+    /// compression used for an SST is chosen by the level the file lands at:
+    /// `compression_per_level[level]`, clamping any level at-or-beyond the array's
+    /// length to its LAST element (mirrors RocksDB, where the array conventionally
+    /// covers L0..Ln and deeper levels reuse the tail).  This lets shallow levels
+    /// (hot, churned by frequent compaction) stay uncompressed while deeper levels
+    /// (cold, long-lived) are compressed.  When null, every level uses the scalar
+    /// `compression` field.  The caller owns the slice; its lifetime must exceed
+    /// the DB's.  Use `compressionForLevel` to resolve the effective type.
+    compression_per_level: ?[]const CompressionType = null,
+
     max_file_size: usize = 2 * 1024 * 1024,
     level0_file_num_compaction_trigger: u32 = 4,
     level0_slowdown_writes_trigger: u32 = 20,
@@ -128,6 +140,21 @@ pub const Options = struct {
     /// lookup.  The caller owns the `Cache` and must ensure its lifetime exceeds
     /// the DB's.  Default null (no block-cache; each lookup re-reads the block).
     block_cache: ?*Cache = null,
+
+    /// Effective compression type for an SST that lands at `level`.  When a
+    /// non-empty `compression_per_level` is configured, returns
+    /// `compression_per_level[min(level, len-1)]` (levels past the array reuse the
+    /// last element).  Otherwise — no array, or an empty array — falls back to the
+    /// scalar `compression` field.
+    pub fn compressionForLevel(self: Options, level: usize) CompressionType {
+        if (self.compression_per_level) |per_level| {
+            if (per_level.len != 0) {
+                const idx = @min(level, per_level.len - 1);
+                return per_level[idx];
+            }
+        }
+        return self.compression;
+    }
 };
 
 // ---------------------------------------------------------------------------

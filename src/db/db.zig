@@ -2728,3 +2728,139 @@ test "rangetomb-guard: fast path with flushed SSTs — hasAnyRangeTombstones fal
         try testing.expectEqualStrings("zv", got);
     }
 }
+
+// ===========================================================================
+// compress-perlevel — per-level compression chosen by the output level.
+// ===========================================================================
+
+const footer_mod = @import("../format/footer.zig");
+const block_mod = @import("../format/block.zig");
+
+/// Read an entire file from `e` into a freshly allocated buffer (caller frees).
+fn readWholeFile(e: env.Env, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
+    const size = try e.getFileSize(path);
+    const buf = try gpa.alloc(u8, @intCast(size));
+    errdefer gpa.free(buf);
+    var raf = try e.newRandomAccessFile(gpa, path);
+    defer raf.close() catch {};
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = try raf.readAt(total, buf[total..]);
+        if (n == 0) break;
+        total += n;
+    }
+    return buf;
+}
+
+/// Parse an on-disk SST and report whether ANY of its data blocks is stored
+/// Snappy-compressed (trailer byte == kSnappyCompression).  Mirrors the
+/// table_builder mini-reader: footer -> index block -> per-data-block trailer.
+fn sstHasSnappyDataBlock(gpa: std.mem.Allocator, file: []const u8) !bool {
+    const footer = try footer_mod.Footer.decodeFrom(file[file.len - footer_mod.kEncodedLength ..]);
+
+    // Index block is always stored uncompressed (kNoCompression).
+    const ih_start: usize = @intCast(footer.index_handle.offset);
+    const ih_size: usize = @intCast(footer.index_handle.size);
+    const index_contents = file[ih_start .. ih_start + ih_size];
+    const index_block = try block_mod.Block.init(gpa, index_contents);
+
+    // The index block's comparator only affects ordered seeks; a forward scan
+    // works with any comparator, so use bytewise.
+    var it = index_block.iterator(comparator.bytewise);
+    defer it.deinit();
+    it.seekToFirst();
+    while (it.valid()) : (it.next()) {
+        var hv: []const u8 = it.value();
+        const h = try footer_mod.BlockHandle.decodeFrom(&hv);
+        const start: usize = @intCast(h.offset);
+        const size: usize = @intCast(h.size);
+        // trailer[0] (the byte immediately after the block payload) is the
+        // compression type.
+        if (file[start + size] == table_builder.kSnappyCompression) return true;
+    }
+    return false;
+}
+
+test "compress-perlevel: deeper-level compaction output is compressed, data correct + reopen" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    // L0 uncompressed, L1+ Snappy.  Tiny write_buffer forces an L0 file per write
+    // batch; a low L0 trigger forces an L0->L1 compaction whose output lands at
+    // L1 (where the per-level policy selects Snappy).
+    const per_level = [_]options_mod.CompressionType{ .none, .snappy, .snappy };
+    const opts = options_mod.Options{
+        .create_if_missing = true,
+        .compaction_style = .level,
+        .compression_per_level = &per_level,
+        .write_buffer_size = 1,
+        .level0_file_num_compaction_trigger = 2,
+        // Keep base byte budget small so the merged L1 file is not immediately
+        // shoved further down before we can inspect it.
+        .max_bytes_for_level_base = 64 * 1024 * 1024,
+        .target_file_size_base = 64 * 1024 * 1024,
+    };
+
+    const N = 40;
+
+    {
+        const db = try DB.open(gpa, e, "perlevel", opts);
+        defer db.close();
+
+        // Highly compressible values (long runs) so a data block shrinks.
+        var i: usize = 0;
+        while (i < N) : (i += 1) {
+            var kbuf: [16]u8 = undefined;
+            const k = try std.fmt.bufPrint(&kbuf, "key{d:0>5}", .{i});
+            const v = "A" ** 200;
+            try db.put(.{}, k, v);
+        }
+
+        // A compaction must have moved data into L1 (or deeper).
+        const v = db.versions.currentVersion();
+        var deeper_files: usize = 0;
+        var lvl: usize = 1;
+        while (lvl < version_set.kNumLevels) : (lvl += 1) deeper_files += v.files[lvl].items.len;
+        try testing.expect(deeper_files >= 1);
+
+        // Every L1 file's data must be Snappy-compressed on disk.
+        var found_snappy = false;
+        lvl = 1;
+        while (lvl < version_set.kNumLevels) : (lvl += 1) {
+            for (v.files[lvl].items) |f| {
+                const path = try filename.tableFileName(gpa, "perlevel", f.number);
+                defer gpa.free(path);
+                const bytes = try readWholeFile(e, gpa, path);
+                defer gpa.free(bytes);
+                if (try sstHasSnappyDataBlock(gpa, bytes)) found_snappy = true;
+            }
+        }
+        try testing.expect(found_snappy);
+
+        // Data is intact through the compressed path.
+        i = 0;
+        while (i < N) : (i += 1) {
+            var kbuf: [16]u8 = undefined;
+            const k = try std.fmt.bufPrint(&kbuf, "key{d:0>5}", .{i});
+            const got = try db.get(.{}, k) orelse return error.TestExpectedFound;
+            defer gpa.free(got);
+            try testing.expectEqualStrings("A" ** 200, got);
+        }
+    }
+
+    // Reopen: the compressed SSTs decompress correctly on read.
+    {
+        const db = try DB.open(gpa, e, "perlevel", opts);
+        defer db.close();
+        var i: usize = 0;
+        while (i < N) : (i += 1) {
+            var kbuf: [16]u8 = undefined;
+            const k = try std.fmt.bufPrint(&kbuf, "key{d:0>5}", .{i});
+            const got = try db.get(.{}, k) orelse return error.TestExpectedFound;
+            defer gpa.free(got);
+            try testing.expectEqualStrings("A" ** 200, got);
+        }
+    }
+}
