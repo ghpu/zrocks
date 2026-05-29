@@ -56,6 +56,25 @@ pub const CompressionType = enum(u8) {
 /// two formats coexist on disk and an old SST is never misread as a new one.
 pub const FilterMode = enum { block_based, full };
 
+/// SST index on-disk shape (partitioned-idx).  Selects whether the table builder
+/// writes one flat single-level index or a two-level (partitioned) index.
+///   - `.single_level`: the classic LevelDB/RocksDB flat index — ONE index block
+///     whose entries are (separator-key -> data-block handle), pointed at by the
+///     footer.  This is the DEFAULT, so existing on-disk SSTs and every existing
+///     test keep their exact behaviour.
+///   - `.two_level`: a partitioned index — index entries are split across several
+///     INDEX PARTITION blocks plus a TOP-LEVEL index block (last-key-of-partition
+///     -> partition handle), which the footer points at.  A new partition is
+///     started once the current one exceeds `metadata_block_size`.  Reads perform
+///     a 3-level descent (top-index -> partition-index -> data block).
+///
+/// NOTE: this is zrocks's OWN clean two-level index format (see
+/// `format/partitioned_index.zig`), NOT byte-compatible with RocksDB's fv4/fv5
+/// partitioned index.  The reader auto-detects which shape a table carries from a
+/// `"rocksdb.index_type"` meta entry, so the two coexist on disk and a DB can be
+/// reopened with a different `index_type` without misreading old SSTs.
+pub const IndexType = enum { single_level, two_level };
+
 // ---------------------------------------------------------------------------
 // Options — DB-open configuration (capability-based plain value struct)
 // ---------------------------------------------------------------------------
@@ -122,6 +141,18 @@ pub const Options = struct {
     /// reader auto-detects either format from the metaindex regardless of this
     /// setting, so a DB can be reopened with a different mode without breaking.
     filter_mode: FilterMode = .block_based,
+
+    /// SST index shape (partitioned-idx).  Default `.single_level` keeps the
+    /// classic flat index so existing SSTs/tests are unaffected; `.two_level`
+    /// writes a partitioned (two-level) index.  The reader auto-detects either
+    /// shape from the metaindex regardless of this setting.
+    index_type: IndexType = .single_level,
+
+    /// Target byte size of one index PARTITION block under `.two_level`
+    /// (partitioned-idx).  The builder starts a new index partition once the
+    /// current partition's estimated block size reaches this threshold.  Smaller
+    /// values produce more, smaller partitions.  Ignored under `.single_level`.
+    metadata_block_size: usize = 4096,
 
     /// Optional merge operator (M7.1).  When set, `DB.merge(key, operand)`
     /// records a read-modify-write operand that is combined lazily — on read,

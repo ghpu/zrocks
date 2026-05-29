@@ -1226,6 +1226,247 @@ test "M7.5: a table with no range tombstones returns an empty list" {
     try testing.expect(rtl.isEmpty());
 }
 
+// ===========================================================================
+// partitioned-idx — two-level (partitioned) SST index round-trip.
+// zrocks's OWN clean two-level format (see format/partitioned_index.zig), NOT
+// RocksDB byte-exact.  A small metadata_block_size forces MULTIPLE partitions;
+// get/iterate/seek must cross partition boundaries correctly.
+// ===========================================================================
+
+const partitioned_index = @import("partitioned_index.zig");
+
+/// Read the on-disk `rocksdb.index_type` meta tag from a table's metaindex; null
+/// when the entry is absent (a single-level table).
+fn readIndexTypeTag(gpa: std.mem.Allocator, file: []const u8) !?u8 {
+    const footer = try Footer.decodeFrom(file[file.len - footer_mod.kEncodedLength ..]);
+    const mstart: usize = @intCast(footer.metaindex_handle.offset);
+    const msize: usize = @intCast(footer.metaindex_handle.size);
+    const meta_contents = file[mstart .. mstart + msize];
+    const meta_block = try Block.init(gpa, meta_contents);
+    var it = meta_block.iterator(comparator.bytewise);
+    defer it.deinit();
+    it.seek(partitioned_index.kIndexTypeMetaKey);
+    if (!it.valid() or comparator.bytewise.compare(it.key(), partitioned_index.kIndexTypeMetaKey) != .eq) {
+        return null;
+    }
+    const v = it.value();
+    if (v.len != 1) return error.Corruption;
+    return v[0];
+}
+
+/// Verify a two-level SST: the footer's index_handle must be a TOP-LEVEL block
+/// whose entries point at index PARTITION blocks (each itself an index block of
+/// data-block handles).  Returns the number of partitions (top-level entries),
+/// after asserting the on-disk index-type tag is `kTwoLevelTag` and that every
+/// partition block parses with a non-zero entry count.
+fn countIndexPartitions(gpa: std.mem.Allocator, e: env.Env, path: []const u8) !usize {
+    const file = try readAllFile(e, gpa, path);
+    defer gpa.free(file);
+
+    // The on-disk tag must mark this table two-level.
+    const tag = try readIndexTypeTag(gpa, file);
+    try testing.expectEqual(@as(?u8, partitioned_index.kTwoLevelTag), tag);
+
+    const footer = try Footer.decodeFrom(file[file.len - footer_mod.kEncodedLength ..]);
+    const start: usize = @intCast(footer.index_handle.offset);
+    const size: usize = @intCast(footer.index_handle.size);
+    const top_contents = file[start .. start + size];
+    const top_block = try Block.init(gpa, top_contents);
+    var it = top_block.iterator(comparator.bytewise);
+    defer it.deinit();
+    var n: usize = 0;
+    it.seekToFirst();
+    while (it.valid()) : (it.next()) {
+        // Each top-level value is a partition BlockHandle; the partition block
+        // must itself be a parseable index block with >= 1 entry.
+        var hv: []const u8 = it.value();
+        const ph = try BlockHandle.decodeFrom(&hv);
+        const pstart: usize = @intCast(ph.offset);
+        const psize: usize = @intCast(ph.size);
+        const part_block = try Block.init(gpa, file[pstart .. pstart + psize]);
+        var pit = part_block.iterator(comparator.bytewise);
+        defer pit.deinit();
+        var pcount: usize = 0;
+        pit.seekToFirst();
+        while (pit.valid()) : (pit.next()) pcount += 1;
+        try testing.expect(pcount >= 1);
+        n += 1;
+    }
+    return n;
+}
+
+test "partitioned-idx: two-level index round-trips get/scan/seek across MULTIPLE partitions" {
+    const gpa = testing.allocator;
+
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    // Small block_size -> many data blocks -> many index entries; tiny
+    // metadata_block_size (128) -> MULTIPLE index partitions.
+    const opts = options_mod.Options{
+        .block_size = 128,
+        .block_restart_interval = 2,
+        .index_type = .two_level,
+        .metadata_block_size = 128,
+    };
+    const policy = bloom.BloomFilterPolicy.init(10);
+
+    var entries = try makeSortedEntries(gpa, 200);
+    defer freeEntries(gpa, &entries);
+
+    try buildTable(gpa, e, "two.sst", opts, policy, entries.items);
+
+    // MULTIPLE index partitions must have been produced.
+    const n_parts = try countIndexPartitions(gpa, e, "two.sst");
+    try testing.expect(n_parts > 1);
+
+    const file_size = try e.getFileSize("two.sst");
+    var raf = try e.newRandomAccessFile(gpa, "two.sst");
+    defer raf.close() catch {};
+    var table = try Table.open(gpa, raf, file_size, opts, policy, null, 0);
+    defer table.deinit();
+
+    // 1. get: every key round-trips to its exact value (across all partitions).
+    for (entries.items) |kv| {
+        const got = try table.get(gpa, kv.k) orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings(kv.v, got);
+    }
+    // Absent key returns null.
+    {
+        const got = try table.get(gpa, "key99999-absent");
+        if (got) |g| {
+            gpa.free(g);
+            return error.TestExpectedNull;
+        }
+    }
+
+    // 2. full forward scan yields all entries in order.
+    {
+        var it = table.iterator(gpa);
+        defer it.deinit();
+        var idx: usize = 0;
+        it.seekToFirst();
+        while (it.valid()) : (it.next()) {
+            try testing.expect(idx < entries.items.len);
+            try testing.expectEqualStrings(entries.items[idx].k, it.key());
+            try testing.expectEqualStrings(entries.items[idx].v, it.value());
+            idx += 1;
+        }
+        try testing.expectEqual(entries.items.len, idx);
+        try testing.expect(it.status() == null);
+    }
+
+    // 3. seek: present / between / before-first / past-end / exactly-last,
+    //    landing correctly across partition boundaries.
+    {
+        var it = table.iterator(gpa);
+        defer it.deinit();
+
+        // A present key deep in a later partition.
+        it.seek(entries.items[137].k);
+        try testing.expect(it.valid());
+        try testing.expectEqualStrings(entries.items[137].k, it.key());
+        try testing.expectEqualStrings(entries.items[137].v, it.value());
+
+        // Between two keys -> next greater. "key00099x" sorts between 99 and 100.
+        it.seek("key00099x");
+        try testing.expect(it.valid());
+        try testing.expectEqualStrings(entries.items[100].k, it.key());
+
+        // Before first -> first entry.
+        it.seek("");
+        try testing.expect(it.valid());
+        try testing.expectEqualStrings(entries.items[0].k, it.key());
+
+        // Past end -> invalid.
+        it.seek("zzzzzzzz");
+        try testing.expect(!it.valid());
+
+        // Exactly the last key, then next -> invalid.
+        it.seek(entries.items[entries.items.len - 1].k);
+        try testing.expect(it.valid());
+        try testing.expectEqualStrings(entries.items[entries.items.len - 1].k, it.key());
+        it.next();
+        try testing.expect(!it.valid());
+    }
+}
+
+test "partitioned-idx: single small two-level table still well-formed (one partition)" {
+    const gpa = testing.allocator;
+
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    const opts = options_mod.Options{ .index_type = .two_level, .metadata_block_size = 4096 };
+    const policy = bloom.BloomFilterPolicy.init(10);
+
+    const pairs = [_]KV{
+        .{ .k = "alpha", .v = "1" },
+        .{ .k = "beta", .v = "2" },
+        .{ .k = "gamma", .v = "3" },
+    };
+    try buildTable(gpa, e, "twosmall.sst", opts, policy, &pairs);
+
+    const file_size = try e.getFileSize("twosmall.sst");
+    var raf = try e.newRandomAccessFile(gpa, "twosmall.sst");
+    defer raf.close() catch {};
+    var table = try Table.open(gpa, raf, file_size, opts, policy, null, 0);
+    defer table.deinit();
+
+    for (pairs) |p| {
+        const got = try table.get(gpa, p.k) orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings(p.v, got);
+    }
+    var it = table.iterator(gpa);
+    defer it.deinit();
+    var idx: usize = 0;
+    it.seekToFirst();
+    while (it.valid()) : (it.next()) {
+        try testing.expectEqualStrings(pairs[idx].k, it.key());
+        idx += 1;
+    }
+    try testing.expectEqual(pairs.len, idx);
+}
+
+test "partitioned-idx: two-level reader auto-detects regardless of open Options.index_type" {
+    const gpa = testing.allocator;
+
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    const build_opts = options_mod.Options{
+        .block_size = 128,
+        .block_restart_interval = 2,
+        .index_type = .two_level,
+        .metadata_block_size = 128,
+    };
+    const policy = bloom.BloomFilterPolicy.init(10);
+
+    var entries = try makeSortedEntries(gpa, 120);
+    defer freeEntries(gpa, &entries);
+    try buildTable(gpa, e, "auto.sst", build_opts, policy, entries.items);
+
+    // Open with the DEFAULT single_level Options: the reader must still detect the
+    // on-disk two-level index from the metaindex and read every key correctly.
+    const open_opts = options_mod.Options{ .block_size = 128, .block_restart_interval = 2 };
+    const file_size = try e.getFileSize("auto.sst");
+    var raf = try e.newRandomAccessFile(gpa, "auto.sst");
+    defer raf.close() catch {};
+    var table = try Table.open(gpa, raf, file_size, open_opts, policy, null, 0);
+    defer table.deinit();
+
+    for (entries.items) |kv| {
+        const got = try table.get(gpa, kv.k) orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings(kv.v, got);
+    }
+}
+
 test "table reader: optional block cache yields identical results and hits on reread" {
     const gpa = testing.allocator;
 
