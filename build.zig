@@ -74,6 +74,20 @@ pub fn build(b: *std.Build) void {
     });
     const run_integration_tests = b.addRunArtifact(integration_tests);
 
+    // D1c self-consistency interop regression gate (rooted at
+    // tests/interop_selfconsistency_test.zig, importing the "zrocks" module):
+    // locks in the RealEnv path model + kNewFile4 MANIFEST round-trip + a real
+    // on-disk write/reopen/read cycle.
+    const interop_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/interop_selfconsistency_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zrocks", .module = mod }},
+        }),
+    });
+    const run_interop_tests = b.addRunArtifact(interop_tests);
+
     // Bench harness tests (bench_main.zig imports zrocks and has embedded tests).
     const bench_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -88,5 +102,6 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&run_integration_tests.step);
+    test_step.dependOn(&run_interop_tests.step);
     test_step.dependOn(&run_bench_tests.step);
 }
