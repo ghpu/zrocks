@@ -143,6 +143,17 @@ pub const TableBuilder = struct {
     rdb_raw_key_size: u64,
     /// Sum of raw value bytes — the `rocksdb.raw.value.size` property.
     rdb_raw_value_size: u64,
+    /// Count of point-delete entries (kTypeDeletion / kTypeSingleDeletion) added
+    /// — the `rocksdb.deleted.keys` property.
+    rdb_deleted_keys: u64,
+    /// Count of merge-operand entries (kTypeMerge) added — the
+    /// `rocksdb.merge.operands` property.
+    rdb_merge_operands: u64,
+    /// Smallest / largest sequence numbers seen across added internal keys (for
+    /// the `rocksdb.key.smallest.seqno` / `rocksdb.key.largest.seqno` props).
+    /// `rdb_smallest_seqno` starts at max-u64 so the first key initialises it.
+    rdb_smallest_seqno: u64,
+    rdb_largest_seqno: u64,
 
     pub fn init(
         gpa: std.mem.Allocator,
@@ -185,6 +196,10 @@ pub const TableBuilder = struct {
             .rdb_index_handles = .empty,
             .rdb_raw_key_size = 0,
             .rdb_raw_value_size = 0,
+            .rdb_deleted_keys = 0,
+            .rdb_merge_operands = 0,
+            .rdb_smallest_seqno = std.math.maxInt(u64),
+            .rdb_largest_seqno = 0,
         };
     }
 
@@ -254,11 +269,29 @@ pub const TableBuilder = struct {
         try self.last_key.appendSlice(self.gpa, key);
 
         self.num_entries += 1;
-        // rocksdb-write: accumulate raw (uncompressed) key/value byte totals for
-        // the `rocksdb.raw.key.size` / `rocksdb.raw.value.size` properties.
-        if (self.options.sst_output == .rocksdb) {
-            self.rdb_raw_key_size += key.len;
-            self.rdb_raw_value_size += value.len;
+        // Accumulate the RocksDB table-properties statistics unconditionally so
+        // the rocksdb finish path is always complete and correct regardless of
+        // the discriminator (the flip milestone makes that path the only one):
+        //   * raw (uncompressed) key/value byte totals;
+        //   * point-delete / merge-operand counts;
+        //   * the [smallest, largest] sequence-number span.
+        // The seqno/type fields live in the 8-byte internal-key trailer; DB SSTs
+        // are built with internal keys (>= 8 bytes).  Bare-bytewise SSTs (no
+        // trailer) simply contribute no seqno/type stats.
+        self.rdb_raw_key_size += key.len;
+        self.rdb_raw_value_size += value.len;
+        if (key.len >= 8) {
+            const trailer = coding.decodeFixed64(key[key.len - 8 ..][0..8]);
+            const seq = trailer >> 8;
+            if (seq < self.rdb_smallest_seqno) self.rdb_smallest_seqno = seq;
+            if (seq > self.rdb_largest_seqno) self.rdb_largest_seqno = seq;
+            switch (@as(u8, @truncate(trailer))) {
+                @intFromEnum(internal_key.ValueType.deletion),
+                @intFromEnum(internal_key.ValueType.single_deletion),
+                => self.rdb_deleted_keys += 1,
+                @intFromEnum(internal_key.ValueType.merge) => self.rdb_merge_operands += 1,
+                else => {},
+            }
         }
         try self.data_block.add(key, value);
 
@@ -610,15 +643,40 @@ pub const TableBuilder = struct {
             }
         }.go;
 
-        // RocksDB property keys, emitted in ASCENDING bytewise order.  Values
-        // are varint64 unless noted.  These are the minimum a real RocksDB v11
-        // needs to open the file (verified against the verify_open oracle).
+        // RocksDB table-properties keys, emitted in STRICT ASCENDING bytewise
+        // order (the block builder requires sorted keys).  This is the full field
+        // set a real RocksDB v11 SST carries (verified byte-for-byte against the
+        // tests/fixtures/rocksdb fixture written by librocksdb).  Values are
+        // varint64 unless noted.  Fields whose source data zrocks does not track
+        // (timestamps, host/db/session identity, the original file number) are
+        // omitted — RocksDB treats every property as optional on read and opens
+        // the file regardless; what we DO emit is always correct.
+        //
+        // smallest/largest seqno default to 0 when no internal-key trailers were
+        // seen (e.g. a bare-bytewise SST), matching RocksDB's "no seqno" encoding.
+        const smallest_seqno: u64 = if (self.rdb_smallest_seqno == std.math.maxInt(u64)) 0 else self.rdb_smallest_seqno;
+
         // index.type: a 4-byte fixed32 (kBinarySearch == 0) — RocksDB reads it
         // as a raw fixed32, NOT a varint.
         try pb.add("rocksdb.block.based.table.index.type", &[_]u8{ 0, 0, 0, 0 });
+        // whole.key.filtering=1 / prefix.filtering=0: a whole-key (non-prefix)
+        // table.  Stored as a single ASCII '0'/'1' byte, matching RocksDB.
+        try pb.add("rocksdb.block.based.table.prefix.filtering", if (self.options.prefix_extractor != null) "1" else "0");
+        try pb.add("rocksdb.block.based.table.whole.key.filtering", "1");
         try putU64(&pb, &vbuf, self.gpa, "rocksdb.column.family.id", 0);
+        // column.family.name: the default CF (zrocks emits a single shared CF).
+        try pb.add("rocksdb.column.family.name", "default");
         try pb.add("rocksdb.comparator", rocksDbUserComparatorName(self.options.comparator));
+        // compression: zrocks SSTs in the rocksdb path are written uncompressed.
+        try pb.add("rocksdb.compression", "NoCompression");
+        try putU64(&pb, &vbuf, self.gpa, "rocksdb.data.block.restart.interval", self.options.block_restart_interval);
         try putU64(&pb, &vbuf, self.gpa, "rocksdb.data.size", data_size);
+        try putU64(&pb, &vbuf, self.gpa, "rocksdb.deleted.keys", self.rdb_deleted_keys);
+        try putU64(&pb, &vbuf, self.gpa, "rocksdb.filter.size", 0);
+        try putU64(&pb, &vbuf, self.gpa, "rocksdb.fixed.key.length", 0);
+        // format.version: the block-based-table format version (5).
+        try putU64(&pb, &vbuf, self.gpa, "rocksdb.format.version", 5);
+        try putU64(&pb, &vbuf, self.gpa, "rocksdb.index.block.restart.interval", 1);
         // index.key.is.user.key=1: the index separators are USER keys (no seq).
         try putU64(&pb, &vbuf, self.gpa, "rocksdb.index.key.is.user.key", 1);
         try putU64(&pb, &vbuf, self.gpa, "rocksdb.index.size", index_size);
@@ -626,8 +684,19 @@ pub const TableBuilder = struct {
         // path; harmless here because restart_interval=1 makes every index entry
         // a restart, so each stores its full (offset,size) handle anyway.
         try putU64(&pb, &vbuf, self.gpa, "rocksdb.index.value.is.delta.encoded", 1);
+        try putU64(&pb, &vbuf, self.gpa, "rocksdb.key.largest.seqno", self.rdb_largest_seqno);
+        try putU64(&pb, &vbuf, self.gpa, "rocksdb.key.smallest.seqno", smallest_seqno);
+        try putU64(&pb, &vbuf, self.gpa, "rocksdb.merge.operands", self.rdb_merge_operands);
+        // merge.operator name: "nullptr" when none is configured (RocksDB form).
+        try pb.add("rocksdb.merge.operator", "nullptr");
         try putU64(&pb, &vbuf, self.gpa, "rocksdb.num.data.blocks", self.rdb_index_handles.items.len);
         try putU64(&pb, &vbuf, self.gpa, "rocksdb.num.entries", self.num_entries);
+        try putU64(&pb, &vbuf, self.gpa, "rocksdb.num.filter_entries", 0);
+        try putU64(&pb, &vbuf, self.gpa, "rocksdb.num.range-deletions", self.range_tombstones.count());
+        // prefix.extractor.name: the configured extractor's name, or "nullptr".
+        try pb.add("rocksdb.prefix.extractor.name", if (self.options.prefix_extractor) |pe| pe.name() else "nullptr");
+        // property.collectors: none configured — RocksDB encodes this as "[]".
+        try pb.add("rocksdb.property.collectors", "[]");
         try putU64(&pb, &vbuf, self.gpa, "rocksdb.raw.key.size", self.rdb_raw_key_size);
         try putU64(&pb, &vbuf, self.gpa, "rocksdb.raw.value.size", self.rdb_raw_value_size);
 
@@ -1303,17 +1372,64 @@ test "rocksdb-write: SST is RocksDB-form (metaindex has rocksdb.properties, inde
                 try testing.expectEqualStrings(key, it.key());
             }
         };
-        try expect.present(&props_blk, "rocksdb.block.based.table.index.type");
-        try expect.present(&props_blk, "rocksdb.comparator");
-        try expect.present(&props_blk, "rocksdb.index.key.is.user.key");
-        try expect.present(&props_blk, "rocksdb.index.value.is.delta.encoded");
-        try expect.present(&props_blk, "rocksdb.num.entries");
+        // The FULL required field set a real RocksDB v11 SST carries (matches the
+        // tests/fixtures/rocksdb fixture written by librocksdb).
+        const required = [_][]const u8{
+            "rocksdb.block.based.table.index.type",
+            "rocksdb.block.based.table.prefix.filtering",
+            "rocksdb.block.based.table.whole.key.filtering",
+            "rocksdb.column.family.id",
+            "rocksdb.column.family.name",
+            "rocksdb.comparator",
+            "rocksdb.compression",
+            "rocksdb.data.block.restart.interval",
+            "rocksdb.data.size",
+            "rocksdb.deleted.keys",
+            "rocksdb.filter.size",
+            "rocksdb.fixed.key.length",
+            "rocksdb.format.version",
+            "rocksdb.index.block.restart.interval",
+            "rocksdb.index.key.is.user.key",
+            "rocksdb.index.size",
+            "rocksdb.index.value.is.delta.encoded",
+            "rocksdb.key.largest.seqno",
+            "rocksdb.key.smallest.seqno",
+            "rocksdb.merge.operands",
+            "rocksdb.merge.operator",
+            "rocksdb.num.data.blocks",
+            "rocksdb.num.entries",
+            "rocksdb.num.filter_entries",
+            "rocksdb.num.range-deletions",
+            "rocksdb.prefix.extractor.name",
+            "rocksdb.property.collectors",
+            "rocksdb.raw.key.size",
+            "rocksdb.raw.value.size",
+        };
+        for (required) |k| try expect.present(&props_blk, k);
 
         // comparator property records the USER comparator name.
         var cit = props_blk.iterator(comparator.bytewise);
         defer cit.deinit();
         cit.seek("rocksdb.comparator");
         try testing.expectEqualStrings("leveldb.BytewiseComparator", cit.value());
+        // column.family.name + merge.operator carry their RocksDB ASCII forms.
+        cit.seek("rocksdb.column.family.name");
+        try testing.expectEqualStrings("default", cit.value());
+        cit.seek("rocksdb.merge.operator");
+        try testing.expectEqualStrings("nullptr", cit.value());
+        cit.seek("rocksdb.compression");
+        try testing.expectEqualStrings("NoCompression", cit.value());
+        // index.type is a 4-byte fixed32 (kBinarySearch == 0).
+        cit.seek("rocksdb.block.based.table.index.type");
+        try testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 0 }, cit.value());
+        // num.entries == 12 (all 12 keys added).
+        cit.seek("rocksdb.num.entries");
+        var nv: []const u8 = cit.value();
+        try testing.expectEqual(@as(u64, 12), try coding.getVarint64(&nv));
+        // All 12 added keys are kTypeValue -> zero deletes / merges.
+        cit.seek("rocksdb.deleted.keys");
+        var dv: []const u8 = cit.value();
+        try testing.expectEqual(@as(u64, 0), try coding.getVarint64(&dv));
     }
 
     // ---- Index is RocksDB form: user-key separators + bare handles ----
