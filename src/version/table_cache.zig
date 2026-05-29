@@ -141,6 +141,16 @@ pub const TableCache = struct {
         return table.get(self.gpa, key);
     }
 
+    /// Evict the cached entry for `file_number` if present; no-op if not cached.
+    /// Mirrors the `deinit` teardown order: table.deinit → file.close → gpa.destroy.
+    pub fn evict(self: *TableCache, file_number: u64) void {
+        const kv = self.tables.fetchRemove(file_number) orelse return;
+        const entry = kv.value;
+        entry.table.deinit();
+        entry.file.close() catch {};
+        self.gpa.destroy(entry);
+    }
+
     /// Build a generic `iterator.Iterator` over the whole SST `file_number`.
     /// The returned iterator OWNS a heap-allocated adapter wrapping the Table's
     /// own iterator; its `deinit` frees the adapter and tears down the Table
@@ -350,4 +360,114 @@ test "TableCache: get returns the stored value, null for absent" {
     const absent_ikey = try encodeIkey(gpa, "absent", 1, .value);
     defer gpa.free(absent_ikey);
     try testing.expect((try tc.get(9, size, absent_ikey)) == null);
+}
+
+test "TableCache.evict: evict-uncached is a no-op (zero leaks)" {
+    const gpa = testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+    try e.makeDir("db");
+
+    var tc = TableCache.init(gpa, e, "db", .{}, null);
+    defer tc.deinit();
+
+    // Evicting a file that was never cached must be a no-op (no crash, no leak).
+    tc.evict(42);
+    tc.evict(0);
+}
+
+test "TableCache.evict: open two SSTs, evict one, count drops, re-open works" {
+    const gpa = testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+    try e.makeDir("db");
+
+    const policy = bloom.BloomFilterPolicy.init(10);
+
+    const entries1 = [_]IKV{
+        .{ .user = "a", .seq = 1, .t = .value, .v = "va" },
+    };
+    const entries2 = [_]IKV{
+        .{ .user = "b", .seq = 2, .t = .value, .v = "vb" },
+    };
+    try buildSST(gpa, e, "db", 10, policy, &entries1);
+    try buildSST(gpa, e, "db", 11, policy, &entries2);
+
+    const path10 = try filename.tableFileName(gpa, "db", 10);
+    defer gpa.free(path10);
+    const path11 = try filename.tableFileName(gpa, "db", 11);
+    defer gpa.free(path11);
+    const size10 = try e.getFileSize(path10);
+    const size11 = try e.getFileSize(path11);
+
+    var tc = TableCache.init(gpa, e, "db", .{}, null);
+    defer tc.deinit();
+
+    // Open both tables into the cache.
+    _ = try tc.findTable(10, size10);
+    _ = try tc.findTable(11, size11);
+    try testing.expectEqual(@as(usize, 2), tc.tables.count());
+
+    // Evict SST 10; count drops to 1.
+    tc.evict(10);
+    try testing.expectEqual(@as(usize, 1), tc.tables.count());
+
+    // SST 11 is still cached (same pointer as before).
+    const t11a = try tc.findTable(11, size11);
+    const t11b = try tc.findTable(11, size11);
+    try testing.expectEqual(@intFromPtr(t11a), @intFromPtr(t11b));
+
+    // Re-opening SST 10 succeeds (file still exists on disk) and re-caches it.
+    const t10 = try tc.findTable(10, size10);
+    try testing.expectEqual(@as(usize, 2), tc.tables.count());
+
+    // The re-opened table is functional: scan its one entry.
+    var it = try tc.newIterator(gpa, 10, size10);
+    defer it.deinit();
+    it.seekToFirst();
+    try testing.expect(it.valid());
+    try testing.expectEqualStrings("a", internal_key.extractUserKey(it.key()));
+    try testing.expectEqualStrings("va", it.value());
+    it.next();
+    try testing.expect(!it.valid());
+    // Returned pointer is fresh (different from the pre-evict pointer would have been),
+    // but we can verify it's a valid, non-null pointer.
+    try testing.expect(@intFromPtr(t10) != 0);
+}
+
+test "TableCache.evict: evict then deleteFile -> findTable returns FileNotFound" {
+    const gpa = testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+    try e.makeDir("db");
+
+    const policy = bloom.BloomFilterPolicy.init(10);
+
+    const entries = [_]IKV{
+        .{ .user = "x", .seq = 5, .t = .value, .v = "vx" },
+    };
+    try buildSST(gpa, e, "db", 20, policy, &entries);
+
+    const path = try filename.tableFileName(gpa, "db", 20);
+    defer gpa.free(path);
+    const size = try e.getFileSize(path);
+
+    var tc = TableCache.init(gpa, e, "db", .{}, null);
+    defer tc.deinit();
+
+    // Open the table so it's cached.
+    _ = try tc.findTable(20, size);
+    try testing.expectEqual(@as(usize, 1), tc.tables.count());
+
+    // Evict first (releases the file handle), then delete the file.
+    tc.evict(20);
+    try testing.expectEqual(@as(usize, 0), tc.tables.count());
+    try e.deleteFile(path);
+
+    // findTable should now fail because the file is gone.
+    const result = tc.findTable(20, size);
+    try testing.expectError(error.NotFound, result);
 }
