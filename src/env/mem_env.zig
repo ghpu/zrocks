@@ -23,9 +23,23 @@ pub const MemEnv = struct {
     gpa: std.mem.Allocator,
     /// path (owned) -> file contents (owned).
     files: std.StringHashMapUnmanaged([]u8) = .empty,
+    /// Guards `files` (D2a-2).  zrocks once drove a MemEnv strictly
+    /// single-threaded, but the background flush worker now runs the SST build
+    /// on a concurrent fiber while the foreground continues writing the new WAL
+    /// — both touch this map.  A `std.Io.Mutex` keyed off the test runner's
+    /// global `io` serializes the (small, in-memory) map mutations so the
+    /// hashmap's backing store is never corrupted by a data race.  A RealEnv
+    /// needs no equivalent: distinct OS files are independent.
+    mutex: std.Io.Mutex = .init,
 
     pub fn init(gpa: std.mem.Allocator) MemEnv {
         return .{ .gpa = gpa };
+    }
+
+    /// The `io` backing `mutex` (test-runner global in test builds).
+    fn lockIo() std.Io {
+        if (builtin.is_test) return std.testing.io;
+        unreachable; // MemEnv is a test-only double.
     }
 
     pub fn deinit(self: *MemEnv) void {
@@ -47,6 +61,8 @@ pub const MemEnv = struct {
     /// Replace (or create) the contents of `path` with `bytes` (the map takes
     /// ownership of a freshly duped copy of both `path` and `bytes`).
     fn store(self: *MemEnv, path: []const u8, bytes: []const u8) Error!void {
+        self.mutex.lockUncancelable(lockIo());
+        defer self.mutex.unlock(lockIo());
         const gop = try self.files.getOrPut(self.gpa, path);
         if (gop.found_existing) {
             // Reuse the existing key; swap in fresh contents.
@@ -70,8 +86,29 @@ pub const MemEnv = struct {
         }
     }
 
-    fn get(self: *MemEnv, path: []const u8) ?[]u8 {
-        return self.files.get(path);
+    /// A freshly duped copy of `path`'s contents (caller owns + frees), or null
+    /// if absent.  Locks across the lookup + dupe so a concurrent `store` cannot
+    /// free the underlying bytes mid-read (D2a-2).
+    fn dupContents(self: *MemEnv, gpa: std.mem.Allocator, path: []const u8) Error!?[]u8 {
+        self.mutex.lockUncancelable(lockIo());
+        defer self.mutex.unlock(lockIo());
+        const bytes = self.files.get(path) orelse return null;
+        return try gpa.dupe(u8, bytes);
+    }
+
+    /// The size of `path`'s contents, or null if absent (locked).
+    fn sizeOf(self: *MemEnv, path: []const u8) ?u64 {
+        self.mutex.lockUncancelable(lockIo());
+        defer self.mutex.unlock(lockIo());
+        const bytes = self.files.get(path) orelse return null;
+        return bytes.len;
+    }
+
+    /// Whether `path` exists (locked).
+    fn exists(self: *MemEnv, path: []const u8) bool {
+        self.mutex.lockUncancelable(lockIo());
+        defer self.mutex.unlock(lockIo());
+        return self.files.contains(path);
     }
 
     // -- Env vtable ------------------------------------------------------
@@ -122,7 +159,8 @@ pub const MemEnv = struct {
         // committed bytes (if any) so flush/close (which replace the file with
         // `buf.items`) extend rather than truncate.  If the path doesn't exist,
         // create it empty (like newWritableFile).
-        const existing = self.get(path);
+        const existing = try self.dupContents(gpa, path);
+        defer if (existing) |bytes| gpa.free(bytes);
         if (existing == null) try self.store(path, "");
 
         const h = try gpa.create(MemWritable);
@@ -143,27 +181,30 @@ pub const MemEnv = struct {
 
     fn newSequentialFile(ptr: *anyopaque, gpa: std.mem.Allocator, path: []const u8) Error!SequentialFile {
         const self: *MemEnv = @ptrCast(@alignCast(ptr));
-        const contents = self.get(path) orelse return error.NotFound;
+        // Snapshot the contents (locked) so the handle is stable even if the map
+        // mutates; the snapshot is the handle's owned backing store.
+        const snapshot = (try self.dupContents(gpa, path)) orelse return error.NotFound;
+        errdefer gpa.free(snapshot);
         const h = try gpa.create(MemSequential);
         errdefer gpa.destroy(h);
-        // Snapshot the contents so the handle is stable even if the map mutates.
-        const snapshot = try gpa.dupe(u8, contents);
         h.* = .{ .gpa = gpa, .data = snapshot, .pos = 0 };
         return .{ .ptr = h, .vtable = &MemSequential.vtable };
     }
 
     fn newRandomAccessFile(ptr: *anyopaque, gpa: std.mem.Allocator, path: []const u8) Error!RandomAccessFile {
         const self: *MemEnv = @ptrCast(@alignCast(ptr));
-        const contents = self.get(path) orelse return error.NotFound;
+        const snapshot = (try self.dupContents(gpa, path)) orelse return error.NotFound;
+        errdefer gpa.free(snapshot);
         const h = try gpa.create(MemRandom);
         errdefer gpa.destroy(h);
-        const snapshot = try gpa.dupe(u8, contents);
         h.* = .{ .gpa = gpa, .data = snapshot };
         return .{ .ptr = h, .vtable = &MemRandom.vtable };
     }
 
     fn deleteFile(ptr: *anyopaque, path: []const u8) Error!void {
         const self: *MemEnv = @ptrCast(@alignCast(ptr));
+        self.mutex.lockUncancelable(lockIo());
+        defer self.mutex.unlock(lockIo());
         if (self.files.fetchRemove(path)) |kv| {
             self.gpa.free(kv.key);
             self.gpa.free(kv.value);
@@ -174,6 +215,8 @@ pub const MemEnv = struct {
 
     fn renameFile(ptr: *anyopaque, from: []const u8, to: []const u8) Error!void {
         const self: *MemEnv = @ptrCast(@alignCast(ptr));
+        self.mutex.lockUncancelable(lockIo());
+        defer self.mutex.unlock(lockIo());
         const kv = self.files.fetchRemove(from) orelse return error.NotFound;
         // `kv.value` ownership transfers to the destination.  Free any existing
         // destination contents and re-key.
@@ -196,13 +239,12 @@ pub const MemEnv = struct {
 
     fn fileExists(ptr: *anyopaque, path: []const u8) bool {
         const self: *MemEnv = @ptrCast(@alignCast(ptr));
-        return self.files.contains(path);
+        return self.exists(path);
     }
 
     fn getFileSize(ptr: *anyopaque, path: []const u8) Error!u64 {
         const self: *MemEnv = @ptrCast(@alignCast(ptr));
-        const contents = self.get(path) orelse return error.NotFound;
-        return contents.len;
+        return self.sizeOf(path) orelse error.NotFound;
     }
 
     fn makeDir(ptr: *anyopaque, path: []const u8) Error!void {
