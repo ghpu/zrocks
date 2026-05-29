@@ -434,6 +434,7 @@ pub const DB = struct {
                         self.ikcmp.comparatorInterface(),
                         self.options.comparator,
                         self.versions,
+                        &self.table_cache,
                         &c,
                         smallest_snapshot,
                         has_live_snapshot,
@@ -457,6 +458,7 @@ pub const DB = struct {
                         self.ikcmp.comparatorInterface(),
                         self.options.comparator,
                         self.versions,
+                        &self.table_cache,
                         &c,
                         smallest_snapshot,
                         has_live_snapshot,
@@ -467,7 +469,10 @@ pub const DB = struct {
                 while (budget > 0) : (budget -= 1) {
                     const evicted = try compaction.runFifoEviction(
                         self.gpa,
+                        self.env,
+                        self.name,
                         self.versions,
+                        &self.table_cache,
                         self.options.fifo_max_table_files_size,
                     );
                     if (!evicted) break;

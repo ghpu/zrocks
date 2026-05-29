@@ -152,6 +152,39 @@ pub fn pickCompaction(
 }
 
 // ===========================================================================
+// Obsolete-file GC (gc1) — reclaim the .sst inputs a committed edit removed
+// ===========================================================================
+
+/// After a VersionEdit that removes input files has been applied via
+/// `logAndApply`, reclaim those files: evict each from the DB's `table_cache`
+/// (dropping any open handle) and `deleteFile` it from disk.
+///
+/// SAFETY: this is synchronous obsolete-file deletion, sound ONLY while zrocks
+/// is single-threaded.  Once background flush/compaction workers land (D2a) a
+/// concurrent reader could hold a captured handle to a just-removed file, so
+/// this must then become a refcount/pending-deletion queue.  See roadmap D2c.
+///
+/// The DB's `table_cache` must be passed (NOT the per-compaction private cache),
+/// so the entry a reader would re-`findTable` is the one that gets torn down.
+/// Deletion errors (e.g. NotFound when the file was never opened/written) are
+/// swallowed — the file is gone from the Version regardless.
+fn reclaimObsoleteFiles(
+    gpa: std.mem.Allocator,
+    e: env.Env,
+    dbname: []const u8,
+    table_cache: *table_cache_mod.TableCache,
+    edit: *const version_edit.VersionEdit,
+) void {
+    for (edit.deleted_files.items) |df| {
+        // Evict first so no open handle outlives the on-disk file.
+        table_cache.evict(df.number);
+        const path = filename.tableFileName(gpa, dbname, df.number) catch continue;
+        defer gpa.free(path);
+        e.deleteFile(path) catch {};
+    }
+}
+
+// ===========================================================================
 // FIFO compaction (M7.3) — cache-like whole-file eviction of oldest L0 files
 // ===========================================================================
 
@@ -168,7 +201,11 @@ pub fn pickCompaction(
 /// TODO: ttl — only the size-based policy is implemented.
 pub fn runFifoEviction(
     gpa: std.mem.Allocator,
+    e: env.Env,
+    dbname: []const u8,
     versions: *VersionSet,
+    /// The DB's table cache — evicted files are also reclaimed from it (gc1).
+    table_cache: *table_cache_mod.TableCache,
     fifo_max_table_files_size: u64,
 ) !bool {
     const v = versions.currentVersion();
@@ -203,6 +240,8 @@ pub fn runFifoEviction(
     if (evicted == 0) return false;
 
     try versions.logAndApply(&edit);
+    // gc1: reclaim the evicted files from disk and the DB cache.
+    reclaimObsoleteFiles(gpa, e, dbname, table_cache, &edit);
     return true;
 }
 
@@ -387,6 +426,9 @@ pub fn doCompaction(
     ikc: comparator.Comparator,
     user_cmp: comparator.Comparator,
     versions: *VersionSet,
+    /// The DB's table cache — obsolete input files are reclaimed from it (gc1).
+    /// Distinct from the per-compaction private cache `tc` built below.
+    db_table_cache: *table_cache_mod.TableCache,
     compaction: *Compaction,
     smallest_snapshot: u64,
     /// True iff a LIVE snapshot pins `smallest_snapshot` (vs. it merely being the
@@ -680,9 +722,11 @@ pub fn doCompaction(
     }
 
     try versions.logAndApply(&edit);
-    // TODO: delete obsolete input .sst files via an SST file manager.  They are
-    // dropped from the Version here but left on disk so concurrent readers (none
-    // yet) cannot fault.
+    // gc1: now that the new Version is durable, the input .sst files are
+    // obsolete — evict them from the DB cache and delete them from disk.  Sound
+    // only while single-threaded (see reclaimObsoleteFiles); convert to a
+    // pending-deletion queue when background workers land (D2a).
+    reclaimObsoleteFiles(gpa, e, dbname, db_table_cache, &edit);
 }
 
 /// Finish the current output builder: emit the table, capture its metadata into
@@ -1037,6 +1081,16 @@ const DB = db_mod.DB;
 /// Number of files at a given level.
 fn levelFiles(db: *DB, level: usize) usize {
     return db.versions.currentVersion().files[level].items.len;
+}
+
+/// Count `.sst` files physically present in a MemEnv's filesystem map.
+fn sstFilesOnDisk(me: *env.MemEnv) usize {
+    var n: usize = 0;
+    var it = me.files.keyIterator();
+    while (it.next()) |k| {
+        if (std.mem.endsWith(u8, k.*, ".sst")) n += 1;
+    }
+    return n;
 }
 
 test "M6.2: L0 -> L1 merge + dedup keeps latest values" {
@@ -1753,4 +1807,113 @@ test "M7.3: universal merges L0 runs into fewer files, data preserved + reopen" 
         defer db.close();
         try verifyAgainstRef(gpa, db, &ref, key_space);
     }
+}
+
+// --- GC1: obsolete .sst deletion after compaction --------------------------
+
+test "gc1: obsolete input .sst files are deleted from disk after compaction" {
+    const gpa = testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    // Tiny write buffer + low L0 trigger so several flushes produce many L0
+    // files and leveled compaction repeatedly merges them down.  Before GC the
+    // merged input .sst files were dropped from the Version but left on disk;
+    // GC must now physically delete them.
+    {
+        const db = try DB.open(gpa, e, "gc", .{
+            .write_buffer_size = 1,
+            .level0_file_num_compaction_trigger = 2,
+        });
+        defer db.close();
+
+        // Many distinct keys, repeatedly overwriting "hot" so compactions have
+        // obsolete versions to drop.  Each put flushes (write_buffer_size = 1)
+        // and triggers compaction.
+        var i: usize = 0;
+        while (i < 40) : (i += 1) {
+            var kbuf: [8]u8 = undefined;
+            const k = try std.fmt.bufPrint(&kbuf, "k{d:0>4}", .{i});
+            try db.put(.{}, k, "the-quick-brown-fox-value");
+            try db.put(.{}, "hot", k); // overwrite churn -> obsolete versions
+        }
+
+        // The total number of live SST files (across all levels) must equal the
+        // number of .sst files actually on disk — no orphaned obsolete inputs.
+        var live: usize = 0;
+        const v = db.versions.currentVersion();
+        for (&v.files) |level| live += level.items.len;
+
+        const on_disk = sstFilesOnDisk(&me);
+        try testing.expectEqual(live, on_disk);
+
+        // Compaction must have happened (some data pushed below L0), so there
+        // really were obsolete inputs to reclaim.
+        try testing.expect(levelFiles(db, 1) >= 1);
+
+        // Data is intact.
+        {
+            const got = try db.get(.{}, "hot") orelse return error.TestExpectedFound;
+            defer gpa.free(got);
+            try testing.expectEqualStrings("k0039", got);
+        }
+        i = 0;
+        while (i < 40) : (i += 1) {
+            var kbuf: [8]u8 = undefined;
+            const k = try std.fmt.bufPrint(&kbuf, "k{d:0>4}", .{i});
+            const got = try db.get(.{}, k) orelse return error.TestExpectedFound;
+            defer gpa.free(got);
+            try testing.expectEqualStrings("the-quick-brown-fox-value", got);
+        }
+    }
+
+    // Reopen: the surviving (non-obsolete) SSTs are enough to recover all data.
+    {
+        const db = try DB.open(gpa, e, "gc", .{});
+        defer db.close();
+        var i: usize = 0;
+        while (i < 40) : (i += 1) {
+            var kbuf: [8]u8 = undefined;
+            const k = try std.fmt.bufPrint(&kbuf, "k{d:0>4}", .{i});
+            const got = try db.get(.{}, k) orelse return error.TestExpectedFound;
+            defer gpa.free(got);
+            try testing.expectEqualStrings("the-quick-brown-fox-value", got);
+        }
+        const got = try db.get(.{}, "hot") orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings("k0039", got);
+    }
+}
+
+test "gc1: FIFO eviction deletes evicted .sst files from disk" {
+    const gpa = testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    const db = try DB.open(gpa, e, "gcfifo", .{
+        .compaction_style = .fifo,
+        .write_buffer_size = 1,
+        .fifo_max_table_files_size = 1500,
+    });
+    defer db.close();
+
+    var i: usize = 0;
+    while (i < 30) : (i += 1) {
+        var kbuf: [8]u8 = undefined;
+        const k = try std.fmt.bufPrint(&kbuf, "k{d:0>4}", .{i});
+        try db.put(.{}, k, "value-padding-to-grow-the-sst-files");
+    }
+
+    // The Version's live L0 file count must match the .sst files on disk: FIFO
+    // eviction must physically delete the dropped files, not just unlink them
+    // from the Version.
+    const live = levelFiles(db, 0);
+    try testing.expectEqual(live, sstFilesOnDisk(&me));
+
+    // The newest key is still present.
+    const got = try db.get(.{}, "k0029") orelse return error.TestExpectedFound;
+    defer gpa.free(got);
+    try testing.expectEqualStrings("value-padding-to-grow-the-sst-files", got);
 }
