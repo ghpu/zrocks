@@ -843,11 +843,31 @@ pub const DB = struct {
     /// a time), which combined with the foreground-only `commitFlush` upholds the
     /// single-flush MANIFEST invariant.
     fn maybeFlush(self: *DB) !void {
+        return self.maybeFlushForced(false);
+    }
+
+    /// Force-flush the active memtable to an L0 SST, even if it is below the
+    /// write-buffer threshold (rocksdb-write: drive a flush so all committed
+    /// data lives in SSTs and the new WAL is empty, the precondition for a real
+    /// RocksDB to read the DB from MANIFEST + SSTs alone).  Public, mutex-guarded.
+    /// A no-op on a read-only DB or an empty memtable.
+    pub fn flushAll(self: *DB) !void {
+        if (self.options.read_only) return;
+        try self.write_mutex.lock(self.io);
+        defer self.write_mutex.unlock(self.io);
+        try self.maybeFlushForced(true);
+    }
+
+    fn maybeFlushForced(self: *DB, force: bool) !void {
         // Drain a previously launched flush before deciding / starting another.
         // This keeps at most one flush in flight and frees its imm holder.
         try self.awaitFlush();
 
-        if (self.mem.approximateMemoryUsage() < self.options.write_buffer_size) return;
+        if (force) {
+            // Nothing buffered: a forced flush is a no-op (avoids writing an
+            // empty SST + a needless MANIFEST edit).
+            if (self.mem.approximateMemoryUsage() == 0) return;
+        } else if (self.mem.approximateMemoryUsage() < self.options.write_buffer_size) return;
 
         // 1. Allocate a new log number.  When this DB owns its WAL, also open a
         //    fresh WAL and swap it in (the classic single-CF flush).  A per-CF

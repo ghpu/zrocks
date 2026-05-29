@@ -75,6 +75,26 @@ pub const FilterMode = enum { block_based, full };
 /// reopened with a different `index_type` without misreading old SSTs.
 pub const IndexType = enum { single_level, two_level };
 
+/// SST + MANIFEST on-disk dialect (rocksdb-write-interop).  Selects what a
+/// `TableBuilder` and the `VersionSet`/flush MANIFEST writer emit.
+///   - `.native`: zrocks's own LevelDB-derived format — LevelDB-shaped index
+///     (internal-key separators + value-length-prefixed handles), a
+///     `"filter."`/`"fullfilter."` filter block, NO `rocksdb.properties` block,
+///     and a MANIFEST whose new-file records carry a kColumnFamilyAdd for the
+///     default CF.  This is the DEFAULT so every existing on-disk DB and test is
+///     byte-for-byte unaffected.
+///   - `.rocksdb`: a format a REAL RocksDB v11 binary can open read-only.  The
+///     SST carries a RocksDB-shaped binary-search index (USER-key separators +
+///     bare 2-varint handles, restart_interval=1), the required
+///     `rocksdb.properties` meta block (num_entries, comparator name, index
+///     type/shape flags, etc.), crc32c block checksums, and the fv5 footer; NO
+///     filter block is written (RocksDB opens without one).  The MANIFEST emits
+///     kNewFile4 (tag 103) records with smallest/largest seqnos and OMITS the
+///     default-CF add record (RocksDB auto-creates the default CF).  A DB written
+///     in this mode must be FULLY FLUSHED (no pending WAL data) for RocksDB to
+///     read all of it — RocksDB needs only MANIFEST + SSTs.
+pub const SstOutput = enum { native, rocksdb };
+
 // ---------------------------------------------------------------------------
 // Options — DB-open configuration (capability-based plain value struct)
 // ---------------------------------------------------------------------------
@@ -158,6 +178,12 @@ pub const Options = struct {
     /// writes a partitioned (two-level) index.  The reader auto-detects either
     /// shape from the metaindex regardless of this setting.
     index_type: IndexType = .single_level,
+
+    /// SST + MANIFEST on-disk dialect (rocksdb-write-interop).  Default
+    /// `.native` keeps zrocks's own format so all existing DBs/tests are
+    /// unaffected; `.rocksdb` makes a fully-flushed DB openable by a real
+    /// RocksDB binary.  See `SstOutput`.
+    sst_output: SstOutput = .native,
 
     /// Target byte size of one index PARTITION block under `.two_level`
     /// (partitioned-idx).  The builder starts a new index partition once the

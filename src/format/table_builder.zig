@@ -76,6 +76,11 @@ const kRangeDelMetaKey: []const u8 = "rocksdb.range_del";
 /// SST keeps reading unchanged.  See partitioned_index.zig.
 const kIndexTypeMetaKey: []const u8 = partitioned_index.kIndexTypeMetaKey;
 
+/// Metaindex key naming the RocksDB table-properties block (rocksdb-write).
+/// Its presence is exactly the discriminator the reader uses to recognise a
+/// RocksDB-form SST (see `table_reader.metaindexHasRocksDbProperties`).
+const kRocksDbPropertiesMetaKey: []const u8 = "rocksdb.properties";
+
 pub const TableBuilder = struct {
     gpa: std.mem.Allocator,
     options: options_mod.Options,
@@ -125,6 +130,20 @@ pub const TableBuilder = struct {
     /// meta block registered under `kRangeDelMetaKey`.
     range_tombstones: delete_range.RangeTombstoneList,
 
+    // -- rocksdb-write (sst_output == .rocksdb) accumulators ------------------
+    /// USER-key separators for the RocksDB-form index (one per data block).
+    /// Each is the user-key portion of the chosen separator (no 8-byte trailer);
+    /// RocksDB reads the index with `index.key.is.user.key=1`.  Only populated
+    /// when `options.sst_output == .rocksdb`; owned (each entry freed in deinit).
+    rdb_index_seps: std.ArrayListUnmanaged([]u8),
+    /// Data-block handles paired with `rdb_index_seps` (same length/order).
+    rdb_index_handles: std.ArrayListUnmanaged(BlockHandle),
+    /// Sum of raw (uncompressed, undelta'd) internal-key bytes across all added
+    /// entries — the `rocksdb.raw.key.size` property.
+    rdb_raw_key_size: u64,
+    /// Sum of raw value bytes — the `rocksdb.raw.value.size` property.
+    rdb_raw_value_size: u64,
+
     pub fn init(
         gpa: std.mem.Allocator,
         options: options_mod.Options,
@@ -162,6 +181,10 @@ pub const TableBuilder = struct {
             .finished = false,
             .handle_encoding = .empty,
             .range_tombstones = delete_range.RangeTombstoneList.init(gpa),
+            .rdb_index_seps = .empty,
+            .rdb_index_handles = .empty,
+            .rdb_raw_key_size = 0,
+            .rdb_raw_value_size = 0,
         };
     }
 
@@ -174,6 +197,9 @@ pub const TableBuilder = struct {
         self.last_key.deinit(self.gpa);
         self.handle_encoding.deinit(self.gpa);
         self.range_tombstones.deinit();
+        for (self.rdb_index_seps.items) |s| self.gpa.free(s);
+        self.rdb_index_seps.deinit(self.gpa);
+        self.rdb_index_handles.deinit(self.gpa);
         self.* = undefined;
     }
 
@@ -228,6 +254,12 @@ pub const TableBuilder = struct {
         try self.last_key.appendSlice(self.gpa, key);
 
         self.num_entries += 1;
+        // rocksdb-write: accumulate raw (uncompressed) key/value byte totals for
+        // the `rocksdb.raw.key.size` / `rocksdb.raw.value.size` properties.
+        if (self.options.sst_output == .rocksdb) {
+            self.rdb_raw_key_size += key.len;
+            self.rdb_raw_value_size += value.len;
+        }
         try self.data_block.add(key, value);
 
         if (self.data_block.currentSizeEstimate() >= self.options.block_size) {
@@ -251,6 +283,20 @@ pub const TableBuilder = struct {
     /// `pending_index_entry`.
     fn appendIndexEntry(self: *TableBuilder) !void {
         std.debug.assert(self.pending_index_entry);
+
+        // rocksdb-write: capture the USER-key separator + data-block handle for
+        // the RocksDB-form index built at `finish`.  `self.last_key` is the
+        // chosen separator (an internal key); RocksDB's index stores only its
+        // user-key portion (index.key.is.user.key=1).  The native index block
+        // is NOT built in this mode, so we return early after capturing.
+        if (self.options.sst_output == .rocksdb) {
+            const user_sep = internal_key.extractUserKey(self.last_key.items);
+            try self.rdb_index_seps.append(self.gpa, try self.gpa.dupe(u8, user_sep));
+            try self.rdb_index_handles.append(self.gpa, self.pending_handle);
+            self.pending_index_entry = false;
+            return;
+        }
+
         self.handle_encoding.clearRetainingCapacity();
         try self.pending_handle.encodeTo(&self.handle_encoding, self.gpa);
         // Single-level: add straight to the flat index block.  Two-level: route to
@@ -377,6 +423,14 @@ pub const TableBuilder = struct {
         try self.flush();
         self.finished = true;
 
+        // rocksdb-write: emit a RocksDB-openable SST (RocksDB-form index +
+        // rocksdb.properties meta block, no filter block).  Diverges entirely
+        // from the native layout below.
+        if (self.options.sst_output == .rocksdb) {
+            try self.finishRocksDb();
+            return;
+        }
+
         // 1. Filter block.  The active format (fulllocalbloom gate) decides both
         //    the on-disk filter layout and the metaindex key it is registered
         //    under — block-based under "filter."++name, full under
@@ -465,7 +519,164 @@ pub const TableBuilder = struct {
 
         try self.file.flush();
     }
+
+    // -----------------------------------------------------------------------
+    // rocksdb-write — emit a real-RocksDB-openable SST (sst_output == .rocksdb)
+    // -----------------------------------------------------------------------
+
+    /// Finish the SST in RocksDB-openable form.  Data blocks were already
+    /// written (internal keys, exactly as native).  Here we emit, in order:
+    ///   1. the final pending index entry (user-key short successor);
+    ///   2. the RocksDB-form INDEX block — USER-key separators (no trailer) +
+    ///      bare 2-varint handles, restart_interval=1 (every entry a restart);
+    ///   3. the `rocksdb.properties` block — the basic table properties RocksDB
+    ///      requires to open the file (num_entries, comparator name, the index
+    ///      shape flags index.key.is.user.key=1 + index.value.is.delta.encoded=1
+    ///      + block.based.table.index.type=kBinarySearch, raw sizes, …);
+    ///   4. the metaindex block — a single `rocksdb.properties` -> handle entry
+    ///      (no filter, no zrocks-specific tags), the read-side discriminator;
+    ///   5. the fv5 / crc32c footer.
+    /// No filter block is written: RocksDB opens fine without one.
+    fn finishRocksDb(self: *TableBuilder) !void {
+        // 1. Final pending index entry — narrow the last key to a short user-key
+        //    successor, then capture it (appendIndexEntry routes to the rocksdb
+        //    accumulators under sst_output == .rocksdb).
+        if (self.pending_index_entry) {
+            self.options.comparator.findShortSuccessor(&self.last_key);
+            try self.appendIndexEntry();
+        }
+
+        // 2. RocksDB-form index block.
+        const index_raw = try buildRocksDbIndexBlock(
+            self.gpa,
+            self.rdb_index_seps.items,
+            self.rdb_index_handles.items,
+        );
+        defer self.gpa.free(index_raw);
+        // Data blocks span [0, current offset); record it for the data.size
+        // property BEFORE the index/properties/metaindex are written.
+        const data_size = self.offset;
+        const index_handle = try self.writeRawBlock(index_raw, kNoCompression);
+
+        // 3. Properties block.
+        const props_raw = try self.buildRocksDbPropertiesBlock(
+            data_size,
+            index_handle.size,
+        );
+        defer self.gpa.free(props_raw);
+        const props_handle = try self.writeRawBlock(props_raw, kNoCompression);
+
+        // 4. Metaindex block: a single `rocksdb.properties` -> handle entry.
+        var metaindex_block = BlockBuilder.init(self.gpa, comparator.bytewise, kMetaIndexRestartInterval);
+        defer metaindex_block.deinit();
+        {
+            self.handle_encoding.clearRetainingCapacity();
+            try props_handle.encodeTo(&self.handle_encoding, self.gpa);
+            try metaindex_block.add(kRocksDbPropertiesMetaKey, self.handle_encoding.items);
+        }
+        const metaindex_handle = try self.writeBlock(&metaindex_block);
+
+        // 5. Footer.
+        const footer = Footer{
+            .metaindex_handle = metaindex_handle,
+            .index_handle = index_handle,
+            .format_version = 5,
+            .checksum_type = .crc32c,
+        };
+        var footer_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer footer_buf.deinit(self.gpa);
+        try footer.encodeTo(&footer_buf, self.gpa);
+        try self.file.append(footer_buf.items);
+        self.offset += footer_buf.items.len;
+
+        try self.file.flush();
+    }
+
+    /// Build the `rocksdb.properties` block contents (caller frees with gpa).
+    /// Properties are emitted in ascending bytewise key order (the block builder
+    /// requires sorted keys) with restart_interval=1, matching RocksDB.
+    fn buildRocksDbPropertiesBlock(self: *TableBuilder, data_size: u64, index_size: u64) ![]u8 {
+        var pb = BlockBuilder.init(self.gpa, comparator.bytewise, kMetaIndexRestartInterval);
+        defer pb.deinit();
+
+        // Scratch for varint64 property values.
+        var vbuf: std.ArrayListUnmanaged(u8) = .empty;
+        defer vbuf.deinit(self.gpa);
+        const putU64 = struct {
+            fn go(b: *BlockBuilder, scratch: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, key: []const u8, v: u64) !void {
+                scratch.clearRetainingCapacity();
+                try coding.putVarint64(scratch, a, v);
+                try b.add(key, scratch.items);
+            }
+        }.go;
+
+        // RocksDB property keys, emitted in ASCENDING bytewise order.  Values
+        // are varint64 unless noted.  These are the minimum a real RocksDB v11
+        // needs to open the file (verified against the verify_open oracle).
+        // index.type: a 4-byte fixed32 (kBinarySearch == 0) — RocksDB reads it
+        // as a raw fixed32, NOT a varint.
+        try pb.add("rocksdb.block.based.table.index.type", &[_]u8{ 0, 0, 0, 0 });
+        try putU64(&pb, &vbuf, self.gpa, "rocksdb.column.family.id", 0);
+        try pb.add("rocksdb.comparator", rocksDbUserComparatorName(self.options.comparator));
+        try putU64(&pb, &vbuf, self.gpa, "rocksdb.data.size", data_size);
+        // index.key.is.user.key=1: the index separators are USER keys (no seq).
+        try putU64(&pb, &vbuf, self.gpa, "rocksdb.index.key.is.user.key", 1);
+        try putU64(&pb, &vbuf, self.gpa, "rocksdb.index.size", index_size);
+        // index.value.is.delta.encoded=1: matches RocksDB's fv5 default decode
+        // path; harmless here because restart_interval=1 makes every index entry
+        // a restart, so each stores its full (offset,size) handle anyway.
+        try putU64(&pb, &vbuf, self.gpa, "rocksdb.index.value.is.delta.encoded", 1);
+        try putU64(&pb, &vbuf, self.gpa, "rocksdb.num.data.blocks", self.rdb_index_handles.items.len);
+        try putU64(&pb, &vbuf, self.gpa, "rocksdb.num.entries", self.num_entries);
+        try putU64(&pb, &vbuf, self.gpa, "rocksdb.raw.key.size", self.rdb_raw_key_size);
+        try putU64(&pb, &vbuf, self.gpa, "rocksdb.raw.value.size", self.rdb_raw_value_size);
+
+        const contents = pb.finish();
+        return self.gpa.dupe(u8, contents);
+    }
 };
+
+/// The USER comparator name for a SST built with `cmp`.  DB SSTs are built with
+/// the InternalKeyComparator (which wraps a user comparator); RocksDB's
+/// `rocksdb.comparator` property records the USER comparator name.  The IKC
+/// always wraps the bytewise user comparator in this codebase's write paths, so
+/// we map its name accordingly; any non-IKC comparator (e.g. a bare bytewise
+/// SST) records its own name directly.
+fn rocksDbUserComparatorName(cmp: comparator.Comparator) []const u8 {
+    if (std.mem.eql(u8, cmp.name(), "leveldb.InternalKeyComparator")) {
+        return "leveldb.BytewiseComparator";
+    }
+    return cmp.name();
+}
+
+/// Build a RocksDB block-based-table INDEX block: kBinarySearch with
+/// restart_interval=1, USER-key separators (no 8-byte trailer), bare 2-varint
+/// BlockHandle values (NO per-entry value length — the value runs to the next
+/// entry, every entry being its own restart).  This is exactly the shape
+/// `table_reader.transcodeRocksDbIndex` parses back, and the byte-shape a real
+/// RocksDB reads.  Returns a freshly gpa-allocated buffer the caller frees.
+fn buildRocksDbIndexBlock(
+    gpa: std.mem.Allocator,
+    seps: []const []const u8,
+    handles: []const BlockHandle,
+) ![]u8 {
+    std.debug.assert(seps.len == handles.len);
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    var restarts: std.ArrayListUnmanaged(u32) = .empty;
+    defer restarts.deinit(gpa);
+
+    for (seps, handles) |sep, h| {
+        try restarts.append(gpa, @intCast(buf.items.len));
+        try coding.putVarint32(&buf, gpa, 0); // shared (restart: full key)
+        try coding.putVarint32(&buf, gpa, @intCast(sep.len)); // non_shared
+        try buf.appendSlice(gpa, sep); // user-key separator
+        try h.encodeTo(&buf, gpa); // bare 2-varint handle, no value length
+    }
+    for (restarts.items) |r| try coding.putFixed32(&buf, gpa, r);
+    try coding.putFixed32(&buf, gpa, @intCast(restarts.items.len));
+    return buf.toOwnedSlice(gpa);
+}
 
 // ===========================================================================
 // Tests — byte-compat gate. Build a multi-data-block table, then parse it back
@@ -983,4 +1194,220 @@ test "table reader: full-filter mode round-trips through Table.get (no data lost
         const got = try tbl.get(gpa, "key99999-definitely-absent");
         try testing.expect(got == null);
     }
+}
+
+// ===========================================================================
+// rocksdb-write — SST emitted in real-RocksDB-openable form (sst_output ==
+// .rocksdb).  CI-safe: zrocks writes the RocksDB-form SST, then RE-READS it via
+// its own RocksDB-read path (Table.open auto-detects the form), proving the
+// metaindex carries rocksdb.properties and the index parses as the RocksDB
+// (user-key separator) shape.  The real-RocksDB authenticity gate lives in
+// tests/rocksdb_write_interop_test.zig (shells out to verify_open).
+// ===========================================================================
+
+const internal_key_mod = @import("internal_key.zig");
+const RdwTable = @import("table_reader.zig").Table;
+
+/// Encode `user ++ fixed64(packSequenceAndType(seq, t))` (caller frees).
+fn rdwEncodeIkey(gpa: std.mem.Allocator, user: []const u8, seq: u64, t: internal_key_mod.ValueType) ![]u8 {
+    const out = try gpa.alloc(u8, user.len + 8);
+    @memcpy(out[0..user.len], user);
+    coding.encodeFixed64(out[user.len..][0..8], internal_key_mod.packSequenceAndType(seq, t));
+    return out;
+}
+
+test "rocksdb-write: SST is RocksDB-form (metaindex has rocksdb.properties, index is user-key) and round-trips" {
+    const gpa = testing.allocator;
+
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    // Build with the InternalKeyComparator (as the DB flush path does) and a
+    // small block_size so several data blocks form.
+    var ikc = internal_key_mod.InternalKeyComparator{ .user = comparator.bytewise };
+    const opts = options_mod.Options{
+        .comparator = ikc.comparatorInterface(),
+        .block_size = 64,
+        .block_restart_interval = 4,
+        .sst_output = .rocksdb,
+    };
+    const policy = bloom.BloomFilterPolicy.init(10);
+
+    // 12 sorted user keys (internal keys, seq increasing), enough for >= 2 data
+    // blocks at block_size=64.
+    const users = [_][]const u8{ "k00", "k01", "k02", "k03", "k04", "k05", "k06", "k07", "k08", "k09", "k10", "k11" };
+    var ikeys: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (ikeys.items) |k| gpa.free(k);
+        ikeys.deinit(gpa);
+    }
+    {
+        var wf = try e.newWritableFile(gpa, "rdw.sst");
+        errdefer wf.close() catch {};
+        var tb = try TableBuilder.init(gpa, opts, wf, policy);
+        defer tb.deinit();
+        var seq: u64 = 1;
+        for (users) |u| {
+            const ik = try rdwEncodeIkey(gpa, u, seq, .value);
+            try ikeys.append(gpa, ik);
+            try tb.add(ik, u); // value = user key for easy verification
+            seq += 1;
+        }
+        try tb.finish();
+        try wf.close();
+    }
+
+    const file = try readAllFile(e, gpa, "rdw.sst");
+    defer gpa.free(file);
+
+    // ---- Footer: fv5, crc32c, RocksDB magic ----
+    const footer = try Footer.decodeFrom(file[file.len - footer_mod.kEncodedLength ..]);
+    try testing.expectEqual(@as(u32, 5), footer.format_version);
+    try testing.expectEqual(footer_mod.ChecksumType.crc32c, footer.checksum_type);
+
+    // ---- Metaindex carries rocksdb.properties and NO filter entry ----
+    {
+        const meta_contents = try readVerifiedBlock(file, footer.metaindex_handle);
+        const meta_blk = try block.Block.init(gpa, meta_contents);
+        var it = meta_blk.iterator(comparator.bytewise);
+        defer it.deinit();
+        it.seek("rocksdb.properties");
+        try testing.expect(it.valid());
+        try testing.expectEqualStrings("rocksdb.properties", it.key());
+
+        // No legacy "filter." entry in rocksdb-write mode.
+        it.seek("filter.leveldb.BuiltinBloomFilter2");
+        const has_filter = it.valid() and comparator.bytewise.compare(it.key(), "filter.leveldb.BuiltinBloomFilter2") == .eq;
+        try testing.expect(!has_filter);
+    }
+
+    // ---- Properties block carries the required keys ----
+    {
+        const meta_contents = try readVerifiedBlock(file, footer.metaindex_handle);
+        const meta_blk = try block.Block.init(gpa, meta_contents);
+        var mit = meta_blk.iterator(comparator.bytewise);
+        defer mit.deinit();
+        mit.seek("rocksdb.properties");
+        var hv: []const u8 = mit.value();
+        const props_handle = try BlockHandle.decodeFrom(&hv);
+        const props_contents = try readVerifiedBlock(file, props_handle);
+        const props_blk = try block.Block.init(gpa, props_contents);
+
+        const expect = struct {
+            fn present(b: *const block.Block, key: []const u8) !void {
+                var it = b.iterator(comparator.bytewise);
+                defer it.deinit();
+                it.seek(key);
+                try testing.expect(it.valid());
+                try testing.expectEqualStrings(key, it.key());
+            }
+        };
+        try expect.present(&props_blk, "rocksdb.block.based.table.index.type");
+        try expect.present(&props_blk, "rocksdb.comparator");
+        try expect.present(&props_blk, "rocksdb.index.key.is.user.key");
+        try expect.present(&props_blk, "rocksdb.index.value.is.delta.encoded");
+        try expect.present(&props_blk, "rocksdb.num.entries");
+
+        // comparator property records the USER comparator name.
+        var cit = props_blk.iterator(comparator.bytewise);
+        defer cit.deinit();
+        cit.seek("rocksdb.comparator");
+        try testing.expectEqualStrings("leveldb.BytewiseComparator", cit.value());
+    }
+
+    // ---- Index is RocksDB form: user-key separators + bare handles ----
+    // The RocksDB index is NOT a standard LevelDB block (its handle values have
+    // no value-length prefix), so it must be parsed by restart points the way
+    // `table_reader.transcodeRocksDbIndex` does.  Decode each restart entry and
+    // assert: separator is a USER key (len 3, no 8-byte trailer) and the value
+    // is a bare BlockHandle that runs exactly to the next entry boundary.
+    {
+        const index_contents = try readVerifiedBlock(file, footer.index_handle);
+        const raw = index_contents;
+        const num_restarts = coding.decodeFixed32(raw[raw.len - 4 ..][0..4]);
+        try testing.expect(num_restarts >= 2); // >= 2 data blocks
+        const restart_array_off = raw.len - (@as(usize, num_restarts) + 1) * @sizeOf(u32);
+        for (0..num_restarts) |i| {
+            const start = coding.decodeFixed32(raw[restart_array_off + i * 4 ..][0..4]);
+            const end: usize = if (i + 1 < num_restarts)
+                coding.decodeFixed32(raw[restart_array_off + (i + 1) * 4 ..][0..4])
+            else
+                restart_array_off;
+            var entry: []const u8 = raw[start..end];
+            const shared = try coding.getVarint32(&entry);
+            const non_shared = try coding.getVarint32(&entry);
+            try testing.expectEqual(@as(u32, 0), shared); // restart: full key
+            // Separator is a USER key (a short separator/successor, 1..3 bytes —
+            // never an internal key, which would be >= 9 bytes for these keys).
+            try testing.expect(non_shared >= 1 and non_shared < 9);
+            entry = entry[non_shared..];
+            _ = try BlockHandle.decodeFrom(&entry);
+            try testing.expectEqual(@as(usize, 0), entry.len); // bare handle, no trailer
+        }
+    }
+
+    // ---- Round-trip: re-read via Table.open (auto-detects RocksDB form) ----
+    {
+        const size = try e.getFileSize("rdw.sst");
+        var raf = try e.newRandomAccessFile(gpa, "rdw.sst");
+        defer raf.close() catch {};
+        var tbl = try RdwTable.open(gpa, raf, size, opts, policy, null, 0);
+        defer tbl.deinit();
+
+        for (users, ikeys.items) |u, ik| {
+            const got = try tbl.get(gpa, ik) orelse return error.TestExpectedFound;
+            defer gpa.free(got);
+            try testing.expectEqualStrings(u, got);
+        }
+        // Full scan yields all 12 in order.
+        var it = tbl.iterator(gpa);
+        defer it.deinit();
+        var idx: usize = 0;
+        it.seekToFirst();
+        while (it.valid()) : (it.next()) {
+            try testing.expectEqualStrings(users[idx], it.value());
+            idx += 1;
+        }
+        try testing.expectEqual(users.len, idx);
+    }
+}
+
+test "rocksdb-write: native sst_output is unchanged (no rocksdb.properties, filter present)" {
+    const gpa = testing.allocator;
+
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    const opts = options_mod.Options{ .block_size = 200, .block_restart_interval = 4 }; // .native default
+    const policy = bloom.BloomFilterPolicy.init(10);
+
+    var entries = try makeSortedEntries(gpa, 30);
+    defer freeEntries(gpa, &entries);
+    {
+        var wf = try e.newWritableFile(gpa, "native.sst");
+        errdefer wf.close() catch {};
+        var tb = try TableBuilder.init(gpa, opts, wf, policy);
+        defer tb.deinit();
+        for (entries.items) |kv| try tb.add(kv.k, kv.v);
+        try tb.finish();
+        try wf.close();
+    }
+
+    const file = try readAllFile(e, gpa, "native.sst");
+    defer gpa.free(file);
+    const footer = try Footer.decodeFrom(file[file.len - footer_mod.kEncodedLength ..]);
+    const meta_contents = try readVerifiedBlock(file, footer.metaindex_handle);
+    const meta_blk = try block.Block.init(gpa, meta_contents);
+    var it = meta_blk.iterator(comparator.bytewise);
+    defer it.deinit();
+
+    // Native mode: NO rocksdb.properties entry; the legacy filter entry IS there.
+    it.seek("rocksdb.properties");
+    const has_props = it.valid() and comparator.bytewise.compare(it.key(), "rocksdb.properties") == .eq;
+    try testing.expect(!has_props);
+    it.seek("filter.leveldb.BuiltinBloomFilter2");
+    try testing.expect(it.valid());
+    try testing.expectEqualStrings("filter.leveldb.BuiltinBloomFilter2", it.key());
 }

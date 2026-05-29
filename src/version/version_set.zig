@@ -824,8 +824,13 @@ pub const VersionSet = struct {
     /// kColumnFamilyAdd record for the default CF so the snapshot is
     /// self-contained when read by a RocksDB-aware reader).
     fn writeSnapshot(self: *VersionSet, writer: *log_writer.Writer, wf: env.WritableFile) !void {
+        const rocksdb = self.options.sst_output == .rocksdb;
+
         // First record: kColumnFamilyAdd for the default CF (id=0, name="default").
-        {
+        // OMITTED in rocksdb-write mode: real RocksDB auto-creates the default CF
+        // and rejects a MANIFEST that adds it again ("adding the same column
+        // family twice: default").
+        if (!rocksdb) {
             var cf_edit = VersionEdit.init();
             defer cf_edit.deinit(self.gpa);
             cf_edit.setColumnFamilyId(0);
@@ -841,7 +846,14 @@ pub const VersionSet = struct {
         var edit = VersionEdit.init();
         defer edit.deinit(self.gpa);
 
-        try edit.setComparatorName(self.gpa, self.cmp.name());
+        // rocksdb-write records the USER comparator name; zrocks DB SSTs are
+        // ordered by the InternalKeyComparator, but RocksDB's MANIFEST expects
+        // the user comparator (e.g. leveldb.BytewiseComparator).
+        if (rocksdb and std.mem.eql(u8, self.cmp.name(), "leveldb.InternalKeyComparator")) {
+            try edit.setComparatorName(self.gpa, "leveldb.BytewiseComparator");
+        } else {
+            try edit.setComparatorName(self.gpa, self.cmp.name());
+        }
         if (self.log_number != 0) edit.setLogNumber(self.log_number);
         if (self.prev_log_number != 0) edit.setPrevLogNumber(self.prev_log_number);
         edit.setNextFileNumber(self.next_file_number);
@@ -850,7 +862,22 @@ pub const VersionSet = struct {
         var level: usize = 0;
         while (level < kNumLevels) : (level += 1) {
             for (self.current.files[level].items) |f| {
-                try edit.addFile(self.gpa, @intCast(level), f.number, f.file_size, f.smallest, f.largest);
+                if (rocksdb) {
+                    // kNewFile4 (tag 103) with the file's seqno range — what
+                    // real RocksDB needs in its MANIFEST.
+                    try edit.addFile4(
+                        self.gpa,
+                        @intCast(level),
+                        f.number,
+                        f.file_size,
+                        f.smallest,
+                        f.largest,
+                        f.smallest_seqno,
+                        f.largest_seqno,
+                    );
+                } else {
+                    try edit.addFile(self.gpa, @intCast(level), f.number, f.file_size, f.smallest, f.largest);
+                }
             }
         }
 
