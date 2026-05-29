@@ -34,6 +34,13 @@ const coding = @import("../util/coding.zig");
 
 const MemTable = memtable_mod.MemTable;
 
+/// Decode the sequence number from an internal key's 8-byte trailer.
+fn seqnoOf(ikey: []const u8) u64 {
+    if (ikey.len < 8) return 0;
+    const trailer = coding.decodeFixed64(ikey[ikey.len - 8 ..][0..8]);
+    return internal_key.unpackSequenceAndType(trailer).sequence;
+}
+
 /// Encode `user_key ++ fixed64(packSequenceAndType(seq, t))` (caller frees).
 fn encodeInternalKey(gpa: std.mem.Allocator, user_key: []const u8, seq: u64, t: internal_key.ValueType) ![]u8 {
     const out = try gpa.alloc(u8, user_key.len + 8);
@@ -167,7 +174,26 @@ pub fn commitFlush(
     defer edit.deinit(gpa);
 
     if (result.num_entries != 0) {
-        try edit.addFile(gpa, 0, result.file_number, result.file_size, result.smallest.?, result.largest.?);
+        // rocksdb-write: emit a kNewFile4 (tag 103) record carrying the file's
+        // smallest/largest sequence numbers (decoded from the internal-key
+        // trailers), which real RocksDB requires in its MANIFEST.  Native mode
+        // keeps the legacy kNewFile=7 record (no seqnos).
+        if (versions.options.sst_output == .rocksdb) {
+            const smin = seqnoOf(result.smallest.?);
+            const smax = seqnoOf(result.largest.?);
+            try edit.addFile4(
+                gpa,
+                0,
+                result.file_number,
+                result.file_size,
+                result.smallest.?,
+                result.largest.?,
+                @min(smin, smax),
+                @max(smin, smax),
+            );
+        } else {
+            try edit.addFile(gpa, 0, result.file_number, result.file_size, result.smallest.?, result.largest.?);
+        }
         edit.setLastFileHasRangeTombstones(result.has_range_tombstones);
     }
 

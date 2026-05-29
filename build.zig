@@ -123,6 +123,21 @@ pub fn build(b: *std.Build) void {
     const rocksdb_interop_tests = b.addTest(.{ .root_module = rocksdb_interop_mod });
     const run_rocksdb_interop_tests = b.addRunArtifact(rocksdb_interop_tests);
 
+    // rocksdb-write CI-safe self-consistency gate (rooted at
+    // tests/rocksdb_write_interop_test.zig, importing the "zrocks" module):
+    // writes a fully-flushed DB in the opt-in `.rocksdb` dialect, re-reads it via
+    // a fresh zrocks open (round-trip through the RocksDB-read path), and asserts
+    // the on-disk SST/MANIFEST carry the RocksDB form.  No external RocksDB.
+    const rocksdb_write_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/rocksdb_write_interop_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zrocks", .module = mod }},
+        }),
+    });
+    const run_rocksdb_write_tests = b.addRunArtifact(rocksdb_write_tests);
+
     // Bench harness tests (bench_main.zig imports zrocks and has embedded tests).
     const bench_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -140,5 +155,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_interop_tests.step);
     test_step.dependOn(&run_leveldb_interop_tests.step);
     test_step.dependOn(&run_rocksdb_interop_tests.step);
+    test_step.dependOn(&run_rocksdb_write_tests.step);
     test_step.dependOn(&run_bench_tests.step);
 }
