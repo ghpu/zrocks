@@ -79,6 +79,8 @@ pub const Version = struct {
             .file_size = meta.file_size,
             .smallest = s,
             .largest = l,
+            .smallest_seqno = meta.smallest_seqno,
+            .largest_seqno = meta.largest_seqno,
         });
     }
 
@@ -288,6 +290,8 @@ pub const Version = struct {
                     .file_size = f.file_size,
                     .smallest = try gpa.dupe(u8, f.smallest),
                     .largest = try gpa.dupe(u8, f.largest),
+                    .smallest_seqno = f.smallest_seqno,
+                    .largest_seqno = f.largest_seqno,
                 });
                 // The just-appended entry owns its bytes; on a later error the
                 // errdefer above frees the whole list.

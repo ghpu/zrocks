@@ -16,8 +16,16 @@
 ///   7  kNewFile          varint32 level + varint64 file# + varint64 file size
 ///                         + length-prefixed smallest key + length-prefixed largest key
 ///   9  kPrevLogNumber    varint64
-///
-/// TODO(interop): RocksDB kNewFile4=100 for real-RocksDB-manifest read (M5.x).
+///   100 kNewFile4        RocksDB extended new-file record:
+///                         varint32 level + varint64 file# + varint64 file size
+///                         + length-prefixed smallest + length-prefixed largest
+///                         + varint64 smallest_seqno + varint64 largest_seqno
+///                         + zero or more custom fields, each
+///                           (varint32 custom_tag + length-prefixed value),
+///                         terminated by custom_tag == kTerminate(1).
+///                         Custom tags with the 0x40 non-safe-to-ignore bit set
+///                         that we do not understand are a Corruption; other
+///                         unknown custom tags are skipped.
 const std = @import("std");
 const coding = @import("../util/coding.zig");
 
@@ -49,6 +57,17 @@ const Tag = struct {
     const kDeletedFile: u32 = 6;
     const kNewFile: u32 = 7;
     const kPrevLogNumber: u32 = 9;
+    const kNewFile4: u32 = 100;
+};
+
+/// kNewFile4 custom-field sub-tags (RocksDB version_edit.cc CustomTag enum).
+/// Only kTerminate is emitted by us; the rest are recognised for safe skipping
+/// when reading a real RocksDB MANIFEST.
+const CustomTag = struct {
+    const kTerminate: u32 = 1;
+    /// Custom tags with this mask bit set MUST be understood; an unknown one is
+    /// a Corruption (a forward-incompatible field we cannot safely ignore).
+    const kSafeIgnoreMask: u32 = 0x40;
 };
 
 // ---------------------------------------------------------------------------
@@ -67,6 +86,11 @@ pub const FileMetaData = struct {
     smallest: []const u8,
     /// Internal-key bytes for the largest key in the file.
     largest: []const u8,
+    /// Smallest sequence number in the file (RocksDB kNewFile4 field).
+    /// Defaults to 0 for the legacy kNewFile=7 path, which carries no seqnos.
+    smallest_seqno: u64 = 0,
+    /// Largest sequence number in the file (RocksDB kNewFile4 field).
+    largest_seqno: u64 = 0,
     // allowed_seeks, refs etc. can be added later (M5.1+).
 };
 
@@ -89,7 +113,9 @@ pub const VersionEdit = struct {
     // TODO(m5.1): compact_pointers (kCompactPointer tag=5) skipped for now.
 
     pub const DeletedFile = struct { level: u32, number: u64 };
-    pub const NewFileEntry = struct { level: u32, meta: FileMetaData };
+    /// `is_v4` selects the wire format on encode: kNewFile4 (tag=100, carries
+    /// seqnos + custom-field terminator) when true, else legacy kNewFile (tag=7).
+    pub const NewFileEntry = struct { level: u32, meta: FileMetaData, is_v4: bool = false };
 
     // -----------------------------------------------------------------------
     // Lifecycle
@@ -161,6 +187,38 @@ pub const VersionEdit = struct {
         });
     }
 
+    /// Add a new SSTable file in RocksDB kNewFile4 format (tag=100), carrying
+    /// the smallest/largest sequence numbers.  `smallest`/`largest` key bytes
+    /// are duped into edit-owned memory; the caller may release their copies.
+    pub fn addFile4(
+        self: *VersionEdit,
+        gpa: std.mem.Allocator,
+        level: u32,
+        number: u64,
+        file_size: u64,
+        smallest: []const u8,
+        largest: []const u8,
+        smallest_seqno: u64,
+        largest_seqno: u64,
+    ) !void {
+        const s = try dupSlice(gpa, smallest);
+        errdefer gpa.free(s);
+        const l = try dupSlice(gpa, largest);
+        errdefer gpa.free(l);
+        try self.new_files.append(gpa, .{
+            .level = level,
+            .is_v4 = true,
+            .meta = .{
+                .number = number,
+                .file_size = file_size,
+                .smallest = s,
+                .largest = l,
+                .smallest_seqno = smallest_seqno,
+                .largest_seqno = largest_seqno,
+            },
+        });
+    }
+
     /// Mark a file as deleted.
     pub fn removeFile(
         self: *VersionEdit,
@@ -213,14 +271,27 @@ pub const VersionEdit = struct {
             try coding.putVarint32(buf, gpa, df.level);
             try coding.putVarint64(buf, gpa, df.number);
         }
-        // kNewFile entries
+        // New-file entries: kNewFile4 (tag=100, with seqnos) or legacy kNewFile.
         for (self.new_files.items) |nf| {
-            try coding.putVarint32(buf, gpa, Tag.kNewFile);
-            try coding.putVarint32(buf, gpa, nf.level);
-            try coding.putVarint64(buf, gpa, nf.meta.number);
-            try coding.putVarint64(buf, gpa, nf.meta.file_size);
-            try coding.putLengthPrefixedSlice(buf, gpa, nf.meta.smallest);
-            try coding.putLengthPrefixedSlice(buf, gpa, nf.meta.largest);
+            if (nf.is_v4) {
+                try coding.putVarint32(buf, gpa, Tag.kNewFile4);
+                try coding.putVarint32(buf, gpa, nf.level);
+                try coding.putVarint64(buf, gpa, nf.meta.number);
+                try coding.putVarint64(buf, gpa, nf.meta.file_size);
+                try coding.putLengthPrefixedSlice(buf, gpa, nf.meta.smallest);
+                try coding.putLengthPrefixedSlice(buf, gpa, nf.meta.largest);
+                try coding.putVarint64(buf, gpa, nf.meta.smallest_seqno);
+                try coding.putVarint64(buf, gpa, nf.meta.largest_seqno);
+                // We emit no custom fields beyond the terminator.
+                try coding.putVarint32(buf, gpa, CustomTag.kTerminate);
+            } else {
+                try coding.putVarint32(buf, gpa, Tag.kNewFile);
+                try coding.putVarint32(buf, gpa, nf.level);
+                try coding.putVarint64(buf, gpa, nf.meta.number);
+                try coding.putVarint64(buf, gpa, nf.meta.file_size);
+                try coding.putLengthPrefixedSlice(buf, gpa, nf.meta.smallest);
+                try coding.putLengthPrefixedSlice(buf, gpa, nf.meta.largest);
+            }
         }
     }
 
@@ -284,6 +355,40 @@ pub const VersionEdit = struct {
                             .file_size = file_size,
                             .smallest = smallest,
                             .largest = largest,
+                        },
+                    });
+                },
+                Tag.kNewFile4 => {
+                    const level = try coding.getVarint32(&input);
+                    const number = try coding.getVarint64(&input);
+                    const file_size = try coding.getVarint64(&input);
+                    const smallest_raw = try coding.getLengthPrefixedSlice(&input);
+                    const largest_raw = try coding.getLengthPrefixedSlice(&input);
+                    const smallest_seqno = try coding.getVarint64(&input);
+                    const largest_seqno = try coding.getVarint64(&input);
+                    // Custom-field loop: read (tag, length-prefixed value) pairs
+                    // until kTerminate.  Unknown tags with the non-safe-ignore
+                    // mask bit set are a Corruption; others are skipped.
+                    while (true) {
+                        const ctag = try coding.getVarint32(&input);
+                        if (ctag == CustomTag.kTerminate) break;
+                        _ = try coding.getLengthPrefixedSlice(&input); // skip value
+                        if (ctag & CustomTag.kSafeIgnoreMask != 0) return error.Corruption;
+                    }
+                    const smallest = try dupSlice(gpa, smallest_raw);
+                    errdefer gpa.free(smallest);
+                    const largest = try dupSlice(gpa, largest_raw);
+                    errdefer gpa.free(largest);
+                    try edit.new_files.append(gpa, .{
+                        .level = level,
+                        .is_v4 = true,
+                        .meta = .{
+                            .number = number,
+                            .file_size = file_size,
+                            .smallest = smallest,
+                            .largest = largest,
+                            .smallest_seqno = smallest_seqno,
+                            .largest_seqno = largest_seqno,
                         },
                     });
                 },
