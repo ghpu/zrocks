@@ -501,9 +501,13 @@ pub fn doCompaction(
     }
 
     // The currently-open output builder + its file/metadata (null between
-    // outputs).  build_opts uses the IKC (SSTs store internal keys).
+    // outputs).  build_opts uses the IKC (SSTs store internal keys).  Output
+    // files all land at `outputLevel()`, so resolve the per-level compression
+    // for that destination level (compress-perlevel): deeper leveled outputs may
+    // be compressed while shallow/L0 outputs stay verbatim.
     var build_opts = options;
     build_opts.comparator = ikc;
+    build_opts.compression = options.compressionForLevel(compaction.outputLevel());
     const policy = bloom.BloomFilterPolicy.init(kFilterBitsPerKey);
 
     var builder: ?table_builder_mod.TableBuilder = null;

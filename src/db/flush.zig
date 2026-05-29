@@ -79,8 +79,12 @@ pub fn flushMemTable(
     defer gpa.free(path);
 
     // Build the SST with the InternalKeyComparator (SSTs store internal keys).
+    // A flush always writes to L0, so resolve the per-level compression for
+    // level 0 (compress-perlevel) — keeps L0 uncompressed under a typical
+    // per-level policy while honouring an explicit scalar `compression`.
     var build_opts = options;
     build_opts.comparator = ikc;
+    build_opts.compression = options.compressionForLevel(0);
     const policy = bloom.BloomFilterPolicy.init(kFilterBitsPerKey);
 
     // smallest/largest are gpa-owned here; addFile later dupes them into
