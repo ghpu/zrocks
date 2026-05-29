@@ -153,6 +153,37 @@ pub fn pickCompaction(
     return c;
 }
 
+/// FORCED L0->L1 compaction for write-stall draining (D2a-4).  Unlike
+/// `pickCompaction`, this ignores the score / `level0_file_num_compaction_trigger`
+/// — it always picks a compaction whenever L0 has at least one file, so a write
+/// that hit the STOP trigger can drain L0 even when the normal leveled trigger is
+/// configured higher than the stop trigger.  Picks the first L0 file, expands to
+/// every overlapping L0 file (L0 files overlap arbitrarily), and pulls in the
+/// overlapping L1 files — identical input selection to `pickCompaction`'s L0
+/// branch, just without the trigger gate.  Returns null only when L0 is empty.
+pub fn pickL0CompactionForced(
+    gpa: std.mem.Allocator,
+    versions: *VersionSet,
+    user_cmp: comparator.Comparator,
+) !?Compaction {
+    const v = versions.currentVersion();
+    if (v.numFiles(0) == 0) return null;
+
+    var c = Compaction{
+        .level = 0,
+        .inputs = .{ .empty, .empty },
+    };
+    errdefer c.deinit(gpa);
+
+    const first = v.files[0].items[0];
+    c.inputs[0] = try v.overlappingInputs(gpa, 0, first.smallest, first.largest, user_cmp);
+
+    const range = keyRange(c.inputs[0].items, user_cmp);
+    c.inputs[1] = try v.overlappingInputs(gpa, 1, range.smallest, range.largest, user_cmp);
+
+    return c;
+}
+
 // ===========================================================================
 // Obsolete-file GC (gc1) — reclaim the .sst inputs a committed edit removed
 // ===========================================================================

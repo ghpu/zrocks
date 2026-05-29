@@ -164,6 +164,14 @@ pub const DB = struct {
     /// the background worker (`io.concurrent`).  Used by tests to confirm
     /// compaction actually backgrounds; not load-bearing for correctness.
     bg_compactions: u64 = 0,
+    /// D2a-4 write-stall counters (diagnostic; consulted by tests).  Both are
+    /// bumped by `enforceWriteStall` at the START of each write:
+    ///   * `write_slowdowns` — a write was delayed because L0 sat in the
+    ///     slowdown band (>= `level0_slowdown_writes_trigger`, below stop).
+    ///   * `write_stalls`    — a write was STALLED at the stop trigger; L0 was
+    ///     force-drained below `level0_stop_writes_trigger` before it proceeded.
+    write_slowdowns: u64 = 0,
+    write_stalls: u64 = 0,
 
     /// Open a DB rooted at directory `name` on `e`, recovering durable state.
     ///
@@ -189,6 +197,8 @@ pub const DB = struct {
         self.io = e.io();
         self.write_mutex = .init;
         self.bg_compactions = 0;
+        self.write_slowdowns = 0;
+        self.write_stalls = 0;
         self.options = options;
         self.last_sequence = 0;
         self.owns_wal = true;
@@ -327,6 +337,8 @@ pub const DB = struct {
         self.io = e.io();
         self.write_mutex = .init;
         self.bg_compactions = 0;
+        self.write_slowdowns = 0;
+        self.write_stalls = 0;
         self.options = options;
         self.last_sequence = 0;
         self.owns_wal = false;
@@ -404,6 +416,9 @@ pub const DB = struct {
         // each CF which briefly locks only its own sub-LSM.
         try self.write_mutex.lock(self.io);
         defer self.write_mutex.unlock(self.io);
+
+        // Throttle the writer if L0 has fallen behind (D2a-4).
+        try self.enforceWriteStall();
 
         try write_path.insertBatchForCf(self.mem, batch, cf_id, first_sequence);
         self.last_sequence = set_last_sequence;
@@ -495,6 +510,10 @@ pub const DB = struct {
         try self.write_mutex.lock(self.io);
         defer self.write_mutex.unlock(self.io);
 
+        // Throttle the writer if L0 has fallen behind (D2a-4): slow down in the
+        // slowdown band, or stall + force-drain L0 at the stop trigger.
+        try self.enforceWriteStall();
+
         const first_sequence = self.last_sequence + 1;
         batch.setSequence(first_sequence);
 
@@ -520,6 +539,78 @@ pub const DB = struct {
         // A flush may have pushed a level over its compaction threshold; run any
         // pending leveled compactions before returning.
         try self.maybeScheduleCompaction();
+    }
+
+    /// Write stalls / L0 file-count throttling (D2a-4).  Called at the START of
+    /// every write (`write` / `applyBatchNoWal`), BEFORE the batch is inserted,
+    /// while holding the write mutex.  Slows or stalls the writer so it cannot
+    /// outrun flush/compaction — the L0 read path degrades linearly with the L0
+    /// file count, so an unbounded L0 would wreck read latency.
+    ///
+    /// Two bands, mirroring RocksDB:
+    ///   * STOP  (L0 >= `level0_stop_writes_trigger`): the write STALLS.  We
+    ///     force-drain L0 via leveled L0->L1 compactions — run REGARDLESS of the
+    ///     normal score / `level0_file_num_compaction_trigger` (a stuck writer
+    ///     must always be able to make progress) — until L0 is back below the
+    ///     stop trigger, then proceed.  Records one `write_stalls`.
+    ///   * SLOWDOWN (L0 >= `level0_slowdown_writes_trigger`, below stop): the
+    ///     write is DELAYED by `write_stall_slowdown_delay_us` to throttle the
+    ///     producer.  Records one `write_slowdowns`.
+    ///
+    /// A trigger of 0 disables its band.  The force-drain only applies under
+    /// leveled compaction (`.level`); universal/FIFO manage their own L0 budget
+    /// via `maybeScheduleCompaction`, so the stop band there degrades to a
+    /// best-effort `maybeScheduleCompaction` drain (still counted).
+    fn enforceWriteStall(self: *DB) !void {
+        const stop_trigger = self.options.level0_stop_writes_trigger;
+        const slowdown_trigger = self.options.level0_slowdown_writes_trigger;
+
+        const l0 = self.versions.currentVersion().numFiles(0);
+
+        // --- STOP band: stall + force-drain L0 below the trigger -------------
+        if (stop_trigger != 0 and l0 >= stop_trigger) {
+            self.write_stalls += 1;
+            switch (self.options.compaction_style) {
+                .level => {
+                    // Force L0->L1 compactions (ignoring the score trigger) until
+                    // L0 is back under the stop threshold.  Bound the loop by the
+                    // file count so a stuck picker cannot spin forever.
+                    var budget = self.versions.currentVersion().numFiles(0) * 2 + 16;
+                    const oldest_snapshot = self.snapshots.oldest();
+                    const has_live_snapshot = oldest_snapshot != null;
+                    const smallest_snapshot = oldest_snapshot orelse self.last_sequence;
+                    while (budget > 0 and
+                        self.versions.currentVersion().numFiles(0) >= stop_trigger) : (budget -= 1)
+                    {
+                        var c = (try compaction.pickL0CompactionForced(
+                            self.gpa,
+                            self.versions,
+                            self.options.comparator,
+                        )) orelse break;
+                        defer c.deinit(self.gpa);
+                        try self.runCompaction(&c, smallest_snapshot, has_live_snapshot);
+                    }
+                },
+                .universal, .fifo => {
+                    // These styles keep their runs in L0; drain via their own
+                    // picker.  Best-effort — the stall is still recorded.
+                    try self.maybeScheduleCompaction();
+                },
+            }
+            return;
+        }
+
+        // --- SLOWDOWN band: delay the write ----------------------------------
+        if (slowdown_trigger != 0 and l0 >= slowdown_trigger) {
+            self.write_slowdowns += 1;
+            const delay_us = self.options.write_stall_slowdown_delay_us;
+            if (delay_us != 0) {
+                self.io.sleep(
+                    std.Io.Duration.fromMicroseconds(@intCast(delay_us)),
+                    .awake,
+                ) catch {};
+            }
+        }
     }
 
     /// Run compactions for the configured style until nothing wants one (or a
@@ -3526,9 +3617,11 @@ test "d2a4-stalls: L0 reaching the stop trigger stalls the write, which drains L
         const k = try std.fmt.bufPrint(&kbuf, "key{d:0>5}", .{i});
         const v = try std.fmt.bufPrint(&vbuf, "val-{d:0>5}", .{i});
         try db.put(.{}, k, v);
-        // The stall is enforced at the START of each write, so right after any
-        // write returns L0 must be strictly below the stop trigger.
-        try testing.expect(db.versions.currentVersion().numFiles(0) < opts.level0_stop_writes_trigger);
+        // The stall is enforced at the START of each write (drains L0 below the
+        // stop trigger BEFORE inserting), and this write's own flush adds at most
+        // one L0 file — so right after any write returns L0 is bounded by the
+        // stop trigger.  Without throttling L0 would grow to ~30 here.
+        try testing.expect(db.versions.currentVersion().numFiles(0) <= opts.level0_stop_writes_trigger);
     }
 
     // At least one stall fired (we wrote far more than the stop trigger with no
