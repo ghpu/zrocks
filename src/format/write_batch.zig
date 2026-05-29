@@ -9,14 +9,19 @@
 ///
 /// The type bytes 0x01 / 0x00 / 0x02 match ValueType.value / .deletion / .merge.
 ///
-/// M7.0 Column-family tagging: a record targeting a NON-default column family
-/// (cf_id != 0) is prefixed with `kColumnFamilyTag` (0x10) ++ varint32(cf_id),
-/// then the ordinary record bytes follow.  Default-CF records (cf_id 0) are left
-/// UNTAGGED, so existing single-CF batches are byte-for-byte unchanged and remain
-/// back-compatible (the WAL replay + iterate paths treat an untagged record as
-/// cf 0).  `iterate` yields `(cf_id, op)` by calling `handler.putCF(cf_id, ...)`
-/// etc. when those methods exist, falling back to the cf-0 `put`/`delete`/...
-/// methods otherwise.
+/// Column-family records use RocksDB's WAL CF value types (db/dbformat.h):
+/// a record targeting a NON-default column family (cf_id != 0) starts with a
+/// `kTypeColumnFamily*` type byte IMMEDIATELY followed by varint32(cf_id), then
+/// the ordinary record fields (length-prefixed key, and value/end where
+/// applicable).  Default-CF records (cf_id 0) use the plain value-type bytes
+/// (0x01/0x00/0x02/0x0F) with NO cf id, so a single-CF batch is byte-for-byte
+/// exactly what RocksDB writes and a real RocksDB instance replays the WAL.
+///
+/// This replaces the legacy zrocks `kColumnFamilyTag=0x10` prefix scheme (which
+/// RocksDB could not parse); the on-disk WriteBatch is now RocksDB-exact.
+/// `iterate` yields `(cf_id, op)` by calling `handler.putCF(cf_id, ...)` etc.
+/// when those methods exist, falling back to the cf-0 `put`/`delete`/... methods
+/// otherwise.
 const std = @import("std");
 const coding = @import("../util/coding.zig");
 const internal_key = @import("internal_key.zig");
@@ -25,12 +30,13 @@ const ValueType = internal_key.ValueType;
 
 pub const Error = error{Corruption} || std.mem.Allocator.Error;
 
-/// Record-prefix tag introducing a non-default column-family id (M7.0).  The
-/// next bytes are varint32(cf_id) followed by the ordinary record (type byte +
-/// fields).  Chosen distinct from every ValueType tag used in a batch record
-/// (0x00/0x01/0x02/0x0F), so the first byte of a record unambiguously says
-/// whether a CF id precedes it.
-pub const kColumnFamilyTag: u8 = 0x10;
+/// RocksDB WAL column-family value-type bytes (db/dbformat.h).  Each is followed
+/// by varint32(cf_id) and then the ordinary record fields.  Byte-exact with
+/// RocksDB so real RocksDB replays a zrocks WAL carrying non-default CF records.
+pub const kTypeColumnFamilyDeletion: u8 = 0x4;
+pub const kTypeColumnFamilyValue: u8 = 0x5;
+pub const kTypeColumnFamilyMerge: u8 = 0x6;
+pub const kTypeColumnFamilyRangeDeletion: u8 = 0xE;
 
 /// Byte offset of the sequence number in the header.
 const kSeqOffset: usize = 0;
@@ -89,19 +95,24 @@ pub const WriteBatch = struct {
         self.setCount(self.count() + 1);
     }
 
-    /// Emit the CF prefix `kColumnFamilyTag ++ varint32(cf_id)` when `cf_id` is
-    /// non-default; default (0) emits nothing so the record stays untagged.
-    fn putCfPrefix(self: *WriteBatch, gpa: std.mem.Allocator, cf_id: u32) !void {
-        if (cf_id == 0) return;
-        try self.rep.append(gpa, kColumnFamilyTag);
-        try coding.putVarint32(&self.rep, gpa, cf_id);
+    /// Emit the record type byte for column family `cf_id`: for the default CF
+    /// (0) emit the plain `default_type` byte and NO cf id; for a non-default CF
+    /// emit the RocksDB `cf_type` byte followed by varint32(cf_id).  This is the
+    /// byte-exact RocksDB WAL CF encoding.
+    fn putCfTypeAndId(self: *WriteBatch, gpa: std.mem.Allocator, cf_id: u32, default_type: u8, cf_type: u8) !void {
+        if (cf_id == 0) {
+            try self.rep.append(gpa, default_type);
+        } else {
+            try self.rep.append(gpa, cf_type);
+            try coding.putVarint32(&self.rep, gpa, cf_id);
+        }
     }
 
     /// Append a Put record targeting column family `cf_id` and increment the
-    /// count.  `cf_id == 0` is identical to `put` (untagged, back-compatible).
+    /// count.  `cf_id == 0` is identical to `put` (plain 0x01, back-compatible);
+    /// a non-default CF emits `kTypeColumnFamilyValue ++ varint32(cf_id)`.
     pub fn putCF(self: *WriteBatch, gpa: std.mem.Allocator, cf_id: u32, key: []const u8, value: []const u8) !void {
-        try self.putCfPrefix(gpa, cf_id);
-        try self.rep.append(gpa, @intFromEnum(ValueType.value));
+        try self.putCfTypeAndId(gpa, cf_id, @intFromEnum(ValueType.value), kTypeColumnFamilyValue);
         try coding.putLengthPrefixedSlice(&self.rep, gpa, key);
         try coding.putLengthPrefixedSlice(&self.rep, gpa, value);
         self.setCount(self.count() + 1);
@@ -109,16 +120,14 @@ pub const WriteBatch = struct {
 
     /// Append a Delete record targeting column family `cf_id`.
     pub fn deleteCF(self: *WriteBatch, gpa: std.mem.Allocator, cf_id: u32, key: []const u8) !void {
-        try self.putCfPrefix(gpa, cf_id);
-        try self.rep.append(gpa, @intFromEnum(ValueType.deletion));
+        try self.putCfTypeAndId(gpa, cf_id, @intFromEnum(ValueType.deletion), kTypeColumnFamilyDeletion);
         try coding.putLengthPrefixedSlice(&self.rep, gpa, key);
         self.setCount(self.count() + 1);
     }
 
     /// Append a Merge operand targeting column family `cf_id`.
     pub fn mergeCF(self: *WriteBatch, gpa: std.mem.Allocator, cf_id: u32, key: []const u8, value: []const u8) !void {
-        try self.putCfPrefix(gpa, cf_id);
-        try self.rep.append(gpa, @intFromEnum(ValueType.merge));
+        try self.putCfTypeAndId(gpa, cf_id, @intFromEnum(ValueType.merge), kTypeColumnFamilyMerge);
         try coding.putLengthPrefixedSlice(&self.rep, gpa, key);
         try coding.putLengthPrefixedSlice(&self.rep, gpa, value);
         self.setCount(self.count() + 1);
@@ -126,8 +135,7 @@ pub const WriteBatch = struct {
 
     /// Append a DeleteRange record targeting column family `cf_id`.
     pub fn deleteRangeCF(self: *WriteBatch, gpa: std.mem.Allocator, cf_id: u32, begin: []const u8, end: []const u8) !void {
-        try self.putCfPrefix(gpa, cf_id);
-        try self.rep.append(gpa, @intFromEnum(ValueType.range_deletion));
+        try self.putCfTypeAndId(gpa, cf_id, @intFromEnum(ValueType.range_deletion), kTypeColumnFamilyRangeDeletion);
         try coding.putLengthPrefixedSlice(&self.rep, gpa, begin);
         try coding.putLengthPrefixedSlice(&self.rep, gpa, end);
         self.setCount(self.count() + 1);
@@ -212,66 +220,81 @@ pub const WriteBatch = struct {
         var parsed_count: u32 = 0;
 
         while (input.len > 0) {
-            // Optional CF prefix: kColumnFamilyTag ++ varint32(cf_id).
-            var cf_id: u32 = 0;
-            if (input[0] == kColumnFamilyTag) {
-                input = input[1..];
-                cf_id = coding.getVarint32(&input) catch return error.Corruption;
-            }
-
-            // Read the type byte.
-            if (input.len == 0) return error.Corruption;
+            // Read the type byte.  Default-CF records use the plain value-type
+            // bytes; CF records use a kTypeColumnFamily* byte followed by
+            // varint32(cf_id).  (RocksDB WAL byte-exact, db/write_batch.cc.)
             const type_byte = input[0];
             input = input[1..];
 
-            if (type_byte == @intFromEnum(ValueType.value)) {
-                const key = coding.getLengthPrefixedSlice(&input) catch return error.Corruption;
-                const value = coding.getLengthPrefixedSlice(&input) catch return error.Corruption;
-                if (@hasDecl(Handler, "putCF")) {
-                    try handler.putCF(cf_id, key, value);
-                } else {
-                    if (cf_id != 0) return error.Corruption;
-                    try handler.put(key, value);
-                }
-                parsed_count += 1;
-            } else if (type_byte == @intFromEnum(ValueType.deletion)) {
-                const key = coding.getLengthPrefixedSlice(&input) catch return error.Corruption;
-                if (@hasDecl(Handler, "deleteCF")) {
-                    try handler.deleteCF(cf_id, key);
-                } else {
-                    if (cf_id != 0) return error.Corruption;
-                    try handler.delete(key);
-                }
-                parsed_count += 1;
-            } else if (type_byte == @intFromEnum(ValueType.merge)) {
-                const key = coding.getLengthPrefixedSlice(&input) catch return error.Corruption;
-                const value = coding.getLengthPrefixedSlice(&input) catch return error.Corruption;
-                if (@hasDecl(Handler, "mergeCF")) {
-                    try handler.mergeCF(cf_id, key, value);
-                } else {
-                    if (cf_id != 0) return error.Corruption;
-                    try handler.merge(key, value);
-                }
-                parsed_count += 1;
-            } else if (type_byte == @intFromEnum(ValueType.range_deletion)) {
-                const begin = coding.getLengthPrefixedSlice(&input) catch return error.Corruption;
-                const end = coding.getLengthPrefixedSlice(&input) catch return error.Corruption;
-                if (@hasDecl(Handler, "deleteRangeCF")) {
-                    try handler.deleteRangeCF(cf_id, begin, end);
-                } else if (@hasDecl(Handler, "deleteRange")) {
-                    // A range record reaching a CF-unaware handler with only the
-                    // cf-0 method must target the default CF.
-                    if (cf_id != 0) return error.Corruption;
-                    try handler.deleteRange(begin, end);
-                } else {
-                    // A range record reaching a put/delete-only handler is a usage
-                    // error (e.g. an old handler without range support).
-                    return error.Corruption;
-                }
-                parsed_count += 1;
-            } else {
-                return error.Corruption;
+            // Resolve (cf_id, op-kind), consuming the varint cf id for CF types.
+            const Op = enum { put, deletion, merge, range_deletion };
+            var cf_id: u32 = 0;
+            const op: Op = switch (type_byte) {
+                @intFromEnum(ValueType.value) => .put,
+                @intFromEnum(ValueType.deletion) => .deletion,
+                @intFromEnum(ValueType.merge) => .merge,
+                @intFromEnum(ValueType.range_deletion) => .range_deletion,
+                kTypeColumnFamilyValue, kTypeColumnFamilyDeletion, kTypeColumnFamilyMerge, kTypeColumnFamilyRangeDeletion => blk: {
+                    cf_id = coding.getVarint32(&input) catch return error.Corruption;
+                    break :blk switch (type_byte) {
+                        kTypeColumnFamilyValue => .put,
+                        kTypeColumnFamilyDeletion => .deletion,
+                        kTypeColumnFamilyMerge => .merge,
+                        kTypeColumnFamilyRangeDeletion => .range_deletion,
+                        else => unreachable,
+                    };
+                },
+                else => return error.Corruption,
+            };
+
+            switch (op) {
+                .put => {
+                    const key = coding.getLengthPrefixedSlice(&input) catch return error.Corruption;
+                    const value = coding.getLengthPrefixedSlice(&input) catch return error.Corruption;
+                    if (@hasDecl(Handler, "putCF")) {
+                        try handler.putCF(cf_id, key, value);
+                    } else {
+                        if (cf_id != 0) return error.Corruption;
+                        try handler.put(key, value);
+                    }
+                },
+                .deletion => {
+                    const key = coding.getLengthPrefixedSlice(&input) catch return error.Corruption;
+                    if (@hasDecl(Handler, "deleteCF")) {
+                        try handler.deleteCF(cf_id, key);
+                    } else {
+                        if (cf_id != 0) return error.Corruption;
+                        try handler.delete(key);
+                    }
+                },
+                .merge => {
+                    const key = coding.getLengthPrefixedSlice(&input) catch return error.Corruption;
+                    const value = coding.getLengthPrefixedSlice(&input) catch return error.Corruption;
+                    if (@hasDecl(Handler, "mergeCF")) {
+                        try handler.mergeCF(cf_id, key, value);
+                    } else {
+                        if (cf_id != 0) return error.Corruption;
+                        try handler.merge(key, value);
+                    }
+                },
+                .range_deletion => {
+                    const begin = coding.getLengthPrefixedSlice(&input) catch return error.Corruption;
+                    const end = coding.getLengthPrefixedSlice(&input) catch return error.Corruption;
+                    if (@hasDecl(Handler, "deleteRangeCF")) {
+                        try handler.deleteRangeCF(cf_id, begin, end);
+                    } else if (@hasDecl(Handler, "deleteRange")) {
+                        // A range record reaching a CF-unaware handler with only
+                        // the cf-0 method must target the default CF.
+                        if (cf_id != 0) return error.Corruption;
+                        try handler.deleteRange(begin, end);
+                    } else {
+                        // A range record reaching a put/delete-only handler is a
+                        // usage error (an old handler without range support).
+                        return error.Corruption;
+                    }
+                },
             }
+            parsed_count += 1;
         }
 
         if (parsed_count != expected_count) return error.Corruption;
@@ -596,21 +619,117 @@ test "M7.0 golden bytes: putCF(cf=0) is untagged (back-compatible with put)" {
     try std.testing.expectEqualSlices(u8, a.contents(), b.contents());
 }
 
-test "M7.0 golden bytes: putCF(cf=5) prefixes kColumnFamilyTag + varint(5)" {
+test "RocksDB CF golden bytes: putCF(cf=5) emits kTypeColumnFamilyValue + varint(5)" {
     const gpa = std.testing.allocator;
     var wb = try WriteBatch.init(gpa);
     defer wb.deinit(gpa);
 
     try wb.putCF(gpa, 5, "k", "v");
+    // RocksDB WAL form: type byte kTypeColumnFamilyValue (0x05) IMMEDIATELY
+    // followed by varint32(cf_id=5), then the length-prefixed key + value.
     const expected = [_]u8{
         0, 0, 0, 0, 0, 0, 0, 0, // seq=0
         1, 0, 0, 0, // count=1
-        kColumnFamilyTag, 0x05, // CF prefix: tag + varint(5)
-        0x01, // ValueType.value
+        kTypeColumnFamilyValue, 0x05, // CF type byte + varint(cf=5)
         0x01, 'k',
         0x01, 'v',
     };
     try std.testing.expectEqualSlices(u8, &expected, wb.contents());
+}
+
+test "RocksDB CF golden bytes: deleteCF(cf=2) emits kTypeColumnFamilyDeletion + varint(2)" {
+    const gpa = std.testing.allocator;
+    var wb = try WriteBatch.init(gpa);
+    defer wb.deinit(gpa);
+
+    try wb.deleteCF(gpa, 2, "k");
+    const expected = [_]u8{
+        0, 0, 0, 0, 0, 0, 0, 0, // seq=0
+        1, 0, 0, 0, // count=1
+        kTypeColumnFamilyDeletion, 0x02, // CF deletion type + varint(cf=2)
+        0x01, 'k',
+    };
+    try std.testing.expectEqualSlices(u8, &expected, wb.contents());
+}
+
+test "RocksDB CF golden bytes: mergeCF(cf=3) emits kTypeColumnFamilyMerge + varint(3)" {
+    const gpa = std.testing.allocator;
+    var wb = try WriteBatch.init(gpa);
+    defer wb.deinit(gpa);
+
+    try wb.mergeCF(gpa, 3, "c", "op");
+    const expected = [_]u8{
+        0, 0, 0, 0, 0, 0, 0, 0, // seq=0
+        1, 0, 0, 0, // count=1
+        kTypeColumnFamilyMerge, 0x03, // CF merge type + varint(cf=3)
+        0x01, 'c',
+        0x02, 'o', 'p',
+    };
+    try std.testing.expectEqualSlices(u8, &expected, wb.contents());
+}
+
+test "RocksDB CF golden bytes: deleteRangeCF(cf=4) emits kTypeColumnFamilyRangeDeletion + varint(4)" {
+    const gpa = std.testing.allocator;
+    var wb = try WriteBatch.init(gpa);
+    defer wb.deinit(gpa);
+
+    try wb.deleteRangeCF(gpa, 4, "b", "d");
+    const expected = [_]u8{
+        0, 0, 0, 0, 0, 0, 0, 0, // seq=0
+        1, 0, 0, 0, // count=1
+        kTypeColumnFamilyRangeDeletion, 0x04, // CF range-del type + varint(cf=4)
+        0x01, 'b',
+        0x01, 'd',
+    };
+    try std.testing.expectEqualSlices(u8, &expected, wb.contents());
+}
+
+test "RocksDB CF round-trip: CF records iterate back with their cf ids" {
+    const gpa = std.testing.allocator;
+    var wb = try WriteBatch.init(gpa);
+    defer wb.deinit(gpa);
+
+    try wb.putCF(gpa, 5, "k", "v");
+    try wb.deleteCF(gpa, 2, "k");
+    try wb.mergeCF(gpa, 3, "c", "op");
+    try wb.deleteRangeCF(gpa, 4, "b", "d");
+
+    const Handler = struct {
+        ids: [8]u32 = undefined,
+        kinds: [8]u8 = undefined,
+        n: usize = 0,
+        pub fn putCF(self: *@This(), cf_id: u32, _: []const u8, _: []const u8) !void {
+            self.ids[self.n] = cf_id;
+            self.kinds[self.n] = 'p';
+            self.n += 1;
+        }
+        pub fn deleteCF(self: *@This(), cf_id: u32, _: []const u8) !void {
+            self.ids[self.n] = cf_id;
+            self.kinds[self.n] = 'd';
+            self.n += 1;
+        }
+        pub fn mergeCF(self: *@This(), cf_id: u32, _: []const u8, _: []const u8) !void {
+            self.ids[self.n] = cf_id;
+            self.kinds[self.n] = 'm';
+            self.n += 1;
+        }
+        pub fn deleteRangeCF(self: *@This(), cf_id: u32, _: []const u8, _: []const u8) !void {
+            self.ids[self.n] = cf_id;
+            self.kinds[self.n] = 'r';
+            self.n += 1;
+        }
+    };
+    var h = Handler{};
+    try wb.iterate(&h);
+    try std.testing.expectEqual(@as(usize, 4), h.n);
+    try std.testing.expectEqual(@as(u32, 5), h.ids[0]);
+    try std.testing.expectEqual(@as(u8, 'p'), h.kinds[0]);
+    try std.testing.expectEqual(@as(u32, 2), h.ids[1]);
+    try std.testing.expectEqual(@as(u8, 'd'), h.kinds[1]);
+    try std.testing.expectEqual(@as(u32, 3), h.ids[2]);
+    try std.testing.expectEqual(@as(u8, 'm'), h.kinds[2]);
+    try std.testing.expectEqual(@as(u32, 4), h.ids[3]);
+    try std.testing.expectEqual(@as(u8, 'r'), h.kinds[3]);
 }
 
 test "M7.0 iterate: CF-aware handler receives per-record cf ids" {
