@@ -964,3 +964,33 @@ test "D1b-M4: SST data for all CFs recovers through the one shared MANIFEST" {
         try testing.expectEqualStrings("b-0-padding-padding-padding", cross);
     }
 }
+
+// ---------------------------------------------------------------------------
+// D2a-1 — io capability + shared-WAL write mutex on the multi-CF database
+// ---------------------------------------------------------------------------
+
+test "D2a-1: CfDB carries an Env io capability + a shared-WAL write mutex" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const cdb = try CfDB.open(gpa, me.env(), "cfmutex", .{});
+    defer cdb.close();
+
+    // The CfDB shares the Env's io capability (no ambient io).
+    try testing.expect(cdb.io.userdata == me.env().io().userdata);
+    try testing.expect(cdb.io.vtable == me.env().io().vtable);
+
+    // The shared-WAL write mutex is free between writes; round-trips.
+    try testing.expect(cdb.write_mutex.tryLock());
+    cdb.write_mutex.unlock(cdb.io);
+
+    // Atomic cross-CF writes + reads still work single-threaded under the mutex.
+    const def = cdb.defaultColumnFamily();
+    try cdb.put(.{}, def, "k", "v");
+    const got = try cdb.get(.{}, def, "k") orelse return error.TestExpectedFound;
+    defer gpa.free(got);
+    try testing.expectEqualStrings("v", got);
+
+    try testing.expect(cdb.write_mutex.tryLock());
+    cdb.write_mutex.unlock(cdb.io);
+}
