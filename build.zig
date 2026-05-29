@@ -88,6 +88,20 @@ pub fn build(b: *std.Build) void {
     });
     const run_interop_tests = b.addRunArtifact(interop_tests);
 
+    // Wave A external-LevelDB read-interop gate (rooted at
+    // tests/leveldb_interop_test.zig, importing the "zrocks" module): generates
+    // a byte-valid external-LevelDB fixture (CURRENT + MANIFEST + WAL, no SSTs)
+    // and opens it read_only to prove non-destructive foreign-DB reads.
+    const leveldb_interop_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/leveldb_interop_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zrocks", .module = mod }},
+        }),
+    });
+    const run_leveldb_interop_tests = b.addRunArtifact(leveldb_interop_tests);
+
     // Bench harness tests (bench_main.zig imports zrocks and has embedded tests).
     const bench_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -103,5 +117,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&run_integration_tests.step);
     test_step.dependOn(&run_interop_tests.step);
+    test_step.dependOn(&run_leveldb_interop_tests.step);
     test_step.dependOn(&run_bench_tests.step);
 }
