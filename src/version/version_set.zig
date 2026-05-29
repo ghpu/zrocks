@@ -589,8 +589,24 @@ pub const VersionSet = struct {
     }
 
     /// Emit a VersionEdit capturing the full current state into the descriptor
-    /// log (comparator name, bookkeeping scalars, and every live file).
+    /// log (comparator name, bookkeeping scalars, every live file, and a
+    /// kColumnFamilyAdd record for the default CF so the snapshot is
+    /// self-contained when read by a RocksDB-aware reader).
     fn writeSnapshot(self: *VersionSet, writer: *log_writer.Writer, wf: env.WritableFile) !void {
+        // First record: kColumnFamilyAdd for the default CF (id=0, name="default").
+        {
+            var cf_edit = VersionEdit.init();
+            defer cf_edit.deinit(self.gpa);
+            cf_edit.setColumnFamilyId(0);
+            try cf_edit.setColumnFamilyAdd(self.gpa, "default");
+
+            var cf_buf: std.ArrayListUnmanaged(u8) = .empty;
+            defer cf_buf.deinit(self.gpa);
+            try cf_edit.encodeTo(&cf_buf, self.gpa);
+            try writer.addRecord(self.gpa, cf_buf.items);
+        }
+
+        // Second record: full state snapshot (comparator, scalars, files).
         var edit = VersionEdit.init();
         defer edit.deinit(self.gpa);
 
@@ -929,6 +945,39 @@ test "MANIFEST round-trip: recover reproduces identical state" {
     try testing.expectEqual(@as(u64, 20), v.files[1].items[0].number);
     try testing.expectEqual(@as(u64, 200), v.files[1].items[0].file_size);
     try testing.expectEqual(@as(u64, 30), v.files[2].items[0].number);
+}
+
+test "writeSnapshot emits kColumnFamilyAdd for default CF" {
+    // After logAndApply, the MANIFEST is created via createDescriptor which calls
+    // writeSnapshot.  Recovery must succeed even with the CF records prepended.
+    // This test verifies that:
+    //   (a) The MANIFEST is self-contained after writeSnapshot (recovery works).
+    //   (b) The recovered VersionSet has the correct scalars (not confused by
+    //       the CF tag records).
+    const gpa = testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+
+    {
+        var vs = try VersionSet.init(gpa, me.env(), "cfdb", .{});
+        defer vs.deinit();
+
+        var edit = VersionEdit.init();
+        defer edit.deinit(gpa);
+        edit.setLogNumber(3);
+        edit.setLastSequence(50);
+        edit.setNextFileNumber(10);
+        try vs.logAndApply(&edit);
+    }
+
+    // Recover must succeed: the MANIFEST now starts with a kColumnFamilyAdd record.
+    var vs2 = try VersionSet.init(gpa, me.env(), "cfdb", .{});
+    defer vs2.deinit();
+    try vs2.recover();
+
+    try testing.expectEqual(@as(u64, 3), vs2.logNumber());
+    try testing.expectEqual(@as(u64, 50), vs2.lastSequence());
+    try testing.expect(vs2.newFileNumber() >= 10);
 }
 
 test "recover across multiple edits accumulates layout" {
