@@ -45,6 +45,17 @@ pub const CompressionType = enum(u8) {
     zstd = 0x7,
 };
 
+/// SST filter on-disk format (fulllocalbloom).  Selects which filter the table
+/// builder writes and which one the reader consults.
+///   - `.block_based`: the legacy LevelDB per-2KB-range bloom filter registered
+///     in the metaindex under `"filter." ++ policy.name()` (filter_block.zig).
+///     This is the DEFAULT so existing on-disk SSTs keep reading unchanged.
+///   - `.full`: a single RocksDB-style FastLocalBloom full filter over EVERY
+///     key, registered under `"fullfilter." ++ policy.name()` (full_filter.zig).
+/// The reader auto-detects which one a table carries from the metaindex, so the
+/// two formats coexist on disk and an old SST is never misread as a new one.
+pub const FilterMode = enum { block_based, full };
+
 // ---------------------------------------------------------------------------
 // Options — DB-open configuration (capability-based plain value struct)
 // ---------------------------------------------------------------------------
@@ -88,6 +99,13 @@ pub const Options = struct {
     /// becomes available (see `ReadOptions.prefix_same_as_start`).  Default null
     /// keeps the original whole-key bloom behaviour.
     prefix_extractor: ?prefix.PrefixExtractor = null,
+
+    /// SST filter format (fulllocalbloom).  Default `.block_based` keeps the
+    /// legacy LevelDB block-based filter so existing on-disk SSTs are unaffected;
+    /// set to `.full` to write RocksDB-style FastLocalBloom full filters.  The
+    /// reader auto-detects either format from the metaindex regardless of this
+    /// setting, so a DB can be reopened with a different mode without breaking.
+    filter_mode: FilterMode = .block_based,
 
     /// Optional merge operator (M7.1).  When set, `DB.merge(key, operand)`
     /// records a read-modify-write operand that is combined lazily — on read,

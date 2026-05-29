@@ -30,6 +30,7 @@ const std = @import("std");
 
 const block = @import("block.zig");
 const filter_block = @import("filter_block.zig");
+const full_filter = @import("full_filter.zig");
 const bloom = @import("bloom.zig");
 const internal_key = @import("internal_key.zig");
 const delete_range = @import("../rocks/delete_range.zig");
@@ -54,8 +55,13 @@ pub const kSnappyCompression: u8 = 1;
 /// Restart interval used for the index and metaindex blocks (LevelDB uses 1).
 const kMetaIndexRestartInterval: usize = 1;
 
-/// Prefix of the metaindex key naming the table's filter block.
+/// Prefix of the metaindex key naming the table's (legacy block-based) filter.
 const kFilterMetaKeyPrefix: []const u8 = "filter.";
+/// Prefix of the metaindex key naming the table's FastLocalBloom full filter
+/// (fulllocalbloom).  Distinct from `kFilterMetaKeyPrefix` so the two formats
+/// never collide on disk and an old reader cannot mistake a full filter for a
+/// block-based one (it simply finds no "filter." entry).
+const kFullFilterMetaKeyPrefix: []const u8 = "fullfilter.";
 
 /// Metaindex key naming the table's range-del block (M7.5).  Our own clean
 /// format (see delete_range.zig), NOT RocksDB byte-compatible.
@@ -74,7 +80,11 @@ pub const TableBuilder = struct {
     /// Builder for the index block (one entry per flushed data block).
     index_block: BlockBuilder,
     /// Block-based bloom filter builder (one filter per 2KB data range).
+    /// Used only when `options.filter_mode == .block_based` (the default).
     filter: FilterBlockBuilder,
+    /// FastLocalBloom full-filter builder (one filter over EVERY key).
+    /// Used only when `options.filter_mode == .full` (fulllocalbloom).
+    full_filter: full_filter.FullFilterBuilder,
 
     /// The most recently added key (used for separators and the sorted assert).
     last_key: std.ArrayListUnmanaged(u8),
@@ -120,6 +130,7 @@ pub const TableBuilder = struct {
             .data_block = BlockBuilder.init(gpa, options.comparator, options.block_restart_interval),
             .index_block = BlockBuilder.init(gpa, options.comparator, kMetaIndexRestartInterval),
             .filter = filter,
+            .full_filter = full_filter.FullFilterBuilder.init(policy.bits_per_key),
             .last_key = .empty,
             .offset = 0,
             .num_entries = 0,
@@ -135,6 +146,7 @@ pub const TableBuilder = struct {
         self.data_block.deinit();
         self.index_block.deinit();
         self.filter.deinit(self.gpa);
+        self.full_filter.deinit(self.gpa);
         self.last_key.deinit(self.gpa);
         self.handle_encoding.deinit(self.gpa);
         self.range_tombstones.deinit();
@@ -181,10 +193,10 @@ pub const TableBuilder = struct {
         if (self.options.prefix_extractor) |pe| {
             const user_key = internal_key.extractUserKey(key);
             if (pe.inDomain(user_key)) {
-                try self.filter.addKey(self.gpa, pe.transform(user_key));
+                try self.addFilterKey(pe.transform(user_key));
             }
         } else {
-            try self.filter.addKey(self.gpa, key);
+            try self.addFilterKey(key);
         }
 
         // Remember last_key = key.
@@ -196,6 +208,16 @@ pub const TableBuilder = struct {
 
         if (self.data_block.currentSizeEstimate() >= self.options.block_size) {
             try self.flush();
+        }
+    }
+
+    /// Route a filter key to the active filter format (fulllocalbloom gate).
+    /// Block-based mode accumulates per-2KB-range; full mode accumulates every
+    /// key into a single FastLocalBloom filter.
+    fn addFilterKey(self: *TableBuilder, key: []const u8) !void {
+        switch (self.options.filter_mode) {
+            .block_based => try self.filter.addKey(self.gpa, key),
+            .full => try self.full_filter.addKey(self.gpa, key),
         }
     }
 
@@ -221,8 +243,11 @@ pub const TableBuilder = struct {
         self.pending_index_entry = true;
         try self.file.flush();
 
-        // Begin the next filter range at the new file offset.
-        try self.filter.startBlock(self.gpa, self.offset);
+        // Begin the next filter range at the new file offset (block-based only;
+        // the full filter is offset-agnostic — one filter over all keys).
+        if (self.options.filter_mode == .block_based) {
+            try self.filter.startBlock(self.gpa, self.offset);
+        }
     }
 
     /// Finish a BlockBuilder, write it UNCOMPRESSED (with trailer) to the file,
@@ -290,8 +315,14 @@ pub const TableBuilder = struct {
         try self.flush();
         self.finished = true;
 
-        // 1. Filter block.
-        const filter_contents = try self.filter.finish(self.gpa);
+        // 1. Filter block.  The active format (fulllocalbloom gate) decides both
+        //    the on-disk filter layout and the metaindex key it is registered
+        //    under — block-based under "filter."++name, full under
+        //    "fullfilter."++name — so the two never collide on disk.
+        const filter_contents = switch (self.options.filter_mode) {
+            .block_based => try self.filter.finish(self.gpa),
+            .full => try self.full_filter.finish(self.gpa),
+        };
         const filter_handle = try self.writeRawBlock(filter_contents, kNoCompression);
 
         // 1b. Range-del block (M7.5): a serialized RangeTombstoneList.  Written
@@ -316,7 +347,11 @@ pub const TableBuilder = struct {
         {
             var key_buf: std.ArrayListUnmanaged(u8) = .empty;
             defer key_buf.deinit(self.gpa);
-            try key_buf.appendSlice(self.gpa, kFilterMetaKeyPrefix);
+            const meta_prefix = switch (self.options.filter_mode) {
+                .block_based => kFilterMetaKeyPrefix,
+                .full => kFullFilterMetaKeyPrefix,
+            };
+            try key_buf.appendSlice(self.gpa, meta_prefix);
             try key_buf.appendSlice(self.gpa, self.policy.name());
 
             self.handle_encoding.clearRetainingCapacity();
@@ -730,4 +765,146 @@ test "table builder: single small block still well-formed" {
         idx += 1;
     }
     try testing.expectEqual(pairs.len, idx);
+}
+
+// ===========================================================================
+// fulllocalbloom — FastLocalBloom full filter wired through builder + reader.
+// ===========================================================================
+
+const FullFilterReader = full_filter.FullFilterReader;
+
+test "table builder: full-filter mode writes fullfilter. meta key + readable FastLocalBloom" {
+    const gpa = testing.allocator;
+
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    const opts = options_mod.Options{
+        .block_size = 200,
+        .block_restart_interval = 4,
+        .filter_mode = .full, // fulllocalbloom gate
+    };
+    const policy = bloom.BloomFilterPolicy.init(10);
+
+    var entries = try makeSortedEntries(gpa, 50);
+    defer freeEntries(gpa, &entries);
+
+    {
+        var wf = try e.newWritableFile(gpa, "full.sst");
+        errdefer wf.close() catch {};
+        var tb = try TableBuilder.init(gpa, opts, wf, policy);
+        defer tb.deinit();
+        for (entries.items) |kv| try tb.add(kv.k, kv.v);
+        try tb.finish();
+        try wf.close();
+    }
+
+    const file = try readAllFile(e, gpa, "full.sst");
+    defer gpa.free(file);
+
+    const footer = try Footer.decodeFrom(file[file.len - footer_mod.kEncodedLength ..]);
+
+    // Metaindex carries the FULL-filter key, NOT the block-based one.
+    const meta_contents = try readVerifiedBlock(file, footer.metaindex_handle);
+    const meta_blk = try block.Block.init(gpa, meta_contents);
+
+    var full_key: std.ArrayListUnmanaged(u8) = .empty;
+    defer full_key.deinit(gpa);
+    try full_key.appendSlice(gpa, "fullfilter.");
+    try full_key.appendSlice(gpa, policy.name());
+    try testing.expectEqualStrings("fullfilter.leveldb.BuiltinBloomFilter2", full_key.items);
+
+    var legacy_key: std.ArrayListUnmanaged(u8) = .empty;
+    defer legacy_key.deinit(gpa);
+    try legacy_key.appendSlice(gpa, "filter.");
+    try legacy_key.appendSlice(gpa, policy.name());
+
+    {
+        var it = meta_blk.iterator(comparator.bytewise);
+        defer it.deinit();
+        it.seek(full_key.items);
+        try testing.expect(it.valid());
+        try testing.expectEqualStrings(full_key.items, it.key());
+
+        var hv: []const u8 = it.value();
+        const filter_handle = try BlockHandle.decodeFrom(&hv);
+        const filter_contents = try readVerifiedBlock(file, filter_handle);
+
+        var fr = FullFilterReader.init(filter_contents);
+        try testing.expect(fr.valid);
+        // No false negatives: every inserted internal key reports may-match.
+        for (entries.items) |kv| try testing.expect(fr.keyMayMatch(kv.k));
+        // An absent key is (almost surely) pruned.
+        try testing.expect(!fr.keyMayMatch("definitely-absent-key-9999"));
+    }
+
+    {
+        // The legacy "filter." block-based entry must be ABSENT in full mode.
+        var it = meta_blk.iterator(comparator.bytewise);
+        defer it.deinit();
+        it.seek(legacy_key.items);
+        const present = it.valid() and comparator.bytewise.compare(it.key(), legacy_key.items) == .eq;
+        try testing.expect(!present);
+    }
+}
+
+test "table reader: full-filter mode round-trips through Table.get (no data lost, absent pruned)" {
+    const gpa = testing.allocator;
+
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    // Plain bytewise keys across several data blocks (small block_size), with
+    // the FastLocalBloom full filter enabled.  This drives Table.get's bloom
+    // fast-path through `full_filter_reader`: a present key must never be
+    // pruned (no false negatives), an absent key is pruned/not-found.
+    const opts = options_mod.Options{
+        .block_size = 200,
+        .block_restart_interval = 4,
+        .filter_mode = .full,
+    };
+    const policy = bloom.BloomFilterPolicy.init(10);
+
+    var entries = try makeSortedEntries(gpa, 50);
+    defer freeEntries(gpa, &entries);
+
+    {
+        var wf = try e.newWritableFile(gpa, "fullget.sst");
+        errdefer wf.close() catch {};
+        var tb = try TableBuilder.init(gpa, opts, wf, policy);
+        defer tb.deinit();
+        for (entries.items) |kv| try tb.add(kv.k, kv.v);
+        try tb.finish();
+        try wf.close();
+    }
+
+    const size = try e.getFileSize("fullget.sst");
+    var raf = try e.newRandomAccessFile(gpa, "fullget.sst");
+    defer raf.close() catch {};
+
+    const table_reader = @import("table_reader.zig");
+    var tbl = try table_reader.Table.open(gpa, raf, size, opts, policy, null, 0);
+    defer tbl.deinit();
+
+    // The reader must have detected the FULL filter (not the legacy one).
+    try testing.expect(tbl.full_filter_reader != null);
+    try testing.expect(tbl.filter_reader == null);
+
+    // 1. No data lost: every inserted key resolves to its value — proving the
+    //    full filter never drops a present key.
+    for (entries.items) |kv| {
+        const got = try tbl.get(gpa, kv.k);
+        try testing.expect(got != null);
+        defer gpa.free(got.?);
+        try testing.expectEqualStrings(kv.v, got.?);
+    }
+
+    // 2. Absent keys return null (the filter prunes most; any survivor is found
+    //    absent in its data block).
+    {
+        const got = try tbl.get(gpa, "key99999-definitely-absent");
+        try testing.expect(got == null);
+    }
 }
