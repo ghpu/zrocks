@@ -448,7 +448,21 @@ const Output = struct {
     smallest: []u8, // owned
     largest: []u8, // owned
     file_size: u64,
+    /// Min/max sequence numbers across ALL entries written to this output,
+    /// extracted from the parsed internal-key trailers.  RocksDB's kNewFile4
+    /// MANIFEST record carries these; emitting zeros (the legacy kNewFile=7
+    /// path) makes a real-RocksDB open a Corruption.
+    smallest_seqno: u64 = 0,
+    largest_seqno: u64 = 0,
 };
+
+/// Decode the sequence number from an internal key's 8-byte trailer (0 if the
+/// key is too short to carry a trailer — defensive, should not occur).
+fn seqnoOfIkey(ikey: []const u8) u64 {
+    if (ikey.len < 8) return 0;
+    const trailer = coding.decodeFixed64(ikey[ikey.len - 8 ..][0..8]);
+    return internal_key.unpackSequenceAndType(trailer).sequence;
+}
 
 /// Result of a compaction's BUILD phase (D2a-3): the finished output SSTs'
 /// metadata + whether they carry surviving range tombstones.
@@ -633,6 +647,11 @@ pub fn buildCompaction(
     var cur_number: u64 = 0;
     var cur_smallest: ?[]u8 = null;
     var cur_largest: ?[]u8 = null;
+    // Min/max seqno of the currently-open output (reset per output by
+    // EmitCtx.ensureBuilder); recorded into each finished Output for kNewFile4.
+    var cur_smallest_seqno: u64 = 0;
+    var cur_largest_seqno: u64 = 0;
+    var cur_seqno_seen: bool = false;
     // Tear down a half-open output on error (the success path closes it cleanly).
     errdefer {
         if (builder) |*b| b.deinit();
@@ -686,6 +705,9 @@ pub fn buildCompaction(
         .cur_number = &cur_number,
         .cur_smallest = &cur_smallest,
         .cur_largest = &cur_largest,
+        .cur_smallest_seqno = &cur_smallest_seqno,
+        .cur_largest_seqno = &cur_largest_seqno,
+        .cur_seqno_seen = &cur_seqno_seen,
         .outputs = &outputs,
         .surviving_tombstones = &surviving,
     };
@@ -827,7 +849,7 @@ pub fn buildCompaction(
 
     // Close any final open output.
     if (builder != null) {
-        try finishOutput(gpa, &builder, &cur_file, cur_number, &cur_smallest, &cur_largest, &outputs);
+        try finishOutput(gpa, &builder, &cur_file, cur_number, &cur_smallest, &cur_largest, &cur_smallest_seqno, &cur_largest_seqno, &outputs);
     }
 
     // Build done.  Hand the outputs to the caller, which COMMITS them to the
@@ -875,7 +897,20 @@ pub fn commitCompaction(
     // to `level + 1`.  `outputLevel()` resolves the right destination.
     const out_level = compaction.outputLevel();
     for (result.outputs.items) |o| {
-        try edit.addFile(gpa, @intCast(out_level), o.number, o.file_size, o.smallest, o.largest);
+        // Emit a kNewFile4 (tag 103) record carrying the output's min/max
+        // sequence numbers — real RocksDB requires these in its MANIFEST; the
+        // legacy kNewFile=7 path (addFile) makes a real-RocksDB open a
+        // Corruption (the latent bug this milestone fixes).
+        try edit.addFile4(
+            gpa,
+            @intCast(out_level),
+            o.number,
+            o.file_size,
+            o.smallest,
+            o.largest,
+            o.smallest_seqno,
+            o.largest_seqno,
+        );
         edit.setLastFileHasRangeTombstones(result.out_has_tombstones);
     }
 
@@ -900,6 +935,8 @@ fn finishOutput(
     cur_number: u64,
     cur_smallest: *?[]u8,
     cur_largest: *?[]u8,
+    cur_smallest_seqno: *u64,
+    cur_largest_seqno: *u64,
     outputs: *std.ArrayListUnmanaged(Output),
 ) !void {
     try builder.*.?.finish();
@@ -915,6 +952,8 @@ fn finishOutput(
         .smallest = cur_smallest.*.?,
         .largest = cur_largest.*.?,
         .file_size = file_size,
+        .smallest_seqno = cur_smallest_seqno.*,
+        .largest_seqno = cur_largest_seqno.*,
     });
     cur_smallest.* = null;
     cur_largest.* = null;
@@ -936,6 +975,12 @@ const EmitCtx = struct {
     cur_number: *u64,
     cur_smallest: *?[]u8,
     cur_largest: *?[]u8,
+    /// Min/max sequence numbers seen in the CURRENTLY-open output (reset on
+    /// each `ensureBuilder`).  `cur_seqno_seen` is false until the first entry,
+    /// so the first seqno initializes both bounds.
+    cur_smallest_seqno: *u64,
+    cur_largest_seqno: *u64,
+    cur_seqno_seen: *bool,
     outputs: *std.ArrayListUnmanaged(Output),
     /// M7.5: range tombstones surviving this compaction.  Carried — whole, no
     /// truncation — into EVERY output SST opened here, and they widen each
@@ -956,6 +1001,9 @@ const EmitCtx = struct {
         self.builder.* = try table_builder_mod.TableBuilder.init(gpa, self.build_opts, self.cur_file.*.?, self.policy);
         self.cur_smallest.* = null;
         self.cur_largest.* = null;
+        self.cur_smallest_seqno.* = 0;
+        self.cur_largest_seqno.* = 0;
+        self.cur_seqno_seen.* = false;
 
         // Seed range tombstones + widen the key range from their endpoints.
         for (self.surviving_tombstones.tombstones.items) |t| {
@@ -966,6 +1014,19 @@ const EmitCtx = struct {
             defer gpa.free(e_ik);
             self.widenSmallest(b_ik) catch |err| return err;
             self.widenLargest(e_ik) catch |err| return err;
+            self.recordSeqno(t.seq);
+        }
+    }
+
+    /// Fold `seq` into the current output's min/max seqno bounds.
+    fn recordSeqno(self: *EmitCtx, seq: u64) void {
+        if (!self.cur_seqno_seen.*) {
+            self.cur_smallest_seqno.* = seq;
+            self.cur_largest_seqno.* = seq;
+            self.cur_seqno_seen.* = true;
+        } else {
+            if (seq < self.cur_smallest_seqno.*) self.cur_smallest_seqno.* = seq;
+            if (seq > self.cur_largest_seqno.*) self.cur_largest_seqno.* = seq;
         }
     }
 
@@ -1000,9 +1061,10 @@ const EmitCtx = struct {
         try self.builder.*.?.add(ikey, value);
         try self.widenSmallest(ikey);
         try self.widenLargest(ikey);
+        self.recordSeqno(seqnoOfIkey(ikey));
 
         if (self.builder.*.?.fileSize() >= self.target_file_size) {
-            try finishOutput(gpa, self.builder, self.cur_file, self.cur_number.*, self.cur_smallest, self.cur_largest, self.outputs);
+            try finishOutput(gpa, self.builder, self.cur_file, self.cur_number.*, self.cur_smallest, self.cur_largest, self.cur_smallest_seqno, self.cur_largest_seqno, self.outputs);
         }
     }
 };
@@ -1297,6 +1359,94 @@ test "M6.2: L0 -> L1 merge + dedup keeps latest values" {
         defer gpa.free(got);
         try testing.expectEqualStrings(kv.v, got);
     }
+}
+
+/// Read the whole MANIFEST file of `db` into a gpa-owned buffer (caller frees).
+fn readManifest(gpa: std.mem.Allocator, e: env.Env, db: *DB) ![]u8 {
+    const path = try filename.manifestFileName(gpa, db.name, db.versions.manifestFileNumber());
+    defer gpa.free(path);
+    const size = try e.getFileSize(path);
+    const buf = try gpa.alloc(u8, size);
+    errdefer gpa.free(buf);
+    var raf = try e.newRandomAccessFile(gpa, path);
+    defer raf.close() catch {};
+    var off: u64 = 0;
+    while (off < size) {
+        const n = try raf.readAt(off, buf[off..]);
+        if (n == 0) break;
+        off += n;
+    }
+    return buf;
+}
+
+/// Scan every log record in a MANIFEST blob, decode each VersionEdit, and report
+/// whether any new-file record used the legacy kNewFile=7 form (NOT is_v4), and
+/// whether the compaction-level outputs (level >= 1) carry kNewFile4 with
+/// non-zero seqnos.
+const ManifestScan = struct {
+    saw_legacy_newfile: bool = false,
+    saw_v4_at_deep_level: bool = false,
+    saw_nonzero_seqno_at_deep_level: bool = false,
+};
+
+fn scanManifest(gpa: std.mem.Allocator, manifest: []const u8) !ManifestScan {
+    var out = ManifestScan{};
+    var off: usize = 0;
+    while (off + 7 <= manifest.len) {
+        const len = @as(usize, manifest[off + 4]) | (@as(usize, manifest[off + 5]) << 8);
+        const payload_start = off + 7;
+        if (payload_start + len > manifest.len) break;
+        const payload = manifest[payload_start .. payload_start + len];
+        var edit = try version_edit.VersionEdit.decodeFrom(gpa, payload);
+        defer edit.deinit(gpa);
+        for (edit.new_files.items) |nf| {
+            if (!nf.is_v4) out.saw_legacy_newfile = true;
+            if (nf.is_v4 and nf.level >= 1) {
+                out.saw_v4_at_deep_level = true;
+                if (nf.meta.smallest_seqno != 0 or nf.meta.largest_seqno != 0)
+                    out.saw_nonzero_seqno_at_deep_level = true;
+            }
+        }
+        off = payload_start + len;
+    }
+    return out;
+}
+
+test "manifest-rocksdb-exact: flush+compaction MANIFEST uses kNewFile4 (never legacy tag 7) with seqnos" {
+    const gpa = testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    // Tiny write buffer + low L0 trigger so several flushes + an L0->L1
+    // compaction fire — producing a MULTI-edit MANIFEST with a compaction output.
+    const db = try DB.open(gpa, e, "mfexact", .{
+        .write_buffer_size = 1,
+        .level0_file_num_compaction_trigger = 2,
+    });
+    defer db.close();
+
+    try db.put(.{}, "k", "v1");
+    try db.put(.{}, "a", "av");
+    try db.put(.{}, "k", "v2");
+    try db.delete(.{}, "gone"); // a delete that flows through compaction
+    try db.put(.{}, "b", "bv");
+    try db.put(.{}, "c", "cv");
+    try db.put(.{}, "k", "v3");
+    try db.put(.{}, "d", "dv");
+
+    // A compaction must have pushed data to L1.
+    try testing.expect(levelFiles(db, 1) >= 1);
+
+    const manifest = try readManifest(gpa, e, db);
+    defer gpa.free(manifest);
+    const scan = try scanManifest(gpa, manifest);
+
+    // The latent bug: compaction outputs emitted legacy kNewFile=7.  After the
+    // fix EVERY new-file record (flush AND compaction) is kNewFile4.
+    try testing.expect(!scan.saw_legacy_newfile);
+    try testing.expect(scan.saw_v4_at_deep_level);
+    try testing.expect(scan.saw_nonzero_seqno_at_deep_level);
 }
 
 test "M6.2: tombstone is dropped once compacted past the base level" {
