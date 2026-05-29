@@ -500,6 +500,11 @@ pub const DB = struct {
         const new_mem = try MemTable.init(self.gpa, self.options.comparator);
         errdefer new_mem.deinit();
 
+        // Remember the old log number so we can delete the stale file after the
+        // flush commits it to the MANIFEST.  Only meaningful when this DB owns its
+        // WAL (single-CF); per-CF sub-LSMs (owns_wal == false) have no log files.
+        const old_log_number: u64 = if (self.owns_wal) self.versions.logNumber() else 0;
+
         if (self.owns_wal) {
             const new_log_path = try filename.logFileName(self.gpa, self.name, new_log_number);
             defer self.gpa.free(new_log_path);
@@ -534,6 +539,18 @@ pub const DB = struct {
             new_log_number,
             self.last_sequence,
         );
+
+        // 3b. WAL GC: the old log's data is now safely in the L0 SST (and the
+        //     new log number is committed to the MANIFEST via logAndApply above).
+        //     Delete the stale log file so the directory stays clean.  Ignore
+        //     errors: a missing file is harmless (e.g. an empty-memtable no-op
+        //     flush may have skipped creating one), and we never want a GC
+        //     failure to abort a successful write.
+        if (self.owns_wal and old_log_number != 0) {
+            const old_log_path = try filename.logFileName(self.gpa, self.name, old_log_number);
+            defer self.gpa.free(old_log_path);
+            self.env.deleteFile(old_log_path) catch {};
+        }
 
         // 4. Free the flushed memtable; no pending flush remains.
         self.imm.?.deinit();
@@ -2461,5 +2478,93 @@ test "M7.5: randomized deleteRange gate vs reference map (get + scan + reopen)" 
         const db = try DB.open(gpa, e, "rangefuzz", opts);
         defer db.close();
         try verifyAgainstRangeRef(gpa, db, &ref, key_space);
+    }
+}
+
+// ===========================================================================
+// gc3-wal — Single-CF WAL GC: delete the old .log after flush.
+// ===========================================================================
+
+test "gc3-wal: old log file is deleted after flush" {
+    // After a flush installs a VersionEdit with the new log number, the old
+    // .log file is no longer needed (its data is now in the L0 SST).  It must
+    // be deleted so the directory does not accumulate stale log files.
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    const db = try DB.open(gpa, e, "walGcDb", .{ .write_buffer_size = 1 });
+    defer db.close();
+
+    // Record the initial (pre-flush) log number.
+    const old_log_number = db.versions.logNumber();
+    const old_log_path = try filename.logFileName(gpa, "walGcDb", old_log_number);
+    defer gpa.free(old_log_path);
+
+    // The initial log file exists before any flush.
+    try testing.expect(e.fileExists(old_log_path));
+
+    // Write enough to trigger a flush (write_buffer_size = 1 forces immediate flush).
+    try db.put(.{}, "k", "v");
+    // A second write forces the flush of the first write (the first write fills
+    // the buffer, the second write triggers the rotation+flush).
+    try db.put(.{}, "k2", "v2");
+
+    // A flush must have happened: the current log number must have changed.
+    const new_log_number = db.versions.logNumber();
+    try testing.expect(new_log_number != old_log_number);
+
+    // The OLD log file must have been deleted by the WAL GC.
+    try testing.expect(!e.fileExists(old_log_path));
+
+    // The NEW (current) log file must still exist.
+    const new_log_path = try filename.logFileName(gpa, "walGcDb", new_log_number);
+    defer gpa.free(new_log_path);
+    try testing.expect(e.fileExists(new_log_path));
+}
+
+test "gc3-wal: reopen recovers correctly after old log deleted" {
+    // Recovery must still work after the old log has been GC'd: data is in the
+    // SST (the flush produced it) + the current WAL (any unflushed writes).
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    // Phase 1: write + force flush + close.
+    {
+        const db = try DB.open(gpa, e, "walGcRecov", .{ .write_buffer_size = 1 });
+        defer db.close();
+
+        // These writes trigger flushes (and WAL GC); data ends up in SSTs.
+        try db.put(.{}, "a", "alpha");
+        try db.put(.{}, "b", "beta");
+        try db.put(.{}, "c", "gamma");
+
+        // At least one flush must have happened.
+        try testing.expect(totalSSTFiles(db) >= 1);
+    }
+
+    // Phase 2: reopen and verify all data is still readable.
+    {
+        const db = try DB.open(gpa, e, "walGcRecov", .{ .write_buffer_size = 1 });
+        defer db.close();
+
+        {
+            const got = try db.get(.{}, "a") orelse return error.TestExpectedFound;
+            defer gpa.free(got);
+            try testing.expectEqualStrings("alpha", got);
+        }
+        {
+            const got = try db.get(.{}, "b") orelse return error.TestExpectedFound;
+            defer gpa.free(got);
+            try testing.expectEqualStrings("beta", got);
+        }
+        {
+            const got = try db.get(.{}, "c") orelse return error.TestExpectedFound;
+            defer gpa.free(got);
+            try testing.expectEqualStrings("gamma", got);
+        }
     }
 }
