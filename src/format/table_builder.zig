@@ -29,6 +29,7 @@
 const std = @import("std");
 
 const block = @import("block.zig");
+const partitioned_index = @import("partitioned_index.zig");
 const filter_block = @import("filter_block.zig");
 const full_filter = @import("full_filter.zig");
 const bloom = @import("bloom.zig");
@@ -69,6 +70,12 @@ const kFullFilterMetaKeyPrefix: []const u8 = "fullfilter.";
 /// "rocksdb.deletion_data" / range_del block with a different layout.
 const kRangeDelMetaKey: []const u8 = "rocksdb.range_del";
 
+/// Metaindex key recording the SST's index shape (partitioned-idx), in zrocks's
+/// own clean format: a 1-byte tag (0=single_level, 1=two_level).  Written only
+/// for two-level tables; a missing entry means single_level so every existing
+/// SST keeps reading unchanged.  See partitioned_index.zig.
+const kIndexTypeMetaKey: []const u8 = partitioned_index.kIndexTypeMetaKey;
+
 pub const TableBuilder = struct {
     gpa: std.mem.Allocator,
     options: options_mod.Options,
@@ -77,8 +84,15 @@ pub const TableBuilder = struct {
 
     /// Builder for the current data block (entries flushed at ~block_size).
     data_block: BlockBuilder,
-    /// Builder for the index block (one entry per flushed data block).
+    /// Builder for the index block (one entry per flushed data block).  Used
+    /// directly as the flat index under `.single_level`; under `.two_level` it is
+    /// the reusable builder for the TOP-LEVEL index block (see `index_partitions`).
     index_block: BlockBuilder,
+    /// Partitioned (two-level) index accumulator (partitioned-idx).  Non-null only
+    /// when `options.index_type == .two_level`: index entries are routed here
+    /// during the build, then partitioned + written at `finish`.  zrocks's OWN
+    /// clean two-level format (see partitioned_index.zig), NOT RocksDB byte-exact.
+    index_partitions: ?partitioned_index.PartitionedIndexBuilder,
     /// Block-based bloom filter builder (one filter per 2KB data range).
     /// Used only when `options.filter_mode == .block_based` (the default).
     filter: FilterBlockBuilder,
@@ -129,6 +143,15 @@ pub const TableBuilder = struct {
             // (an InternalKeyComparator for DB SSTs), so build them with it.
             .data_block = BlockBuilder.init(gpa, options.comparator, options.block_restart_interval),
             .index_block = BlockBuilder.init(gpa, options.comparator, kMetaIndexRestartInterval),
+            .index_partitions = switch (options.index_type) {
+                .single_level => null,
+                .two_level => partitioned_index.PartitionedIndexBuilder.init(
+                    gpa,
+                    options.comparator,
+                    kMetaIndexRestartInterval,
+                    options.metadata_block_size,
+                ),
+            },
             .filter = filter,
             .full_filter = full_filter.FullFilterBuilder.init(policy.bits_per_key),
             .last_key = .empty,
@@ -145,6 +168,7 @@ pub const TableBuilder = struct {
     pub fn deinit(self: *TableBuilder) void {
         self.data_block.deinit();
         self.index_block.deinit();
+        if (self.index_partitions) |*pib| pib.deinit();
         self.filter.deinit(self.gpa);
         self.full_filter.deinit(self.gpa);
         self.last_key.deinit(self.gpa);
@@ -229,7 +253,14 @@ pub const TableBuilder = struct {
         std.debug.assert(self.pending_index_entry);
         self.handle_encoding.clearRetainingCapacity();
         try self.pending_handle.encodeTo(&self.handle_encoding, self.gpa);
-        try self.index_block.add(self.last_key.items, self.handle_encoding.items);
+        // Single-level: add straight to the flat index block.  Two-level: route to
+        // the partitioned-index accumulator (partitioned-idx); the partition/top
+        // blocks are produced at `finish`.
+        if (self.index_partitions) |*pib| {
+            try pib.addEntry(self.last_key.items, self.handle_encoding.items);
+        } else {
+            try self.index_block.add(self.last_key.items, self.handle_encoding.items);
+        }
         self.pending_index_entry = false;
     }
 
@@ -258,6 +289,37 @@ pub const TableBuilder = struct {
         const handle = try self.writeRawBlock(contents, kNoCompression);
         builder.reset();
         return handle;
+    }
+
+    /// Partition the accumulated index entries (partitioned-idx), write each
+    /// index PARTITION block (uncompressed, with the standard CRC trailer) to the
+    /// file, build the TOP-LEVEL index block, write it the same way, and return
+    /// its BlockHandle (the footer's `index_handle`).  Only called in two-level
+    /// mode (`index_partitions != null`).
+    fn writePartitionedIndex(self: *TableBuilder) !BlockHandle {
+        const pib = &self.index_partitions.?;
+        std.debug.assert(!pib.isEmpty());
+
+        // The TOP-LEVEL index block reuses `self.index_block` (already a fresh
+        // BlockBuilder with the table comparator + meta restart interval).
+        const num_parts = try pib.finish(
+            @ptrCast(self),
+            writePartitionCb,
+            &self.index_block,
+        );
+        std.debug.assert(num_parts >= 1);
+
+        // Write the finished top-level block (its bytes are produced by `finish`
+        // on `self.index_block`; `writeBlock` finishes+writes+resets it).
+        return try self.writeBlock(&self.index_block);
+    }
+
+    /// `PartitionedIndexBuilder.WritePartitionFn` adapter: writes one finished
+    /// index partition block to the file (uncompressed, with CRC trailer) and
+    /// returns its BlockHandle.  `ctx` is the `*TableBuilder`.
+    fn writePartitionCb(ctx: *anyopaque, contents: []const u8) anyerror!BlockHandle {
+        const self: *TableBuilder = @ptrCast(@alignCast(ctx));
+        return self.writeRawBlock(contents, kNoCompression);
     }
 
     /// Finish a data block, optionally Snappy-compress it (when
@@ -358,6 +420,14 @@ pub const TableBuilder = struct {
             try filter_handle.encodeTo(&self.handle_encoding, self.gpa);
             try metaindex_block.add(key_buf.items, self.handle_encoding.items);
         }
+        // Index-type tag (partitioned-idx): record a 1-byte tag ONLY for
+        // two-level tables so the reader can auto-detect the index shape.  Added
+        // before "rocksdb.range_del" to keep the metaindex bytewise-sorted
+        // ("rocksdb.index_type" < "rocksdb.range_del").  A single-level table
+        // writes no such entry (its absence means single_level).
+        if (self.index_partitions != null) {
+            try metaindex_block.add(kIndexTypeMetaKey, &[_]u8{partitioned_index.kTwoLevelTag});
+        }
         if (range_del_handle) |rdh| {
             self.handle_encoding.clearRetainingCapacity();
             try rdh.encodeTo(&self.handle_encoding, self.gpa);
@@ -371,8 +441,14 @@ pub const TableBuilder = struct {
             try self.appendIndexEntry();
         }
 
-        // 4. Index block.
-        const index_handle = try self.writeBlock(&self.index_block);
+        // 4. Index block.  Single-level: write the one flat index block.
+        //    Two-level (partitioned-idx): partition the accumulated index entries,
+        //    write each partition block, build the TOP-LEVEL index block, and
+        //    point the footer at the top-level block.
+        const index_handle = if (self.index_partitions != null)
+            try self.writePartitionedIndex()
+        else
+            try self.writeBlock(&self.index_block);
 
         // 5. Footer (no trailer).
         const footer = Footer{

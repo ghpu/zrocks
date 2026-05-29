@@ -42,6 +42,7 @@ const cache_mod = @import("../util/cache.zig");
 const env = @import("../env/env.zig");
 const options_mod = @import("../options.zig");
 const internal_key = @import("internal_key.zig");
+const partitioned_index = @import("partitioned_index.zig");
 const prefix = @import("../rocks/prefix.zig");
 const delete_range = @import("../rocks/delete_range.zig");
 const snappy = @import("../util/snappy.zig");
@@ -73,8 +74,16 @@ pub const Table = struct {
 
     /// Contents of the index block (kept resident for the table's lifetime;
     /// owned outright or pinned in the block cache — released in `deinit`).
+    /// Under `two_level == true` (partitioned-idx) this is the TOP-LEVEL index
+    /// block (its entries point at index PARTITION blocks); otherwise it is the
+    /// flat single-level index block.
     index_contents: BlockContents,
     index_block: Block,
+    /// Whether the table carries a two-level (partitioned) index (partitioned-idx),
+    /// auto-detected from the `"rocksdb.index_type"` metaindex tag.  When true,
+    /// `get`/iteration perform a 3-level descent (top-index -> partition-index ->
+    /// data block).  zrocks's OWN clean format, NOT RocksDB byte-exact.
+    two_level: bool,
 
     /// Contents of the filter block, if the table carries one (shared by
     /// whichever filter format the table was built with; released in `deinit`).
@@ -135,6 +144,7 @@ pub const Table = struct {
             .prefix_extractor = options.prefix_extractor,
             .index_contents = index_contents,
             .index_block = index_block,
+            .two_level = false, // set by readIndexType below
             .filter_contents = null,
             .filter_reader = null,
             .full_filter_reader = null,
@@ -143,7 +153,8 @@ pub const Table = struct {
             .metaindex_handle = footer.metaindex_handle,
         };
 
-        // ---- Metaindex block -> filter block ----------------------------
+        // ---- Metaindex block -> index-type tag + filter block -----------
+        try self.readIndexType(footer.metaindex_handle);
         try self.readFilter(footer.metaindex_handle);
         return self;
     }
@@ -160,6 +171,28 @@ pub const Table = struct {
     /// caller MUST `release` the result with `self.gpa` and `self.block_cache`.
     fn readBlockContents(self: *Table, handle: BlockHandle) !BlockContents {
         return readBlockCached(self.gpa, self.file, handle, self.block_cache, self.cache_id);
+    }
+
+    /// Read the `"rocksdb.index_type"` metaindex tag (partitioned-idx) and set
+    /// `self.two_level` accordingly.  A missing entry (or tag 0) means a flat
+    /// single-level index — so every pre-existing SST reads exactly as before.
+    /// zrocks's OWN clean detection convention, NOT RocksDB's properties block.
+    fn readIndexType(self: *Table, metaindex_handle: BlockHandle) !void {
+        var meta_contents = try self.readBlockContents(metaindex_handle);
+        defer meta_contents.release(self.gpa, self.block_cache);
+        const meta_block = try Block.init(self.gpa, meta_contents.bytes);
+
+        // Metaindex keys are plain bytewise meta keys; search bytewise.
+        var it = meta_block.iterator(comparator.bytewise);
+        defer it.deinit();
+        it.seek(partitioned_index.kIndexTypeMetaKey);
+        if (!it.valid() or comparator.bytewise.compare(it.key(), partitioned_index.kIndexTypeMetaKey) != .eq) {
+            self.two_level = false; // no tag -> single-level
+            return;
+        }
+        const v = it.value();
+        if (v.len != 1) return error.Corruption;
+        self.two_level = (v[0] == partitioned_index.kTwoLevelTag);
     }
 
     /// Read the metaindex block, look for a filter entry, and if present read
@@ -248,18 +281,45 @@ pub const Table = struct {
         return delete_range.RangeTombstoneList.decode(gpa, rd_contents.bytes);
     }
 
+    /// Resolve the data-block BlockHandle that may contain `key`, descending the
+    /// index (one level for single-level, two for partitioned-idx).  Returns null
+    /// when `key` is past the last entry (no covering block).  Verifies the
+    /// partition block's CRC via `readBlockContents`.
+    fn findDataBlockHandle(self: *Table, key: []const u8) !?BlockHandle {
+        // Outer/top-level seek: the first entry whose separator >= key covers it.
+        var top_it = self.index_block.iterator(self.comparator);
+        defer top_it.deinit();
+        top_it.seek(key);
+        if (!top_it.valid()) return null;
+
+        var tv: []const u8 = top_it.value();
+        const outer_handle = try BlockHandle.decodeFrom(&tv);
+        if (!self.two_level) {
+            // Single-level: the outer handle IS the data-block handle.
+            return outer_handle;
+        }
+
+        // Two-level: `outer_handle` is an index PARTITION block; seek IT for the
+        // data-block handle covering `key`.
+        var part_contents = try self.readBlockContents(outer_handle);
+        defer part_contents.release(self.gpa, self.block_cache);
+        const part_block = try Block.init(self.gpa, part_contents.bytes);
+        var part_it = part_block.iterator(self.comparator);
+        defer part_it.deinit();
+        part_it.seek(key);
+        if (!part_it.valid()) return null;
+        var pv: []const u8 = part_it.value();
+        return try BlockHandle.decodeFrom(&pv);
+    }
+
     /// Point lookup. Returns a freshly allocated copy of the value (caller owns
     /// and must free with `gpa`) or null if the key is absent.
     pub fn get(self: *Table, gpa: std.mem.Allocator, key: []const u8) !?[]u8 {
-        // Locate the first index entry whose key >= key: that data block is the
-        // only one that may contain `key`.
-        var index_it = self.index_block.iterator(self.comparator);
-        defer index_it.deinit();
-        index_it.seek(key);
-        if (!index_it.valid()) return null;
-
-        var hv: []const u8 = index_it.value();
-        const handle = try BlockHandle.decodeFrom(&hv);
+        // Locate the data block that may contain `key`.  Single-level: one index
+        // seek.  Two-level (partitioned-idx): seek the TOP-LEVEL index to the
+        // covering partition, read that partition block, then seek it for the data
+        // handle (a 3-level descent).
+        const handle = (try self.findDataBlockHandle(key)) orelse return null;
 
         // Bloom fast-path: if the filter proves the key absent, skip the read.
         // M7.2: a prefix-keyed filter is probed by the lookup key's PREFIX.  We
@@ -308,6 +368,152 @@ pub const Table = struct {
         return Iterator.init(self, gpa);
     }
 
+    /// DataHandleCursor — iterates the index in data-block-handle order, hiding
+    /// whether the table is single-level or two-level (partitioned-idx).
+    ///
+    /// Single-level: it is exactly the flat index-block iterator; `value()` is the
+    /// data-block handle encoding.  Two-level: it composes an OUTER iterator over
+    /// the TOP-LEVEL block with an INNER iterator over the current index PARTITION
+    /// block (loaded + CRC-verified on demand); `value()` is the data-block handle
+    /// from the partition.  Either way `value()` yields successive data-block
+    /// handle encodings in key order; `key()` yields the corresponding separator.
+    const DataHandleCursor = struct {
+        table: *Table,
+        /// Outer iterator: the flat index (single-level) or the top-level block.
+        outer: Block.Iter,
+        /// Two-level only: contents + iterator of the CURRENT partition block.
+        part_contents: ?BlockContents,
+        part_block: Block,
+        part_it: ?Block.Iter,
+        err: ?anyerror,
+
+        fn init(table: *Table) DataHandleCursor {
+            return .{
+                .table = table,
+                .outer = table.index_block.iterator(table.comparator),
+                .part_contents = null,
+                .part_block = undefined,
+                .part_it = null,
+                .err = null,
+            };
+        }
+
+        fn deinit(self: *DataHandleCursor) void {
+            self.releasePart();
+            self.outer.deinit();
+            self.* = undefined;
+        }
+
+        fn releasePart(self: *DataHandleCursor) void {
+            if (self.part_it) |*pi| {
+                pi.deinit();
+                self.part_it = null;
+            }
+            if (self.part_contents) |*pc| {
+                pc.release(self.table.gpa, self.table.block_cache);
+                self.part_contents = null;
+            }
+        }
+
+        /// Load the partition block referenced by the current OUTER entry and
+        /// create its inner iterator (left unpositioned).  Two-level only.
+        fn loadPartition(self: *DataHandleCursor) void {
+            self.releasePart();
+            var hv: []const u8 = self.outer.value();
+            const handle = BlockHandle.decodeFrom(&hv) catch |e| {
+                self.err = e;
+                return;
+            };
+            var contents = self.table.readBlockContents(handle) catch |e| {
+                self.err = e;
+                return;
+            };
+            self.part_block = Block.init(self.table.gpa, contents.bytes) catch |e| {
+                self.err = e;
+                contents.release(self.table.gpa, self.table.block_cache);
+                return;
+            };
+            self.part_contents = contents;
+            self.part_it = self.part_block.iterator(self.table.comparator);
+        }
+
+        fn seekToFirst(self: *DataHandleCursor) void {
+            self.err = null;
+            self.outer.seekToFirst();
+            if (!self.table.two_level) return;
+            if (!self.outer.valid()) {
+                self.releasePart();
+                return;
+            }
+            self.loadPartition();
+            if (self.part_it) |*pi| pi.seekToFirst();
+            self.advanceOuterIfPartExhausted();
+        }
+
+        fn seek(self: *DataHandleCursor, target: []const u8) void {
+            self.err = null;
+            self.outer.seek(target);
+            if (!self.table.two_level) return;
+            if (!self.outer.valid()) {
+                self.releasePart();
+                return;
+            }
+            self.loadPartition();
+            if (self.part_it) |*pi| pi.seek(target);
+            self.advanceOuterIfPartExhausted();
+        }
+
+        fn next(self: *DataHandleCursor) void {
+            if (!self.table.two_level) {
+                self.outer.next();
+                return;
+            }
+            if (self.part_it) |*pi| pi.next();
+            self.advanceOuterIfPartExhausted();
+        }
+
+        /// Two-level: if the current partition iterator is exhausted, advance the
+        /// outer (top-level) iterator to the next partition and position its inner
+        /// iterator at the first entry.  Repeats across empty partitions.
+        fn advanceOuterIfPartExhausted(self: *DataHandleCursor) void {
+            while (self.err == null) {
+                if (self.part_it) |*pi| {
+                    if (pi.valid()) return;
+                }
+                if (!self.outer.valid()) {
+                    self.releasePart();
+                    return;
+                }
+                self.outer.next();
+                if (!self.outer.valid()) {
+                    self.releasePart();
+                    return;
+                }
+                self.loadPartition();
+                if (self.part_it) |*pi| pi.seekToFirst();
+            }
+        }
+
+        fn valid(self: *const DataHandleCursor) bool {
+            if (self.err != null) return false;
+            if (self.table.two_level) {
+                if (self.part_it) |pi| return pi.valid();
+                return false;
+            }
+            return self.outer.valid();
+        }
+
+        /// Encoded data-block handle of the current position.
+        fn value(self: *const DataHandleCursor) []const u8 {
+            if (self.table.two_level) return self.part_it.?.value();
+            return self.outer.value();
+        }
+
+        fn status(self: *const DataHandleCursor) ?anyerror {
+            return self.err;
+        }
+    };
+
     /// Two-level forward/seek iterator over all (key, value) pairs in the table.
     ///
     /// VALUE-OWNERSHIP CONTRACT: `key()` and `value()` return slices that point
@@ -318,8 +524,9 @@ pub const Table = struct {
     pub const Iterator = struct {
         table: *Table,
         gpa: std.mem.Allocator,
-        /// Outer iterator over the index block.
-        index_it: Block.Iter,
+        /// Cursor over the index (single-level flat, or two-level partitioned)
+        /// yielding data-block handles in key order.
+        index_it: DataHandleCursor,
         /// Contents of the current data block (null when not positioned); owned
         /// outright or pinned in the block cache, released via `releaseData`.
         data_contents: ?BlockContents,
@@ -334,7 +541,7 @@ pub const Table = struct {
             return .{
                 .table = table,
                 .gpa = gpa,
-                .index_it = table.index_block.iterator(table.comparator),
+                .index_it = DataHandleCursor.init(table),
                 .data_contents = null,
                 .data_block = undefined,
                 .data_it = null,
@@ -382,10 +589,18 @@ pub const Table = struct {
             self.data_it = self.data_block.iterator(self.table.comparator);
         }
 
+        /// Copy an index-cursor error (e.g. a corrupt partition block read during
+        /// the two-level descent) into the iterator's own error so `valid()` is
+        /// false and `status()` surfaces it.
+        fn adoptCursorErr(self: *Iterator) void {
+            if (self.err == null) self.err = self.index_it.status();
+        }
+
         pub fn seekToFirst(self: *Iterator) void {
             self.err = null;
             self.index_it.seekToFirst();
-            if (!self.index_it.valid()) {
+            self.adoptCursorErr();
+            if (self.err != null or !self.index_it.valid()) {
                 self.releaseData();
                 return;
             }
@@ -397,7 +612,8 @@ pub const Table = struct {
         pub fn seek(self: *Iterator, target: []const u8) void {
             self.err = null;
             self.index_it.seek(target);
-            if (!self.index_it.valid()) {
+            self.adoptCursorErr();
+            if (self.err != null or !self.index_it.valid()) {
                 self.releaseData();
                 return;
             }
@@ -426,7 +642,8 @@ pub const Table = struct {
                     return;
                 }
                 self.index_it.next();
-                if (!self.index_it.valid()) {
+                self.adoptCursorErr();
+                if (self.err != null or !self.index_it.valid()) {
                     self.releaseData();
                     return;
                 }
@@ -1232,8 +1449,6 @@ test "M7.5: a table with no range tombstones returns an empty list" {
 // RocksDB byte-exact.  A small metadata_block_size forces MULTIPLE partitions;
 // get/iterate/seek must cross partition boundaries correctly.
 // ===========================================================================
-
-const partitioned_index = @import("partitioned_index.zig");
 
 /// Read the on-disk `rocksdb.index_type` meta tag from a table's metaindex; null
 /// when the entry is absent (a single-level table).
