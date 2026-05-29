@@ -482,11 +482,26 @@ pub const CfDB = struct {
     /// carrying its id, with every record consuming a slot in the shared sequence
     /// space (so record i of the batch maps to first_sequence + i regardless of
     /// CF).  Finally advance the shared `last_sequence`.
+    ///
+    /// NESTED-LOCK RULE (D2b1 — deadlock freedom).  This holds TWO levels of
+    /// `std.Io.Mutex`:
+    ///   1. OUTER: the CfDB's own `write_mutex` (guards the shared WAL + the
+    ///      global `last_sequence` + the fan-out), taken here.
+    ///   2. INNER: each sub-LSM's `cf.db.write_mutex`, taken briefly inside
+    ///      `applyBatchNoWal` per CF.
+    /// The ordering is ALWAYS CfDB-outer → sub-LSM-inner, and the inner lock is a
+    /// DISTINCT mutex per CF (never the CfDB's own).  A sub-LSM NEVER reaches back
+    /// up to acquire the CfDB mutex, so no lock cycle can form — the nesting is
+    /// strictly acyclic and the two levels can never deadlock.  Do NOT invert this
+    /// (e.g. by calling a CfDB method that re-takes `self.write_mutex` from inside
+    /// the per-CF fan-out — `std.Io.Mutex` is non-recursive and that would
+    /// self-deadlock).
     pub fn write(self: *CfDB, wopts: WriteOptions, batch: *WriteBatch) !void {
         // Serialize writers over the shared WAL (D2a-1).  Held across the single
         // WAL append + the per-CF fan-out so a cross-CF write stays atomic once
         // background workers contend.  Single-threaded today (always
-        // uncontended), so `lock` never reaches a cancelation point.
+        // uncontended), so `lock` never reaches a cancelation point.  This is the
+        // OUTER lock of the nested-lock rule documented above.
         try self.write_mutex.lock(self.io);
         defer self.write_mutex.unlock(self.io);
 
@@ -1023,4 +1038,61 @@ test "D2a-1: CfDB carries an Env io capability + a shared-WAL write mutex" {
 
     try testing.expect(cdb.write_mutex.tryLock());
     cdb.write_mutex.unlock(cdb.io);
+}
+
+// ---------------------------------------------------------------------------
+// D2b1 — CfDB nested-lock rule: CfDB mutex (OUTER) then each sub-LSM (INNER),
+// distinct mutexes, acyclic — a multi-CF write through both levels never
+// deadlocks.
+// ---------------------------------------------------------------------------
+
+test "D2b1: nested-lock rule — CfDB mutex and each sub-LSM mutex are distinct" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const cdb = try CfDB.open(gpa, me.env(), "cfnest", .{});
+    defer cdb.close();
+
+    const def = cdb.defaultColumnFamily();
+    const h2 = try cdb.createColumnFamily("cf2", .{});
+
+    // The CfDB write mutex (OUTER) and every sub-LSM write mutex (INNER) are
+    // SEPARATE objects (distinct addresses): the nesting CfDB.write does
+    // (OUTER -> per-CF INNER) is therefore between different mutexes, never the
+    // same one re-entered (std.Io.Mutex is non-recursive).
+    var it = cdb.cfs.valueIterator();
+    while (it.next()) |cf_ptr| {
+        const sub = &cf_ptr.*.db.write_mutex;
+        try testing.expect(@intFromPtr(sub) != @intFromPtr(&cdb.write_mutex));
+    }
+
+    // A cross-CF write (a single batch touching BOTH CFs) takes the OUTER lock,
+    // then each INNER lock in turn (applyBatchNoWal per CF).  If the ordering
+    // were inverted or a level re-took the CfDB mutex, this would self-deadlock;
+    // it completes, proving the nesting is sound.
+    var batch = try WriteBatch.init(gpa);
+    defer batch.deinit(gpa);
+    try batch.putCF(gpa, def.id, "k0", "v0");
+    try batch.putCF(gpa, h2.id, "k2", "v2");
+    try cdb.write(.{}, &batch);
+
+    // Both CFs received their record; the shared sequence advanced by 2.
+    try testing.expectEqual(@as(u64, 2), cdb.last_sequence);
+    const g0 = try cdb.get(.{}, def, "k0") orelse return error.TestExpectedFound;
+    defer gpa.free(g0);
+    try testing.expectEqualStrings("v0", g0);
+    const g2 = try cdb.get(.{}, h2, "k2") orelse return error.TestExpectedFound;
+    defer gpa.free(g2);
+    try testing.expectEqualStrings("v2", g2);
+
+    // After the nested write, BOTH levels' mutexes are free again (released in
+    // reverse order): no lock leaked out of the fan-out.
+    try testing.expect(cdb.write_mutex.tryLock());
+    cdb.write_mutex.unlock(cdb.io);
+    var it2 = cdb.cfs.valueIterator();
+    while (it2.next()) |cf_ptr| {
+        const sub = &cf_ptr.*.db.write_mutex;
+        try testing.expect(sub.tryLock());
+        sub.unlock(cdb.io);
+    }
 }

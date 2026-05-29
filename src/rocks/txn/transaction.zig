@@ -52,12 +52,20 @@ pub const Transaction = struct {
 
     /// Initialise a base transaction over `db`, capturing the current sequence
     /// as the read snapshot.  Caller must `deinit` (or `rollback`, then `deinit`).
+    ///
+    /// The BEGIN snapshot is read via `db.lastSequence()`, which takes the DB
+    /// write mutex (D2b1).  A bare `db.last_sequence` read raced the write path's
+    /// `last_sequence += batch.count()` — a torn/stale snapshot would have broken
+    /// snapshot isolation (the txn could miss or partially see a concurrent
+    /// commit).  Allocate the batch BEFORE taking the snapshot so the (fallible)
+    /// allocation never holds the DB lock.
     pub fn init(gpa: std.mem.Allocator, db: *DB) !Transaction {
+        const batch = try WriteBatch.init(gpa);
         return .{
             .gpa = gpa,
             .db = db,
-            .batch = try WriteBatch.init(gpa),
-            .snapshot_seq = db.last_sequence,
+            .batch = batch,
+            .snapshot_seq = db.lastSequence(),
         };
     }
 
@@ -167,3 +175,62 @@ pub const Transaction = struct {
         return self.batch.count() == 0;
     }
 };
+
+// ---------------------------------------------------------------------------
+// D2b1 — the BEGIN snapshot is captured under the DB write mutex (no race).
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+const MemEnv = @import("../../env/env.zig").MemEnv;
+
+test "D2b1: Transaction.init captures last_sequence via the locked accessor" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const db = try DB.open(gpa, me.env(), "txnseq", .{});
+    defer db.close();
+
+    // Commit some writes through the DB so last_sequence advances.
+    try db.put(.{}, "a", "1");
+    try db.put(.{}, "b", "2");
+
+    // A txn begun now must capture EXACTLY the current locked last sequence as
+    // its BEGIN snapshot — read via db.lastSequence() (the mutex-guarded accessor
+    // the init now uses), not a bare field read that raced the write path.
+    var txn = try Transaction.init(gpa, db);
+    defer txn.deinit();
+    try testing.expectEqual(db.lastSequence(), txn.snapshot_seq);
+
+    // Init left the DB write mutex free (it locked, read, then unlocked): a
+    // subsequent write does not deadlock against the just-finished init.
+    try testing.expect(db.write_mutex.tryLock());
+    db.write_mutex.unlock(db.io);
+    try db.put(.{}, "c", "3");
+
+    // Writes after BEGIN do not move the txn's captured snapshot.
+    try testing.expectEqual(@as(u64, 2), txn.snapshot_seq);
+}
+
+test "D2b1: txn read-your-own-writes + snapshot isolation still hold under the lock" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const db = try DB.open(gpa, me.env(), "txniso", .{});
+    defer db.close();
+
+    try db.put(.{}, "k", "committed");
+
+    var txn = try Transaction.init(gpa, db);
+    defer txn.deinit();
+
+    // Read-your-own-writes: a buffered put is visible inside the txn.
+    try txn.put("k", "buffered");
+    const own = try txn.get(gpa, "k") orelse return error.TestExpectedFound;
+    defer gpa.free(own);
+    try testing.expectEqualStrings("buffered", own);
+
+    // Snapshot isolation: a key only the DB has (at-or-below the BEGIN snapshot)
+    // is read through the captured snapshot_seq.
+    const base = try txn.get(gpa, "missing");
+    try testing.expectEqual(@as(?[]u8, null), base);
+}
