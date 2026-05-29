@@ -217,6 +217,28 @@ pub const DB = struct {
     /// and `write` must NOT be called on it (use `applyBatchNoWal`).  Caller
     /// `close`s it.
     pub fn openCf(gpa: std.mem.Allocator, e: env.Env, name: []const u8, options: Options) !*DB {
+        return openCfShared(gpa, e, name, options, null, 0);
+    }
+
+    /// Open a per-column-family sub-LSM that shares ONE MANIFEST (D1b-M4).
+    ///
+    /// When `shared` is non-null the per-CF VersionSet is registered with the
+    /// SharedManifest (cf id = `cf_id`): it owns NO MANIFEST/CURRENT of its own
+    /// and routes every flush/compaction VersionEdit (CF-tagged) into the single
+    /// shared descriptor.  The CF's `current` Version is recovered by the
+    /// SharedManifest's replay (done by CfDB AFTER every CF is registered), so a
+    /// shared-mode openCf does NOT recover or write a MANIFEST here.
+    ///
+    /// When `shared` is null this behaves like the legacy per-CF-MANIFEST path
+    /// (kept for the standalone single-CF callers / older tests).
+    pub fn openCfShared(
+        gpa: std.mem.Allocator,
+        e: env.Env,
+        name: []const u8,
+        options: Options,
+        shared: ?*version_set.SharedManifest,
+        cf_id: u32,
+    ) !*DB {
         const self = try gpa.create(DB);
         errdefer gpa.destroy(self);
 
@@ -248,24 +270,32 @@ pub const DB = struct {
         self.snapshots = SnapshotList.init(gpa);
         errdefer self.snapshots.deinit();
 
-        const current_path = try filename.currentFileName(gpa, name);
-        defer gpa.free(current_path);
-
-        if (e.fileExists(current_path)) {
-            // Recover the per-CF VersionSet (SST files + sequences).  The shared
-            // WAL replay (done by CfDB) repopulates the memtable; we do NOT touch
-            // any per-CF `.log` file (there is none in the CF design).
-            try vs.recover();
-            self.last_sequence = vs.lastSequence();
-        } else {
-            // Fresh CF: write an initial MANIFEST/CURRENT.  No log file.
-            var edit = version_edit.VersionEdit.init();
-            defer edit.deinit(gpa);
-            try edit.setComparatorName(gpa, options.comparator.name());
-            edit.setNextFileNumber(vs.nextFileNumber());
-            edit.setLastSequence(0);
-            try vs.logAndApply(&edit);
+        if (shared) |sm| {
+            // Shared-MANIFEST mode: register with the coordinator (sets
+            // vs.shared + vs.cf_id).  No per-CF MANIFEST/CURRENT; the CF's
+            // Version is filled in later by SharedManifest.recover (existing DB)
+            // or starts empty (fresh CF).  last_sequence comes from the shared
+            // manifest after recovery.
+            try sm.registerCf(cf_id, vs);
             self.last_sequence = 0;
+        } else {
+            const current_path = try filename.currentFileName(gpa, name);
+            defer gpa.free(current_path);
+
+            if (e.fileExists(current_path)) {
+                // Legacy per-CF VersionSet recovery (SST files + sequences).
+                try vs.recover();
+                self.last_sequence = vs.lastSequence();
+            } else {
+                // Fresh CF: write an initial MANIFEST/CURRENT.  No log file.
+                var edit = version_edit.VersionEdit.init();
+                defer edit.deinit(gpa);
+                try edit.setComparatorName(gpa, options.comparator.name());
+                edit.setNextFileNumber(vs.nextFileNumber());
+                edit.setLastSequence(0);
+                try vs.logAndApply(&edit);
+                self.last_sequence = 0;
+            }
         }
 
         // wal_file / wal are intentionally left undefined: owns_wal == false means

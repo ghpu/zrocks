@@ -7,40 +7,43 @@
 //! writes atomic.
 //!
 //! ---------------------------------------------------------------------------
-//! Design (tractable + correct — a deliberate divergence from RocksDB's single
-//! shared MANIFEST):
+//! Design (D1b-M4 — ONE shared MANIFEST with CF-tagged VersionEdits):
 //!
 //!   * Each CF is a self-contained sub-LSM rooted in its OWN subdirectory
-//!     `<dbroot>/<cfname>/`.  We REUSE the existing single-CF `DB` for all of a
-//!     CF's per-family machinery — {memtable, imm, VersionSet (its own
-//!     MANIFEST/CURRENT under the subdir), table_cache, flush, leveled/universal/
-//!     fifo compaction, snapshot-aware get + merging iterator} — by opening it
-//!     via `DB.openCf`, which is exactly `DB.open` MINUS its own WAL.
+//!     `<dbroot>/<cfname>/` for its SST files.  We REUSE the existing single-CF
+//!     `DB` for all of a CF's per-family machinery — {memtable, imm, VersionSet,
+//!     table_cache, flush, leveled/universal/fifo compaction, snapshot-aware get
+//!     + merging iterator} — by opening it via `DB.openCfShared`, which is
+//!     `DB.open` MINUS its own WAL and MINUS its own MANIFEST.
 //!
-//!   * The multi-CF `CfDB` owns the cross-cutting pieces a single `DB` would
-//!     normally own per-instance: the dbroot directory, ONE shared WAL at
-//!     `<dbroot>/000001.log`, and ONE `last_sequence` (the sequence space is
+//!   * The multi-CF `CfDB` owns the cross-cutting pieces: the dbroot directory,
+//!     ONE shared WAL at `<dbroot>/000001.log`, and ONE `SharedManifest` at
+//!     `<dbroot>/MANIFEST-*` + `<dbroot>/CURRENT`.  Every per-CF flush/compaction
+//!     VersionEdit is TAGGED with its CF id (kColumnFamily=200) and appended to
+//!     this single descriptor.  The SharedManifest also owns the GLOBAL
+//!     file-number space and the GLOBAL `last_sequence` (the sequence space is
 //!     shared across all CFs, so a global write order exists).
 //!
 //!   * A persisted CF registry `<dbroot>/CF_LIST` maps cf name <-> id so a reopen
-//!     knows which CFs exist (and at which subdir).  The default CF (id 0, name
-//!     "default") always exists.
+//!     knows which CFs exist (and at which subdir).  CF identity lives here; the
+//!     shared MANIFEST stores each CF's FILE/Version state, tagged by id.  The
+//!     default CF (id 0, name "default") always exists.
 //!
 //!   * Atomic cross-CF writes come from the SHARED WAL: one `write` appends the
 //!     whole CF-tagged batch to the shared log with a single flush/sync, THEN
 //!     fans the records out to each target CF's memtable.  Atomicity does NOT
-//!     depend on a shared MANIFEST — per-CF MANIFESTs only track that CF's SST
-//!     files, and a crash either has the whole batch in the shared WAL (replayed
-//!     into every CF on reopen) or none of it.
+//!     depend on the MANIFEST — a crash either has the whole batch in the shared
+//!     WAL (replayed into every CF on reopen) or none of it.
 //!
-//! Recovery: read CF_LIST, `openCf` each CF (recovering its per-CF VersionSet =
-//! its SSTs + sequences), then replay the ENTIRE shared WAL routing each record
-//! to its CF's memtable by cf id (default 0 for untagged records).  Because the
-//! shared WAL is never truncated by a per-CF flush, replayed records that were
-//! already flushed to a CF's SSTs simply re-enter that CF's memtable; newest-wins
-//! reads stay correct (the memtable copy and the SST copy carry the same
-//! sequence/value).  TODO(perf): WAL recycling/truncation once the OLDEST CF has
-//! flushed past a log boundary.
+//! Recovery: read CF_LIST, `openCfShared` each CF (registering it with the
+//! SharedManifest, cf Version starts empty), then `SharedManifest.recover()`
+//! replays the ONE MANIFEST routing each CF-tagged record to the matching CF's
+//! Version (restoring its SSTs + the global next_file_number/last_sequence).
+//! Then replay the ENTIRE shared WAL routing each record to its CF's memtable by
+//! cf id (default 0 for untagged records).  Because the shared WAL is never
+//! truncated by a per-CF flush, replayed records that were already flushed to a
+//! CF's SSTs simply re-enter that CF's memtable; newest-wins reads stay correct.
+//! TODO(perf): WAL recycling/truncation once the OLDEST CF has flushed.
 //!
 //! Standalone test note (Zig 0.16): `../...` imports only resolve inside the
 //! `src`-rooted module:
@@ -57,6 +60,7 @@ const log_writer = @import("../format/log_writer.zig");
 const log_reader = @import("../format/log_reader.zig");
 const log_format = @import("../format/log_format.zig");
 const filename = @import("../version/filename.zig");
+const version_set = @import("../version/version_set.zig");
 
 const db_mod = @import("../db/db.zig");
 const write_path = @import("../db/write_path.zig");
@@ -105,6 +109,11 @@ pub const CfDB = struct {
     /// Next CF id to hand out (default CF takes 0).
     next_cf_id: u32,
 
+    /// The single shared MANIFEST across all CFs (D1b-M4): owns the descriptor +
+    /// CURRENT in `<dbroot>`, the global file-number space, and the global
+    /// last_sequence.  Each CF's VersionSet routes its (CF-tagged) edits here.
+    manifest: *version_set.SharedManifest,
+
     // Shared WAL (one log across all CFs).
     wal_file: env.WritableFile,
     wal: log_writer.Writer,
@@ -134,6 +143,14 @@ pub const CfDB = struct {
 
         try e.makeDir(dbroot);
 
+        // The single shared MANIFEST.  Created before any CF so addCf can
+        // register each CF's VersionSet into it.
+        const sm = try gpa.create(version_set.SharedManifest);
+        errdefer gpa.destroy(sm);
+        sm.* = try version_set.SharedManifest.init(gpa, e, dbroot, options);
+        errdefer sm.deinit();
+        self.manifest = sm;
+
         const cf_list_path = try filename.cfListFileName(gpa, dbroot);
         defer gpa.free(cf_list_path);
 
@@ -144,10 +161,26 @@ pub const CfDB = struct {
 
         if (reopening) {
             // ----- reopen an existing multi-CF database --------------------
-            // 1. Read CF_LIST and open each CF's sub-LSM (recovering its SSTs).
+            // 1. Read CF_LIST and open (register) each CF's sub-LSM.  Each CF's
+            //    Version starts empty; it is filled by the shared-MANIFEST replay.
             try self.loadCfList(cf_list_path);
 
-            // 2. Reopen the shared WAL appendably and resume the writer mid-block.
+            // 2. Recover the shared MANIFEST: replay the ONE descriptor routing
+            //    each CF-tagged record to its CF's Version, restoring the global
+            //    file-number space + last_sequence.  A DB whose CFs never flushed
+            //    has no descriptor yet (it is created lazily on the first edit);
+            //    in that case there is nothing on-disk to recover.
+            if (sm.exists()) try sm.recover();
+
+            // 3. Propagate the recovered sequence to each CF so its reads see all
+            //    SST data before WAL replay further advances it.
+            {
+                var it = self.cfs.valueIterator();
+                while (it.next()) |cf_ptr| cf_ptr.*.db.last_sequence = sm.last_sequence;
+            }
+            self.last_sequence = sm.last_sequence;
+
+            // 4. Reopen the shared WAL appendably and resume the writer mid-block.
             const file_size = e.getFileSize(log_path) catch 0;
             self.wal_file = try e.newAppendableFile(gpa, log_path);
             errdefer self.wal_file.close() catch {};
@@ -156,7 +189,7 @@ pub const CfDB = struct {
                 @intCast(file_size % log_format.kBlockSize),
             );
 
-            // 3. Replay the whole shared WAL into the CFs' memtables, restoring
+            // 5. Replay the whole shared WAL into the CFs' memtables, restoring
             //    last_sequence from the highest replayed sequence.
             try self.replaySharedLog(log_path);
         } else {
@@ -175,11 +208,16 @@ pub const CfDB = struct {
         return self;
     }
 
-    /// Close the shared WAL and tear down every CF.
+    /// Close the shared WAL, tear down every CF, and free the shared MANIFEST.
     pub fn close(self: *CfDB) void {
         const gpa = self.gpa;
         self.wal_file.close() catch {};
+        // Tear down CFs first (frees each VersionSet that the SharedManifest
+        // borrows by pointer), then free the manifest (clears its CF map +
+        // closes the descriptor).
         self.deinitCfs();
+        self.manifest.deinit();
+        gpa.destroy(self.manifest);
         gpa.free(self.dbroot);
         gpa.destroy(self);
     }
@@ -215,7 +253,7 @@ pub const CfDB = struct {
         const dir = try self.cfDir(name);
         defer self.gpa.free(dir);
 
-        const sub = try DB.openCf(self.gpa, self.env, dir, self.options);
+        const sub = try DB.openCfShared(self.gpa, self.env, dir, self.options, self.manifest, id);
         errdefer sub.close();
 
         const cf = try self.gpa.create(ColumnFamily);
@@ -250,6 +288,9 @@ pub const CfDB = struct {
         if (h.id == 0) return error.CannotDropDefault;
         const entry = self.cfs.fetchRemove(h.name) orelse return error.ColumnFamilyNotFound;
         const cf = entry.value;
+        // Unregister from the shared MANIFEST BEFORE closing the CF DB (closing
+        // frees the VersionSet the manifest borrows by pointer).
+        self.manifest.unregisterCf(cf.id);
         cf.db.close();
         self.gpa.free(cf.name);
         self.gpa.destroy(cf);
