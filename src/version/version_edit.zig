@@ -100,6 +100,12 @@ pub const FileMetaData = struct {
     smallest_seqno: u64 = 0,
     /// Largest sequence number in the file (RocksDB kNewFile4 field).
     largest_seqno: u64 = 0,
+    /// True iff the SST's range-del meta block carries at least one range
+    /// tombstone.  Defaults to `true` (conservative: assume tombstones present)
+    /// for files recovered from the MANIFEST or produced by compaction.  Flush
+    /// sets it to `false` when the flushed MemTable carried no range tombstones,
+    /// enabling the fast-path guard in `DB.get` / `DB.newIterator`.
+    has_range_tombstones: bool = true,
     // allowed_seeks, refs etc. can be added later (M5.1+).
 };
 
@@ -259,6 +265,15 @@ pub const VersionEdit = struct {
                 .largest_seqno = largest_seqno,
             },
         });
+    }
+
+    /// Override the `has_range_tombstones` flag on the most-recently-added file
+    /// (the last entry of `new_files`).  Must be called immediately after
+    /// `addFile` / `addFile4`.  Caller is responsible for only calling when
+    /// `new_files` is non-empty.
+    pub fn setLastFileHasRangeTombstones(self: *VersionEdit, v: bool) void {
+        std.debug.assert(self.new_files.items.len > 0);
+        self.new_files.items[self.new_files.items.len - 1].meta.has_range_tombstones = v;
     }
 
     /// Mark a file as deleted.

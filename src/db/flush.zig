@@ -158,6 +158,10 @@ pub fn flushMemTable(
     } else {
         // addFile dupes the key bytes into edit-owned memory.
         try edit.addFile(gpa, 0, file_number, file_size, smallest.?, largest.?);
+        // D3a-M1 range-tombstone guard: record whether this SST carries any
+        // range tombstones so `DB.get`/`DB.newIterator` can skip building the
+        // aggregator on the fast path (no tombstones anywhere).
+        edit.setLastFileHasRangeTombstones(!imm.range_tombstones.isEmpty());
     }
 
     // Rotate to the new active log and advance the last sequence so a later

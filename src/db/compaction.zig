@@ -721,8 +721,12 @@ pub fn doCompaction(
     // Universal keeps the merged run in L0 (output_level == 0); leveled writes it
     // to `level + 1`.  `outputLevel()` resolves the right destination.
     const out_level = compaction.outputLevel();
+    // D3a-M1: surviving tombstones are seeded into every output file by
+    // ensureBuilder, so all outputs carry tombstones iff surviving is non-empty.
+    const out_has_tombs = !surviving.isEmpty();
     for (outputs.items) |o| {
         try edit.addFile(gpa, @intCast(out_level), o.number, o.file_size, o.smallest, o.largest);
+        edit.setLastFileHasRangeTombstones(out_has_tombs);
     }
 
     try versions.logAndApply(&edit);
