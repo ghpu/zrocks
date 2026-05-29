@@ -21,9 +21,22 @@
 /// freed. A freshly inserted entry therefore starts at refs == 2 (one for the
 /// table, one for the returned handle).
 ///
-// TODO(concurrency): per-shard std.Io.Mutex — single-threaded for now, so no
-// locking is taken. The sharding structure exists to make adding per-shard
-// locks (and reducing contention) a localised change later.
+/// CONCURRENCY (D2b-3): each shard carries its own `std.Io.Mutex`, taken around
+/// every operation that touches that shard's hash table / LRU list / usage
+/// tally. Because the cache shards by key hash, two operations on keys in
+/// different shards proceed in parallel — the lock is fine-grained, not global.
+///
+/// io-vs-VTable decision (resolved here): the cache stores a `std.Io` capability
+/// at CONSTRUCTION (`Cache.init(gpa, io, capacity)`), mirroring `TableCache`.
+/// The lock/unlock are pure in-memory critical-section guards; no file I/O ever
+/// happens under the lock. The real call sites — `table_reader.readBlockCached`
+/// and the SST table-iterator VTable — do NOT need an `io` of their own: the
+/// `Cache` they consult already carries one. Threading `io` through the generic
+/// `Iterator` VTable was rejected: it would force an `io` slot onto every
+/// iterator implementation (Vector/Merging/TwoLevel/memtable) that holds no
+/// cache at all, a far more invasive, capability-polluting change. The cache's
+/// infallible API (`lookup`/`release`/`value`/`erase`) uses `lockUncancelable`
+/// so those signatures stay error-free; the critical sections are tiny.
 const std = @import("std");
 
 /// Number of shards (power of two so the shard index is a cheap mask).
@@ -53,6 +66,13 @@ const Entry = struct {
 /// A single shard: a hash table plus an intrusive LRU list and a usage tally.
 const Shard = struct {
     gpa: std.mem.Allocator,
+    /// The `std.Io` capability used to lock/unlock this shard's mutex (the SAME
+    /// one handed to `Cache.init`; never an ambient/global io).
+    io: std.Io,
+    /// Guards EVERY field below (table / lru_head / lru_tail / usage) and the
+    /// refcount mutations on this shard's entries. Held only for the duration
+    /// of a single cache op — no file I/O is ever performed under it.
+    mutex: std.Io.Mutex,
     capacity: usize,
     usage: usize,
     /// key -> entry. The map's own key memory is the Entry's owned key dup,
@@ -63,9 +83,11 @@ const Shard = struct {
     lru_head: ?*Entry,
     lru_tail: ?*Entry,
 
-    fn init(gpa: std.mem.Allocator, capacity: usize) Shard {
+    fn init(gpa: std.mem.Allocator, io: std.Io, capacity: usize) Shard {
         return .{
             .gpa = gpa,
+            .io = io,
+            .mutex = .init,
             .capacity = capacity,
             .usage = 0,
             .table = .empty,
@@ -156,6 +178,9 @@ const Shard = struct {
     }
 
     fn insert(self: *Shard, key: []const u8, val: []u8, charge: usize) !*Entry {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
         const e = try self.gpa.create(Entry);
         errdefer self.gpa.destroy(e);
         const key_dup = try self.gpa.dupe(u8, key);
@@ -184,6 +209,9 @@ const Shard = struct {
     }
 
     fn lookup(self: *Shard, key: []const u8) ?*Entry {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
         const e = self.table.get(key) orelse return null;
         // Pin: if it was evictable (refs == 1), take it off the LRU list.
         if (e.refs == 1) self.lruRemove(e);
@@ -192,10 +220,16 @@ const Shard = struct {
     }
 
     fn release(self: *Shard, e: *Entry) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
         self.unref(e);
     }
 
     fn erase(self: *Shard, key: []const u8) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
         if (self.table.get(key)) |e| {
             self.removeFromCache(e);
         }
@@ -207,20 +241,26 @@ pub const Cache = struct {
     pub const Handle = opaque {};
 
     gpa: std.mem.Allocator,
+    /// The `std.Io` capability shared by every shard's mutex (see the module
+    /// doc comment's io-vs-VTable decision). Caller-supplied at construction.
+    io: std.Io,
     shards: [kNumShards]Shard,
-    /// Observability counters (cumulative across shards).
-    hits: usize = 0,
-    misses: usize = 0,
+    /// Observability counters (cumulative across shards). Atomic so concurrent
+    /// `lookup`s on different shards bump them race-free; read with `hitCount`
+    /// / `missCount`.
+    hits: std.atomic.Value(usize) = .init(0),
+    misses: std.atomic.Value(usize) = .init(0),
 
-    pub fn init(gpa: std.mem.Allocator, capacity: usize) Cache {
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, capacity: usize) Cache {
         var self = Cache{
             .gpa = gpa,
+            .io = io,
             .shards = undefined,
         };
         // Distribute capacity across shards, rounding up so the sum is >=
         // the requested capacity (matches LevelDB's per-shard split).
         const per_shard = (capacity + kNumShards - 1) / kNumShards;
-        for (&self.shards) |*s| s.* = Shard.init(gpa, per_shard);
+        for (&self.shards) |*s| s.* = Shard.init(gpa, io, per_shard);
         return self;
     }
 
@@ -248,11 +288,21 @@ pub const Cache = struct {
     /// `misses`. The caller must `release` any returned handle.
     pub fn lookup(self: *Cache, key: []const u8) ?*Handle {
         if (self.shardFor(key).lookup(key)) |e| {
-            self.hits += 1;
+            _ = self.hits.fetchAdd(1, .monotonic);
             return @ptrCast(e);
         }
-        self.misses += 1;
+        _ = self.misses.fetchAdd(1, .monotonic);
         return null;
+    }
+
+    /// Cumulative cache hits observed by `lookup`.
+    pub fn hitCount(self: *const Cache) usize {
+        return self.hits.load(.monotonic);
+    }
+
+    /// Cumulative cache misses observed by `lookup`.
+    pub fn missCount(self: *const Cache) usize {
+        return self.misses.load(.monotonic);
     }
 
     /// The stored bytes for `handle` (valid until the handle is released).
@@ -275,7 +325,10 @@ pub const Cache = struct {
         self.shardFor(key).erase(key);
     }
 
-    /// Total live charge across all shards.
+    /// Total live charge across all shards. Best-effort snapshot: it reads each
+    /// shard's `usage` WITHOUT taking the shard lock (an observability helper),
+    /// so under concurrent mutation the sum is approximate. Callers wanting an
+    /// exact figure must quiesce the cache first (e.g. join all workers).
     pub fn totalCharge(self: *const Cache) usize {
         var total: usize = 0;
         for (&self.shards) |*s| total += s.usage;
@@ -339,8 +392,8 @@ test "cache: insert + lookup hit returns the value; absent -> null; counters" {
 
     try testing.expect(c.lookup("absent") == null);
 
-    try testing.expectEqual(@as(usize, 1), c.hits);
-    try testing.expectEqual(@as(usize, 1), c.misses);
+    try testing.expectEqual(@as(usize, 1), c.hitCount());
+    try testing.expectEqual(@as(usize, 1), c.missCount());
 }
 
 test "cache: eviction of LRU unpinned entries keeps usage <= capacity" {

@@ -966,7 +966,7 @@ test "table reader: snappy round-trip through the block cache (hits on reread)" 
     try buildTable(gpa, e, "snapc.sst", opts, policy, entries.items);
 
     const file_size = try e.getFileSize("snapc.sst");
-    var cache = cache_mod.Cache.init(gpa, 1 << 20);
+    var cache = cache_mod.Cache.init(gpa, e.io(), 1 << 20);
     defer cache.deinit();
 
     var raf = try e.newRandomAccessFile(gpa, "snapc.sst");
@@ -980,14 +980,14 @@ test "table reader: snappy round-trip through the block cache (hits on reread)" 
         defer gpa.free(got);
         try testing.expectEqualStrings(kv.v, got);
     }
-    const hits_before = cache.hits;
+    const hits_before = cache.hitCount();
     // Second pass: cache hits serve the decompressed blocks; values identical.
     for (entries.items) |kv| {
         const got = try table.get(gpa, kv.k) orelse return error.TestExpectedFound;
         defer gpa.free(got);
         try testing.expectEqualStrings(kv.v, got);
     }
-    try testing.expect(cache.hits > hits_before);
+    try testing.expect(cache.hitCount() > hits_before);
 }
 
 test "table reader: cache hit serves the SAME buffer (zero-copy pinned handle)" {
@@ -1006,7 +1006,7 @@ test "table reader: cache hit serves the SAME buffer (zero-copy pinned handle)" 
     try buildTable(gpa, e, "pin.sst", opts, policy, entries.items);
 
     const file_size = try e.getFileSize("pin.sst");
-    var cache = cache_mod.Cache.init(gpa, 1 << 20);
+    var cache = cache_mod.Cache.init(gpa, e.io(), 1 << 20);
     defer cache.deinit();
 
     var raf = try e.newRandomAccessFile(gpa, "pin.sst");
@@ -1270,7 +1270,7 @@ test "table reader: optional block cache yields identical results and hits on re
     }
 
     // ---- Cached: same results, and hits on reread ------------------------
-    var cache = cache_mod.Cache.init(gpa, 1 << 20);
+    var cache = cache_mod.Cache.init(gpa, e.io(), 1 << 20);
     defer cache.deinit();
 
     var raf = try e.newRandomAccessFile(gpa, "cache.sst");
@@ -1295,7 +1295,7 @@ test "table reader: optional block cache yields identical results and hits on re
     }
     try testing.expect(cache.totalCharge() > 0);
 
-    const hits_before = cache.hits;
+    const hits_before = cache.hitCount();
 
     // Second scan: same blocks -> cache hits, identical results.
     {
@@ -1310,15 +1310,15 @@ test "table reader: optional block cache yields identical results and hits on re
         }
         try testing.expectEqual(ref.items.len, idx);
     }
-    try testing.expect(cache.hits > hits_before);
+    try testing.expect(cache.hitCount() > hits_before);
 
     // Point gets from the same blocks also identical + serviced from cache.
-    const hits_before_get = cache.hits;
+    const hits_before_get = cache.hitCount();
     for (entries.items) |kv| {
         const got = try table.get(gpa, kv.k);
         try testing.expect(got != null);
         defer gpa.free(got.?);
         try testing.expectEqualStrings(kv.v, got.?);
     }
-    try testing.expect(cache.hits > hits_before_get);
+    try testing.expect(cache.hitCount() > hits_before_get);
 }
