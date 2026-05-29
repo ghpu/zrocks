@@ -100,6 +100,10 @@ const ColumnFamily = struct {
 pub const CfDB = struct {
     gpa: std.mem.Allocator,
     env: env.Env,
+    /// Concurrency capability backing this database (D2a-1): the SAME `std.Io`
+    /// that owns `env`'s filesystem authority.  Used by `write_mutex` and the
+    /// upcoming background workers — never an ambient/global io.
+    io: std.Io,
     dbroot: []u8, // owned
     options: Options,
 
@@ -119,6 +123,15 @@ pub const CfDB = struct {
     wal: log_writer.Writer,
     last_sequence: u64,
 
+    /// Serializes the shared-WAL write path (`write`) and teardown (`close`) so
+    /// the single WAL + global last_sequence + per-CF fan-out stay consistent
+    /// once background workers contend (D2a-1).  Distinct from each sub-LSM's own
+    /// write mutex (no deadlock: this guards the shared WAL, then each CF briefly
+    /// locks only its own memtable).  `write` uses the cancelable lock; the
+    /// void-returning `close` uses `lockUncancelable`.  Single-threaded today, so
+    /// always uncontended (lock = a cmpxchg, no futex).
+    write_mutex: std.Io.Mutex = .init,
+
     /// Open (or create) a multi-CF database rooted at `dbroot`.
     ///
     /// Fresh: makes `dbroot`, writes a CF_LIST containing just "default", creates
@@ -132,6 +145,11 @@ pub const CfDB = struct {
 
         self.gpa = gpa;
         self.env = e;
+        // Pull the concurrency capability from the Env (no ambient io).  `self`
+        // came from raw `gpa.create` memory, so the field default initializer is
+        // NOT applied — set the mutex to unlocked explicitly.
+        self.io = e.io();
+        self.write_mutex = .init;
         self.options = options;
         self.last_sequence = 0;
         self.next_cf_id = 0;
@@ -210,6 +228,11 @@ pub const CfDB = struct {
 
     /// Close the shared WAL, tear down every CF, and free the shared MANIFEST.
     pub fn close(self: *CfDB) void {
+        // Acquire the write mutex so close cannot race a writer once background
+        // workers exist (D2a-1).  `close` returns `void` and cannot propagate
+        // `error.Canceled`, so use the uncancelable lock.  We never unlock: the
+        // mutex's memory is freed below with the rest of the CfDB.
+        self.write_mutex.lockUncancelable(self.io);
         const gpa = self.gpa;
         self.wal_file.close() catch {};
         // Tear down CFs first (frees each VersionSet that the SharedManifest
@@ -460,6 +483,13 @@ pub const CfDB = struct {
     /// space (so record i of the batch maps to first_sequence + i regardless of
     /// CF).  Finally advance the shared `last_sequence`.
     pub fn write(self: *CfDB, wopts: WriteOptions, batch: *WriteBatch) !void {
+        // Serialize writers over the shared WAL (D2a-1).  Held across the single
+        // WAL append + the per-CF fan-out so a cross-CF write stays atomic once
+        // background workers contend.  Single-threaded today (always
+        // uncontended), so `lock` never reaches a cancelation point.
+        try self.write_mutex.lock(self.io);
+        defer self.write_mutex.unlock(self.io);
+
         const first_sequence = self.last_sequence + 1;
         batch.setSequence(first_sequence);
 
