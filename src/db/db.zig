@@ -3465,22 +3465,30 @@ fn readWholeFile(e: env.Env, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
 /// Snappy-compressed (trailer byte == kSnappyCompression).  Mirrors the
 /// table_builder mini-reader: footer -> index block -> per-data-block trailer.
 fn sstHasSnappyDataBlock(gpa: std.mem.Allocator, file: []const u8) !bool {
+    _ = gpa;
     const footer = try footer_mod.Footer.decodeFrom(file[file.len - footer_mod.kEncodedLength ..]);
 
-    // Index block is always stored uncompressed (kNoCompression).
+    // Index block is always stored uncompressed (kNoCompression).  It is the
+    // RocksDB-form binary-search index: restart_interval=1, USER-key separator +
+    // bare 2-varint BlockHandle (no value-length prefix), so walk it by restart
+    // points to recover each data-block handle.
     const ih_start: usize = @intCast(footer.index_handle.offset);
     const ih_size: usize = @intCast(footer.index_handle.size);
-    const index_contents = file[ih_start .. ih_start + ih_size];
-    const index_block = try block_mod.Block.init(gpa, index_contents);
-
-    // The index block's comparator only affects ordered seeks; a forward scan
-    // works with any comparator, so use bytewise.
-    var it = index_block.iterator(comparator.bytewise);
-    defer it.deinit();
-    it.seekToFirst();
-    while (it.valid()) : (it.next()) {
-        var hv: []const u8 = it.value();
-        const h = try footer_mod.BlockHandle.decodeFrom(&hv);
+    const raw = file[ih_start .. ih_start + ih_size];
+    if (raw.len < @sizeOf(u32)) return error.Corruption;
+    const num_restarts = coding.decodeFixed32(raw[raw.len - 4 ..][0..4]);
+    const restart_array_off = raw.len - (@as(usize, num_restarts) + 1) * @sizeOf(u32);
+    for (0..num_restarts) |i| {
+        const estart = coding.decodeFixed32(raw[restart_array_off + i * 4 ..][0..4]);
+        const eend: usize = if (i + 1 < num_restarts)
+            coding.decodeFixed32(raw[restart_array_off + (i + 1) * 4 ..][0..4])
+        else
+            restart_array_off;
+        var entry: []const u8 = raw[estart..eend];
+        _ = try coding.getVarint32(&entry); // shared (0 at a restart)
+        const non_shared = try coding.getVarint32(&entry);
+        entry = entry[non_shared..];
+        const h = try footer_mod.BlockHandle.decodeFrom(&entry);
         const start: usize = @intCast(h.offset);
         const size: usize = @intCast(h.size);
         // trailer[0] (the byte immediately after the block payload) is the
