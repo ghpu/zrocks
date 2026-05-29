@@ -326,7 +326,7 @@ fn sameShardKeys(bufs: [][16]u8, out: [][]const u8) void {
 
 test "cache: insert + lookup hit returns the value; absent -> null; counters" {
     const gpa = testing.allocator;
-    var c = Cache.init(gpa, 1024);
+    var c = Cache.init(gpa, testIo(), 1024);
     defer c.deinit();
 
     const h = try c.insert("k1", try ownVal(gpa, "v1"), 2);
@@ -346,7 +346,7 @@ test "cache: insert + lookup hit returns the value; absent -> null; counters" {
 test "cache: eviction of LRU unpinned entries keeps usage <= capacity" {
     const gpa = testing.allocator;
     // Target shard budget 30; each entry charge 10 => at most 3 live in it.
-    var c = Cache.init(gpa, capacityForPerShard(30));
+    var c = Cache.init(gpa, testIo(), capacityForPerShard(30));
     defer c.deinit();
 
     var bufs: [6][16]u8 = undefined;
@@ -373,7 +373,7 @@ test "cache: eviction of LRU unpinned entries keeps usage <= capacity" {
 
 test "cache: pinned entry is not evicted until released" {
     const gpa = testing.allocator;
-    var c = Cache.init(gpa, capacityForPerShard(30));
+    var c = Cache.init(gpa, testIo(), capacityForPerShard(30));
     defer c.deinit();
 
     var bufs: [14][16]u8 = undefined;
@@ -407,7 +407,7 @@ test "cache: pinned entry is not evicted until released" {
 
 test "cache: erase removes and frees an entry" {
     const gpa = testing.allocator;
-    var c = Cache.init(gpa, 1024);
+    var c = Cache.init(gpa, testIo(), 1024);
     defer c.deinit();
 
     const h = try c.insert("gone", try ownVal(gpa, "data"), 4);
@@ -422,7 +422,7 @@ test "cache: erase removes and frees an entry" {
 
 test "cache: lookup promotes to MRU and survives eviction" {
     const gpa = testing.allocator;
-    var c = Cache.init(gpa, capacityForPerShard(30)); // 3 entries of charge 10
+    var c = Cache.init(gpa, testIo(), capacityForPerShard(30)); // 3 entries of charge 10
     defer c.deinit();
 
     var bufs: [4][16]u8 = undefined;
@@ -453,7 +453,7 @@ test "cache: lookup promotes to MRU and survives eviction" {
 
 test "cache: totalCharge equals sum of live entry charges" {
     const gpa = testing.allocator;
-    var c = Cache.init(gpa, 10_000);
+    var c = Cache.init(gpa, testIo(), 10_000);
     defer c.deinit();
 
     var expected: usize = 0;
@@ -471,10 +471,77 @@ test "cache: totalCharge equals sum of live entry charges" {
 
 test "cache: zero leaks with outstanding handle at deinit" {
     const gpa = testing.allocator;
-    var c = Cache.init(gpa, 1024);
+    var c = Cache.init(gpa, testIo(), 1024);
 
     // Insert and keep a handle outstanding; deinit must free gracefully.
     const h = try c.insert("held", try ownVal(gpa, "value"), 5);
     _ = h; // intentionally not released before deinit
     c.deinit();
+}
+
+// ===========================================================================
+// Tests — Part B: per-shard mutex (D2b-3)
+//
+// The cache now carries a `std.Io` capability and a per-shard `std.Io.Mutex`,
+// so concurrent readers/writers spread across the threaded io are race-free.
+// These tests hammer the cache from several fibers (real threads under the
+// Threaded io) and assert the structure stays consistent.
+// ===========================================================================
+
+const builtin = @import("builtin");
+
+fn testIo() std.Io {
+    return std.testing.io;
+}
+
+/// A worker that repeatedly inserts/looks-up/releases against a SHARED cache,
+/// exercising the per-shard locks under genuine concurrency.
+const HammerWorker = struct {
+    cache: *Cache,
+    gpa: std.mem.Allocator,
+    base: usize,
+    iters: usize,
+    ok: bool = false,
+
+    fn run(self: *HammerWorker) void {
+        var buf: [32]u8 = undefined;
+        var i: usize = 0;
+        while (i < self.iters) : (i += 1) {
+            const k = std.fmt.bufPrint(&buf, "k{d}-{d}", .{ self.base, i }) catch unreachable;
+            const v = self.gpa.dupe(u8, k) catch unreachable;
+            const h = self.cache.insert(k, v, k.len) catch unreachable;
+            self.cache.release(h);
+
+            if (self.cache.lookup(k)) |lh| {
+                self.cache.release(lh);
+            }
+            self.cache.erase(k);
+        }
+        self.ok = true;
+    }
+};
+
+test "cache: concurrent insert/lookup/erase across fibers is race-free" {
+    if (!builtin.is_test) return;
+    const gpa = testing.allocator;
+    const io = testIo();
+
+    // Modest capacity so eviction also runs under contention.
+    var c = Cache.init(gpa, io, 4096);
+    defer c.deinit();
+
+    var w0 = HammerWorker{ .cache = &c, .gpa = gpa, .base = 0, .iters = 200 };
+    var w1 = HammerWorker{ .cache = &c, .gpa = gpa, .base = 1, .iters = 200 };
+    var w2 = HammerWorker{ .cache = &c, .gpa = gpa, .base = 2, .iters = 200 };
+
+    var f0 = try std.Io.concurrent(io, HammerWorker.run, .{&w0});
+    var f1 = try std.Io.concurrent(io, HammerWorker.run, .{&w1});
+    var f2 = try std.Io.concurrent(io, HammerWorker.run, .{&w2});
+    f0.await(io);
+    f1.await(io);
+    f2.await(io);
+
+    try testing.expect(w0.ok and w1.ok and w2.ok);
+    // Every key was erased by its worker, so the cache is empty again.
+    try testing.expectEqual(@as(usize, 0), c.totalCharge());
 }
