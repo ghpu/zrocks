@@ -411,9 +411,13 @@ pub const DB = struct {
     /// the shared sequence space.
     pub fn applyBatchNoWal(self: *DB, batch: *const WriteBatch, cf_id: u32, first_sequence: u64, set_last_sequence: u64) !void {
         // Serialize this CF's memtable mutation + flush/compaction under the CF's
-        // own write mutex (D2a-1).  Distinct from the CfDB-level shared-WAL mutex,
-        // so there is no deadlock: the CfDB locks the shared WAL, then fans out to
-        // each CF which briefly locks only its own sub-LSM.
+        // own write mutex (D2a-1).  This is the INNER lock of the CfDB nested-lock
+        // rule (see CfDB.write): the CfDB holds its OWN shared-WAL mutex (OUTER),
+        // then fans out to each CF which briefly locks only its own sub-LSM
+        // (INNER).  Ordering is always CfDB-outer → sub-LSM-inner and a sub-LSM
+        // never reaches back up to the CfDB mutex, so the nesting is acyclic — no
+        // deadlock.  Reads `self.last_sequence` (write-path-internal) directly;
+        // outside callers use `lastSequence()`/`getSnapshot` which take this lock.
         try self.write_mutex.lock(self.io);
         defer self.write_mutex.unlock(self.io);
 
@@ -1356,10 +1360,34 @@ pub const DB = struct {
         gpa.destroy(merger);
     }
 
+    /// Read the current DB-wide last sequence UNDER the write mutex.
+    ///
+    /// `last_sequence` is mutated by the write path (`write`/`applyBatchNoWal`)
+    /// while it holds `write_mutex`.  Any reader OUTSIDE that path (e.g.
+    /// `getSnapshot`, or a `Transaction` capturing its BEGIN snapshot) must take
+    /// the same lock to observe a consistent value once background writers
+    /// contend — a bare field read would be a data race with `+=`.  Returns a
+    /// plain `u64` (no error), so it uses the uncancelable lock.
+    ///
+    /// MUST NOT be called while already holding `write_mutex` (`std.Io.Mutex` is
+    /// non-recursive — that would deadlock).  Callers on the write path read the
+    /// field directly instead.
+    pub fn lastSequence(self: *DB) u64 {
+        self.write_mutex.lockUncancelable(self.io);
+        defer self.write_mutex.unlock(self.io);
+        return self.last_sequence;
+    }
+
     /// Take a snapshot pinned at the current latest sequence.  The returned
     /// `*Snapshot` is owned by the DB's SnapshotList until `releaseSnapshot`;
     /// while it is live, compaction will not discard versions visible to it.
+    ///
+    /// Reads `last_sequence` AND mutates the snapshot list under the write mutex
+    /// (matching `releaseSnapshot`) so the captured sequence and the list stay
+    /// consistent against a concurrent writer (D2b1).
     pub fn getSnapshot(self: *DB) !*Snapshot {
+        self.write_mutex.lockUncancelable(self.io);
+        defer self.write_mutex.unlock(self.io);
         return self.snapshots.newSnapshot(self.last_sequence);
     }
 
@@ -3329,6 +3357,58 @@ test "D2a-1: write mutex serializes the write path; single-thread round-trips" {
     try testing.expectEqualStrings("v2", got);
 
     // After the writes complete, the mutex is released again.
+    try testing.expect(db.write_mutex.tryLock());
+    db.write_mutex.unlock(db.io);
+}
+
+// ---------------------------------------------------------------------------
+// D2b1 — write-mutex hardening: last_sequence reads under the lock
+// ---------------------------------------------------------------------------
+
+test "D2b1: lastSequence() reads under the write mutex and tracks writes" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const db = try openTestDB(gpa, &me);
+    defer db.close();
+
+    // Fresh DB: no writes yet.
+    try testing.expectEqual(@as(u64, 0), db.lastSequence());
+
+    // Each single-key put consumes one sequence slot; lastSequence() observes it.
+    try db.put(.{}, "a", "1");
+    try testing.expectEqual(@as(u64, 1), db.lastSequence());
+    try db.put(.{}, "b", "2");
+    try testing.expectEqual(@as(u64, 2), db.lastSequence());
+
+    // lastSequence() takes (and releases) the write mutex: it is free both before
+    // and after — and it must never deadlock when called repeatedly.
+    try testing.expect(db.write_mutex.tryLock());
+    db.write_mutex.unlock(db.io);
+    try testing.expectEqual(@as(u64, 2), db.lastSequence());
+    try testing.expect(db.write_mutex.tryLock());
+    db.write_mutex.unlock(db.io);
+}
+
+test "D2b1: getSnapshot captures last_sequence under the lock (matches lastSequence)" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const db = try openTestDB(gpa, &me);
+    defer db.close();
+
+    try db.put(.{}, "k", "v1");
+    try db.put(.{}, "k", "v2");
+
+    // getSnapshot now takes the write mutex (no longer a bare field read); the
+    // captured sequence equals the value lastSequence() reports under the lock.
+    const seq_before = db.lastSequence();
+    const snap = try db.getSnapshot();
+    defer db.releaseSnapshot(snap);
+    try testing.expectEqual(seq_before, snap.sequence);
+
+    // Mutex is free immediately after getSnapshot returns (it released the lock),
+    // and releaseSnapshot — which also takes the lock — does not deadlock with it.
     try testing.expect(db.write_mutex.tryLock());
     db.write_mutex.unlock(db.io);
 }
