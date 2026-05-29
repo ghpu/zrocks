@@ -1,4 +1,6 @@
-//! rocksdb_write_interop_test.zig — rocksdb-write CI-safe self-consistency gate.
+//! rocksdb_write_interop_test.zig — TWO-TRACK rocksdb-write gate.
+//!
+//! ## Track 1 — CI self-consistency (runs in every `zig build test`)
 //!
 //! Proves that a zrocks DB written in the opt-in rocksdb-compatible dialect
 //! (`Options.sst_output = .rocksdb`), FULLY FLUSHED to SSTs, is internally
@@ -16,10 +18,30 @@
 //!      read-side discriminator), and the MANIFEST emits NO default-CF add and
 //!      uses kNewFile4 (tag 103) records.
 //!
-//! The REAL-RocksDB authenticity gate (open the same directory with a genuine
-//! RocksDB v11 binary via `verify_open`) was exercised in the dev loop; see the
-//! milestone report for the exact `OPEN_OK count=...` evidence.  It is not wired
-//! as a CI test because it requires the external librocksdb binary.
+//! ## Track 2 — Dev-loop real-RocksDB authenticity gate (NOT wired into CI)
+//!
+//! After the CI test passes, developers run the real RocksDB oracle against the
+//! same flushed DB directory.  The oracle binary (`/home/ghpu/rocksdb-interop/verify_open`)
+//! is built from `tools/rocksdb-interop/verify_open.cc` and performs:
+//!   a. OpenForReadOnly — confirms RocksDB can open the DB at all.
+//!   b. Full forward scan (SeekToFirst → end) — exercises data blocks + bloom.
+//!   c. Point Get on sampled live keys — exercises the Get path and bloom probe.
+//!   d. Point Get on a synthetic absent key — must return NotFound.
+//!   e. Seek to a mid-key + forward range scan — exercises Seek + partial scan.
+//!
+//! Expected oracle output for THIS test's DB (11 live keys, "charlie" deleted):
+//!
+//!   OPEN_OK count=11
+//!   alpha=v-alpha
+//!   bravo=v-bravo
+//!   ... (all live keys in sorted order)
+//!
+//! Dev-loop invocation (after writing the DB to /tmp/rdbwrite or similar):
+//!   /home/ghpu/rocksdb-interop/verify_open <db_dir>
+//!
+//! This gate is NOT in CI because it requires the external librocksdb binary
+//! (not present in CI).  The oracle-widen milestone (oracle-widen) established
+//! the widened checks above and verified OPEN_OK count=11 against this DB.
 
 const std = @import("std");
 const zrocks = @import("zrocks");
