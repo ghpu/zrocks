@@ -960,6 +960,85 @@ test "D1b-M4: the one MANIFEST carries CF-tagged edits for multiple CFs" {
     try testing.expect(ids.contains(2));
 }
 
+test "remove-native-and-tests: SharedManifest snapshot uses kNewFile4 (tag 103) — not legacy kNewFile (tag 7)" {
+    // Final RocksDB-only sweep: the shared MANIFEST's startup snapshot must
+    // emit every per-CF file in kNewFile4 form (tag 103, carrying smallest_seqno
+    // / largest_seqno).  Real RocksDB tolerates legacy kNewFile=7 but the
+    // "RocksDB-only on disk" directive requires we never emit it.  The reopen
+    // creates a fresh shared MANIFEST whose first record per CF is the snapshot;
+    // every file entry in that record must have is_v4 = true.
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    const opts = Options{ .write_buffer_size = 256 };
+
+    // First open: write+flush so each CF carries SST files.
+    {
+        const cdb = try CfDB.open(gpa, e, "snap_v4", opts);
+        defer cdb.close();
+        const u = try cdb.createColumnFamily("users", .{});
+        const o = try cdb.createColumnFamily("orders", .{});
+        var i: usize = 0;
+        var kbuf: [16]u8 = undefined;
+        while (i < 30) : (i += 1) {
+            const k = try std.fmt.bufPrint(&kbuf, "k{d:0>4}", .{i});
+            try cdb.put(.{}, u, k, "padding-value-forces-l0-flush");
+            try cdb.put(.{}, o, k, "padding-value-forces-l0-flush");
+        }
+    }
+
+    // Reopen: this writes a FRESH shared MANIFEST whose first records ARE the
+    // per-CF startup snapshots produced by SharedManifest.writeSnapshot.
+    {
+        const cdb = try CfDB.open(gpa, e, "snap_v4", opts);
+        defer cdb.close();
+        // Force at least one more edit so the descriptor is sealed.
+        const def = cdb.defaultColumnFamily();
+        try cdb.put(.{}, def, "d", "x");
+    }
+
+    // Walk every NewFileEntry in every MANIFEST record; assert ALL are v4 (the
+    // legacy kNewFile=7 wire form is dropped from the SharedManifest writer).
+    var saw_any_file = false;
+    {
+        const current_path = try filename.currentFileName(gpa, "snap_v4");
+        defer gpa.free(current_path);
+        var sf = try e.newSequentialFile(gpa, current_path);
+        var contents: std.ArrayListUnmanaged(u8) = .empty;
+        defer contents.deinit(gpa);
+        var chunk: [256]u8 = undefined;
+        while (true) {
+            const n = try sf.read(&chunk);
+            if (n == 0) break;
+            try contents.appendSlice(gpa, chunk[0..n]);
+        }
+        sf.close() catch {};
+
+        var basename: []const u8 = contents.items;
+        if (basename.len > 0 and basename[basename.len - 1] == '\n') basename = basename[0 .. basename.len - 1];
+        const manifest_path = try std.fmt.allocPrint(gpa, "snap_v4/{s}", .{basename});
+        defer gpa.free(manifest_path);
+
+        var msf = try e.newSequentialFile(gpa, manifest_path);
+        defer msf.close() catch {};
+        var reader = log_reader.Reader.init(msf);
+        var scratch: std.ArrayList(u8) = .empty;
+        defer scratch.deinit(gpa);
+
+        while (try reader.readRecord(gpa, &scratch)) |record| {
+            var edit = try version_edit.VersionEdit.decodeFrom(gpa, record);
+            defer edit.deinit(gpa);
+            for (edit.new_files.items) |nf| {
+                saw_any_file = true;
+                try testing.expect(nf.is_v4);
+            }
+        }
+    }
+    try testing.expect(saw_any_file);
+}
+
 test "D1b-M4: SST data for all CFs recovers through the one shared MANIFEST" {
     const gpa = testing.allocator;
     var me = MemEnv.init(gpa);
