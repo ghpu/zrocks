@@ -4,13 +4,13 @@ zig_binary: /home/ghpu/zig/zig
 stdlib: /home/ghpu/zig/lib/std
 target_rocksdb: "9.x line; block-based table format_version 5; legacy WAL/MANIFEST log (see docs/adr/000-target-format.md)"
 active_phase: "DONE — Phases 0-7 complete"
-active_milestone: "WRITE-interop done: real RocksDB opens a zrocks DB (opt-in .rocksdb). NEXT: make RocksDB the ONLY format (remove native) per DIRECTIVE."
-last_completed: RocksDB write-interop (Options.sst_output=.rocksdb; verify_open opens zrocks DB)
+active_milestone: "DIRECTIVE FULFILLED: byte-exact RocksDB is the ONLY format. native/clean formats DELETED. Real RocksDB opens flush+compaction+range-del+WAL output."
+last_completed: RocksDB-only migration (9/9 oracle-gated; partitioned-idx + bespoke range-del + block-based-bloom-write + sst_output enum + kColumnFamilyTag=0x10 removed; compaction kNewFile4/seqno bug fixed)
 worktrees: "(none — clean)"
 test_command: "/home/ghpu/zig/zig build test"
-test_count: 530
-artifacts: "zig build -> zig-out/lib/libzrocks.a + zig-out/bin/zrocks (CLI). CLI verified end-to-end (put/get/scan/bench, durable across processes)."
-updated: 2026-05-29
+test_count: 529
+artifacts: "zig build -> zig-out/lib/libzrocks.a + zig-out/bin/zrocks (CLI). zrocks reads + writes real RocksDB v11.4.0 end-to-end (real-RocksDB verify_open OPEN_OK count=34 on a full flush+compaction+range-del+WAL DB)."
+updated: 2026-05-30
 ---
 
 # zrocks Development State
