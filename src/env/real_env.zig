@@ -57,6 +57,20 @@ fn mapRenameErr(e: Dir.RenameError) Error {
     };
 }
 
+fn mapHardLinkErr(e: Dir.HardLinkError) Error {
+    return switch (e) {
+        error.FileNotFound => error.NotFound,
+        error.PathAlreadyExists => error.AlreadyExists,
+        error.AccessDenied, error.PermissionDenied => error.PermissionDenied,
+        // A cross-device link (EXDEV) and a filesystem/OS that does not support
+        // hard links both mean "cannot hard-link here" — map them to a DISTINCT
+        // error so the checkpoint caller can recognize it and fall back to a byte
+        // copy (any non-fatal link failure is treated as "copy instead").
+        error.CrossDevice, error.OperationUnsupported => error.NotSupported,
+        else => error.IoError,
+    };
+}
+
 fn mapStatFileErr(e: Dir.StatFileError) Error {
     return switch (e) {
         error.FileNotFound => error.NotFound,
@@ -169,6 +183,7 @@ pub const RealEnv = struct {
         .newRandomAccessFile = newRandomAccessFile,
         .deleteFile = deleteFile,
         .deleteTree = deleteTree,
+        .linkFile = linkFile,
         .renameFile = renameFile,
         .fileExists = fileExists,
         .getFileSize = getFileSize,
@@ -251,6 +266,16 @@ pub const RealEnv = struct {
     fn deleteTree(ptr: *anyopaque, path: []const u8) Error!void {
         const self: *RealEnv = @ptrCast(@alignCast(ptr));
         self.root.deleteTree(self.io, path) catch |e| return mapDeleteTreeErr(e);
+    }
+
+    /// Create a hard link `new_path` aliasing `old_path` within `root` (shared
+    /// inode, no byte copy).  Both paths are relative to `self.root`; `io` is the
+    /// 5th arg of `Dir.hardLink` and the options the 6th.  A cross-device link
+    /// (EXDEV) or an unsupporting filesystem surfaces as `error.NotSupported`
+    /// (see `mapHardLinkErr`) so the checkpoint caller falls back to a byte copy.
+    fn linkFile(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) Error!void {
+        const self: *RealEnv = @ptrCast(@alignCast(ptr));
+        Dir.hardLink(self.root, old_path, self.root, new_path, self.io, .{}) catch |e| return mapHardLinkErr(e);
     }
 
     fn renameFile(ptr: *anyopaque, from: []const u8, to: []const u8) Error!void {

@@ -120,6 +120,7 @@ pub const MemEnv = struct {
         .newRandomAccessFile = newRandomAccessFile,
         .deleteFile = deleteFile,
         .deleteTree = deleteTree,
+        .linkFile = linkFile,
         .renameFile = renameFile,
         .fileExists = fileExists,
         .getFileSize = getFileSize,
@@ -252,6 +253,41 @@ pub const MemEnv = struct {
             }
         }
         // Absent tree → nothing collected → no-op success.
+    }
+
+    /// Emulate a hard link as a CONTENT COPY (C-d): MemEnv files have no inodes,
+    /// and checkpointed SSTs are immutable, so duplicating `old_path`'s current
+    /// bytes into `new_path` is semantically identical to a shared-inode link.
+    /// `old_path` absent → NotFound; `new_path` already present → AlreadyExists
+    /// (matching std `Dir.hardLink` and RealEnv).  Holds the map lock across the
+    /// read + insert so the copy is atomic w.r.t. concurrent mutations; frees the
+    /// owned key/value exactly like the new-entry path in `store`.
+    fn linkFile(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) Error!void {
+        const self: *MemEnv = @ptrCast(@alignCast(ptr));
+        self.mutex.lockUncancelable(lockIo());
+        defer self.mutex.unlock(lockIo());
+
+        if (self.files.contains(new_path)) return error.AlreadyExists;
+        const src_bytes = self.files.get(old_path) orelse return error.NotFound;
+
+        const gop = try self.files.getOrPut(self.gpa, new_path);
+        // `new_path` cannot pre-exist (checked above), so this is always a fresh
+        // entry; dup the key first, then the contents, unwinding on failure.
+        const owned_key = self.gpa.dupe(u8, new_path) catch |e| {
+            _ = self.files.remove(new_path);
+            return e;
+        };
+        // NOTE: `src_bytes` stays valid — we hold the lock and have not mutated
+        // the map's existing entries (getOrPut on a new key may have rehashed,
+        // but the VALUE slices it stores are unchanged, so `src_bytes` still
+        // points at live bytes).
+        const new_bytes = self.gpa.dupe(u8, src_bytes) catch |e| {
+            _ = self.files.remove(new_path);
+            self.gpa.free(owned_key);
+            return e;
+        };
+        gop.key_ptr.* = owned_key;
+        gop.value_ptr.* = new_bytes;
     }
 
     fn renameFile(ptr: *anyopaque, from: []const u8, to: []const u8) Error!void {

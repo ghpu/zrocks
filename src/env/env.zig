@@ -127,6 +127,17 @@ pub const Env = struct {
         // exist succeeds (no-op), matching RocksDB's tolerant cleanup so a drop
         // of a CF that never flushed any SST does not hard-error.
         deleteTree: *const fn (ptr: *anyopaque, path: []const u8) Error!void,
+        // Create a hard link `new_path` pointing at the SAME backing storage as
+        // `old_path` (a cheap, space-sharing alias — no byte copy).  Used by
+        // checkpoint creation to alias immutable SSTs into the checkpoint dir
+        // (RocksDB hard-links SSTs and copies only mutable files).  On RealEnv
+        // this is a POSIX hard link (shared inode); a cross-device link (EXDEV)
+        // surfaces as `error.NotSupported` so the caller can fall back to a byte
+        // copy.  MemEnv has no inodes, so it emulates the link as a content copy
+        // of `old_path`'s current bytes (SSTs are immutable, so a copy is
+        // semantically identical).  `old_path` absent → `error.NotFound`;
+        // `new_path` already present → `error.AlreadyExists`.
+        linkFile: *const fn (ptr: *anyopaque, old_path: []const u8, new_path: []const u8) Error!void,
         renameFile: *const fn (ptr: *anyopaque, from: []const u8, to: []const u8) Error!void,
         fileExists: *const fn (ptr: *anyopaque, path: []const u8) bool,
         getFileSize: *const fn (ptr: *anyopaque, path: []const u8) Error!u64,
@@ -185,6 +196,16 @@ pub const Env = struct {
     /// (C3).
     pub fn deleteTree(self: Env, path: []const u8) Error!void {
         return self.vtable.deleteTree(self.ptr, path);
+    }
+    /// Create a hard link `new_path` aliasing `old_path` (shared backing
+    /// storage, no byte copy).  On RealEnv this is a POSIX hard link; a
+    /// cross-device link surfaces as `error.NotSupported` so callers (checkpoint
+    /// creation) can fall back to a byte copy.  MemEnv emulates it as a content
+    /// copy of `old_path`'s current bytes (its files are inode-less and SSTs are
+    /// immutable).  `old_path` absent → `error.NotFound`; `new_path` present →
+    /// `error.AlreadyExists`.
+    pub fn linkFile(self: Env, old_path: []const u8, new_path: []const u8) Error!void {
+        return self.vtable.linkFile(self.ptr, old_path, new_path);
     }
     /// Rename `from` to `to`.  Atomic where the platform allows (used for the
     /// CURRENT file pointer swap).
@@ -421,6 +442,119 @@ fn runDeleteTreeContract(env: Env, gpa: std.mem.Allocator) !void {
 
     // Deleting an absent tree is a no-op (does NOT error).
     try env.deleteTree("no_such_tree");
+}
+
+/// `linkFile` contract (d-checkpoint-hardlink): write known bytes to a source
+/// path, `linkFile` it to a new path, and confirm the new path reads the SAME
+/// bytes.  `old_path` absent → NotFound; `new_path` already present →
+/// AlreadyExists.  The RealEnv-specific hard-link observation (shared inode /
+/// nlink==2, and "delete one leaves the other readable") is exercised by the
+/// dedicated RealEnv test below — this shared contract only asserts the
+/// content-equivalence that BOTH implementations must satisfy.
+fn runLinkFileContract(env: Env, gpa: std.mem.Allocator) !void {
+    const expect = std.testing.expect;
+
+    // Seed the source with known bytes.
+    {
+        var wf = try env.newWritableFile(gpa, "link_src.txt");
+        errdefer wf.close() catch {};
+        try wf.append("the quick brown fox");
+        try wf.close();
+    }
+
+    // Link source → dest; dest must read identical bytes.
+    try env.linkFile("link_src.txt", "link_dst.txt");
+    try expect(env.fileExists("link_dst.txt"));
+    {
+        var sf = try env.newSequentialFile(gpa, "link_dst.txt");
+        errdefer sf.close() catch {};
+        var buf: [64]u8 = undefined;
+        var total: usize = 0;
+        while (true) {
+            const n = try sf.read(buf[total..]);
+            if (n == 0) break;
+            total += n;
+        }
+        try std.testing.expectEqualStrings("the quick brown fox", buf[0..total]);
+        try sf.close();
+    }
+
+    // Linking a missing source surfaces NotFound.
+    try std.testing.expectError(error.NotFound, env.linkFile("no_such_src", "whatever"));
+
+    // Linking onto an existing destination surfaces AlreadyExists.
+    try std.testing.expectError(error.AlreadyExists, env.linkFile("link_src.txt", "link_dst.txt"));
+
+    try env.deleteFile("link_src.txt");
+    try env.deleteFile("link_dst.txt");
+}
+
+test "MemEnv linkFile contract" {
+    const gpa = std.testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    try runLinkFileContract(me.env(), gpa);
+}
+
+test "RealEnv linkFile contract" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var re = RealEnv.init(gpa, io, tmp.dir);
+    try runLinkFileContract(re.env(), gpa);
+}
+
+test "RealEnv linkFile creates a true hard link (shared inode, nlink==2, delete-one-keeps-other)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var re = RealEnv.init(gpa, io, tmp.dir);
+    const env = re.env();
+
+    {
+        var wf = try env.newWritableFile(gpa, "hl_src");
+        errdefer wf.close() catch {};
+        try wf.append("payload-bytes-1234567890");
+        try wf.close();
+    }
+
+    try env.linkFile("hl_src", "hl_dst");
+
+    // Both paths name the SAME inode and the link count is 2.
+    const st_src = try tmp.dir.statFile(io, "hl_src", .{});
+    const st_dst = try tmp.dir.statFile(io, "hl_dst", .{});
+    try std.testing.expectEqual(st_src.inode, st_dst.inode);
+    try std.testing.expectEqual(@as(@TypeOf(st_src.nlink), 2), st_src.nlink);
+    try std.testing.expectEqual(@as(@TypeOf(st_dst.nlink), 2), st_dst.nlink);
+
+    // The hard-link property: deleting one name leaves the other fully readable.
+    try env.deleteFile("hl_src");
+    try std.testing.expect(!env.fileExists("hl_src"));
+    try std.testing.expect(env.fileExists("hl_dst"));
+    {
+        var sf = try env.newSequentialFile(gpa, "hl_dst");
+        errdefer sf.close() catch {};
+        var buf: [64]u8 = undefined;
+        var total: usize = 0;
+        while (true) {
+            const n = try sf.read(buf[total..]);
+            if (n == 0) break;
+            total += n;
+        }
+        try std.testing.expectEqualStrings("payload-bytes-1234567890", buf[0..total]);
+        try sf.close();
+    }
+    // nlink drops back to 1 after the source name is gone.
+    const st_after = try tmp.dir.statFile(io, "hl_dst", .{});
+    try std.testing.expectEqual(@as(@TypeOf(st_after.nlink), 1), st_after.nlink);
+
+    try env.deleteFile("hl_dst");
 }
 
 test "MemEnv deleteTree contract" {

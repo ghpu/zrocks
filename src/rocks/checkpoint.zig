@@ -10,7 +10,10 @@
 //! ------------------
 //! * Self-contained new file: imports DB and version modules by relative path.
 //! * No edits to db.zig, env.zig, version_set.zig, build.zig, or root.zig.
-//! * Plain byte-copy (no hard-links).
+//! * Immutable SSTs are HARD-LINKED into the checkpoint dir (shared inode —
+//!   cheap, space-efficient), with a byte-copy fallback when a link cannot be
+//!   made (e.g. cross-device dest).  Mutable/small files (MANIFEST, WAL,
+//!   CURRENT) are byte-copied, matching RocksDB.
 //! * Flush WAL before copying so MemEnv's buffered bytes are visible on read.
 //!
 //! Standalone test verify:
@@ -33,7 +36,8 @@ const filename = @import("../version/filename.zig");
 /// Steps:
 ///   1. Flush the active WAL so all committed writes are visible in the MemEnv.
 ///   2. Create `dest_dir` via `db.env.makeDir`.
-///   3. Copy every live SST referenced by the current Version.
+///   3. Hard-link every live SST referenced by the current Version (byte-copy
+///      fallback if the link cannot be made).
 ///   4. Copy the current MANIFEST.
 ///   5. Copy the active WAL (if it exists).
 ///   6. Copy the CURRENT pointer file (its MANIFEST basename is unchanged in
@@ -56,7 +60,12 @@ pub fn createCheckpoint(
     const e = db.env;
     const src = db.name;
 
-    // 3. Copy every live SST across all levels.
+    // 3. Hard-link every live SST across all levels.  SSTs are IMMUTABLE once
+    //    written, so a hard link (shared inode — cheap, space-efficient) is a
+    //    correct, zero-copy alias into the checkpoint dir, exactly as RocksDB
+    //    does.  If the link cannot be made for ANY reason (cross-device dest →
+    //    `error.NotSupported`, an unsupporting filesystem, etc.) fall back to a
+    //    full byte copy so the checkpoint is always complete.
     const version = db.versions.currentVersion();
     for (&version.files) |level| {
         for (level.items) |file_meta| {
@@ -64,7 +73,9 @@ pub fn createCheckpoint(
             defer gpa.free(src_path);
             const dst_path = try filename.tableFileName(gpa, dest_dir, file_meta.number);
             defer gpa.free(dst_path);
-            try copyFile(gpa, e, src_path, dst_path);
+            e.linkFile(src_path, dst_path) catch {
+                try copyFile(gpa, e, src_path, dst_path);
+            };
         }
     }
 
@@ -99,8 +110,6 @@ pub fn createCheckpoint(
         defer gpa.free(dst_path);
         try copyFile(gpa, e, src_path, dst_path);
     }
-    // FUTURE(perf): hard-link via Env for space efficiency when src and dest
-    // share a filesystem — avoids byte-copying large SSTs.
 }
 
 // ---------------------------------------------------------------------------
@@ -144,6 +153,7 @@ fn copyFile(
 
 const testing = std.testing;
 const MemEnv = env_mod.MemEnv;
+const RealEnv = env_mod.RealEnv;
 const DB = db_mod.DB;
 
 test "checkpoint: round-trip — SST + WAL data visible in checkpoint DB" {
@@ -236,6 +246,85 @@ test "checkpoint: source-unaffected — new source writes absent from checkpoint
         try testing.expectEqualStrings("v1", got);
     }
     try testing.expect((try ckpt_db.get(.{}, "after")) == null);
+}
+
+test "checkpoint (RealEnv): SSTs are hard-linked, mutable files copied, data reads back" {
+    const gpa = testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var re = RealEnv.init(gpa, io, tmp.dir);
+    defer re.deinit();
+    const e = re.env();
+
+    // Tiny write buffer forces at least one L0 flush so a real SST exists.
+    const src_db = try DB.open(gpa, e, "srcdb_hl", .{ .write_buffer_size = 512 });
+    defer src_db.close();
+
+    const n: usize = 64;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        var kbuf: [16]u8 = undefined;
+        var vbuf: [32]u8 = undefined;
+        const k = try std.fmt.bufPrint(&kbuf, "key{d:0>4}", .{i});
+        const v = try std.fmt.bufPrint(&vbuf, "val{d:0>4}", .{i});
+        try src_db.put(.{}, k, v);
+    }
+
+    // At least one SST must have flushed.
+    const ver = src_db.versions.currentVersion();
+    var total_sst: usize = 0;
+    for (&ver.files) |level| total_sst += level.items.len;
+    try testing.expect(total_sst >= 1);
+
+    try createCheckpoint(gpa, src_db, "ckpt_hl");
+
+    // Every live SST in the checkpoint must share an inode with its source
+    // (nlink==2) — proving it was hard-linked, not byte-copied.
+    for (&ver.files) |level| {
+        for (level.items) |fm| {
+            const src_path = try filename.tableFileName(gpa, "srcdb_hl", fm.number);
+            defer gpa.free(src_path);
+            const dst_path = try filename.tableFileName(gpa, "ckpt_hl", fm.number);
+            defer gpa.free(dst_path);
+            const st_src = try tmp.dir.statFile(io, src_path, .{});
+            const st_dst = try tmp.dir.statFile(io, dst_path, .{});
+            try testing.expectEqual(st_src.inode, st_dst.inode);
+            try testing.expectEqual(@as(@TypeOf(st_src.nlink), 2), st_src.nlink);
+        }
+    }
+
+    // MANIFEST and CURRENT are COPIED (mutable/small): they exist in the dest
+    // and are NOT hard-linked (nlink stays 1).
+    {
+        const cur = try filename.currentFileName(gpa, "ckpt_hl");
+        defer gpa.free(cur);
+        try testing.expect(e.fileExists(cur));
+        const st = try tmp.dir.statFile(io, cur, .{});
+        try testing.expectEqual(@as(@TypeOf(st.nlink), 1), st.nlink);
+
+        const man = try filename.manifestFileName(gpa, "ckpt_hl", src_db.versions.manifestFileNumber());
+        defer gpa.free(man);
+        try testing.expect(e.fileExists(man));
+        const st_man = try tmp.dir.statFile(io, man, .{});
+        try testing.expectEqual(@as(@TypeOf(st_man.nlink), 1), st_man.nlink);
+    }
+
+    // The checkpoint opens as an independent DB and every key reads back.
+    const ckpt_db = try DB.open(gpa, e, "ckpt_hl", .{});
+    defer ckpt_db.close();
+    i = 0;
+    while (i < n) : (i += 1) {
+        var kbuf: [16]u8 = undefined;
+        var vbuf: [32]u8 = undefined;
+        const k = try std.fmt.bufPrint(&kbuf, "key{d:0>4}", .{i});
+        const want = try std.fmt.bufPrint(&vbuf, "val{d:0>4}", .{i});
+        const got = try ckpt_db.get(.{}, k) orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings(want, got);
+    }
 }
 
 test "checkpoint: expected files exist in dest dir" {
