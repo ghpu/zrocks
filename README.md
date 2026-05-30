@@ -1,5 +1,7 @@
 # zrocks
 
+WARNING : this project was entirely vibe-coded by Claude Code (dynamic workflows), to assess their porting capabilities.
+
 A pure-Zig (Zig 0.16) reimplementation of [RocksDB](https://github.com/facebook/rocksdb/wiki) — an LSM-tree embedded key-value storage engine. No C dependencies.
 
 Goals:
