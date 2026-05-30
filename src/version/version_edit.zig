@@ -152,7 +152,12 @@ pub const VersionEdit = struct {
     deleted_files: std.ArrayListUnmanaged(DeletedFile) = .empty,
     new_files: std.ArrayListUnmanaged(NewFileEntry) = .empty,
 
-    // TODO(m5.1): compact_pointers (kCompactPointer tag=5) skipped for now.
+    // BY DESIGN: compact pointers (kCompactPointer tag=5) are not stored.  They
+    // are a per-level round-robin compaction *hint* that RocksDB treats as
+    // optional (a DB opens fine without them), and zrocks's picker uses first-
+    // file selection instead (see compaction.zig pickCompaction).  The decoder
+    // tolerates+skips the tag on read (see decodeFrom), so real RocksDB
+    // MANIFESTs parse; a read→re-encode cycle drops the hint, which is harmless.
 
     pub const DeletedFile = struct { level: u32, number: u64 };
     /// `is_v4` selects the wire format on encode: kNewFile4 (tag=100, carries
@@ -421,8 +426,10 @@ pub const VersionEdit = struct {
                     edit.last_sequence = try coding.getVarint64(&input);
                 },
                 Tag.kCompactPointer => {
-                    // TODO(m5.1): store compact pointers when needed.
-                    // For now consume the fields so we don't error on them.
+                    // BY DESIGN (see the struct-level note): compact pointers are
+                    // an optional round-robin hint zrocks does not use.  Consume
+                    // the fields so a real-RocksDB MANIFEST carrying them parses;
+                    // the hint itself is intentionally not retained.
                     _ = try coding.getVarint32(&input); // level
                     _ = try coding.getLengthPrefixedSlice(&input); // internal key
                 },

@@ -5,7 +5,7 @@ stdlib: /home/ghpu/zig/lib/std
 target_rocksdb: "9.x line; block-based table format_version 5; legacy WAL/MANIFEST log (see docs/adr/000-target-format.md)"
 active_phase: "DONE — Phases 0-7 complete"
 active_milestone: "DIRECTIVE FULFILLED: byte-exact RocksDB is the ONLY format. native/clean formats DELETED. Real RocksDB opens flush+compaction+range-del+WAL output."
-last_completed: RocksDB-only migration (9/9 oracle-gated; partitioned-idx + bespoke range-del + block-based-bloom-write + sst_output enum + kColumnFamilyTag=0x10 removed; compaction kNewFile4/seqno bug fixed)
+last_completed: RocksDB-only migration (9/9 oracle-gated; partitioned-idx + bespoke range-del + block-based-bloom-write + sst_output enum + kColumnFamilyTag=0x10 removed; compaction kNewFile4/seqno bug fixed). 2026-05-30 TODO-reconciliation: stale format TODOs (bloom/filter_block/table_builder "full filter out of scope", compaction "obsolete .sst deletion TODO", version_edit/set kCompactPointer/CF-name) reworded to match the shipped code; honest perf/feature TODOs relabeled FUTURE(perf|feature); no remaining TODO implies a byte-exact format gap. Byte-exactness RE-PROVEN today: external librocksdb v11.4.0 verify_open on a fresh flushed zrocks DB -> OPEN_OK count=11.
 worktrees: "(none — clean)"
 test_command: "/home/ghpu/zig/zig build test"
 test_count: 529
@@ -86,6 +86,7 @@ zrocks is a working, durable, crash-recoverable, leveled-compacting LSM key-valu
 
 ## Decision log (ADR pointers)
 - ADR-000: RocksDB format target pinned (format_version 5 SST, legacy WAL/MANIFEST, CRC32C mask). docs/adr/000-target-format.md
+- COMPACT POINTERS (kCompactPointer tag=5): intentionally NOT stored. They are an optional per-level round-robin compaction hint RocksDB opens fine without; zrocks's picker uses first-file selection. The MANIFEST decoder tolerates+skips the tag on read (so real-RocksDB MANIFESTs parse); a read->re-encode cycle drops the hint, which is harmless. See src/version/version_edit.zig (struct-level note + kCompactPointer decode arm).
 - BLOCK COMPARATOR (from M6.0, fix in M6.1): `BlockBuilder.add` (src/format/block.zig:89-91) asserts BYTEWISE non-decreasing order. Internal-key SSTs are ordered by InternalKeyComparator (user asc, seq DESC) which is NOT bytewise — so flushing multi-version keys trips it. M6.1 must parameterize BlockBuilder/TableBuilder with the comparator (use IKC for internal-key SSTs) so the data-block order assertion + in-block binary search use IKC. SSTs must be BUILT and OPENED with the InternalKeyComparator (table_cache already opens with IKC). M6.0 sidestepped this by using one internal key per user key per SST.
 - RESOLVED (was M4.0 gap): the `iterator.Iterator` vtable now has optional `deinit` (M6.0); Merging/TwoLevel propagate it.
 - (historical) KNOWN GAP (from M4.0): the generic `iterator.Iterator` vtable has NO deinit/close. Memtable iters are arena-backed (no per-iter alloc) so the in-memory DB is fine, but table/SST iterators allocate block buffers — before merging SSTs into reads/compaction (Phase 5/6), add an optional `deinit: ?*const fn(ctx) void` to the Iterator vtable and have Merging/TwoLevel call it on children. TwoLevelIterator already documents that 2nd-level sources must own cleanup.

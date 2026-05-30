@@ -142,8 +142,8 @@ pub const Options = struct {
     /// `totalFileSize(0)` exceeds this, the OLDEST L0 files (lowest file numbers)
     /// are DROPPED whole — cache-like eviction — until back under budget.  Has no
     /// effect under other styles.  Default 1 GiB.
-    // TODO: ttl — RocksDB FIFO also supports a time-to-live eviction; only the
-    // size-based policy is implemented here.
+    // FUTURE(feature): RocksDB FIFO also supports a time-to-live eviction; only
+    // the size-based policy is implemented here.
     fifo_max_table_files_size: u64 = 1 << 30,
 
     // -- Universal compaction (M7.3) ----------------------------------------
@@ -191,8 +191,11 @@ pub const Options = struct {
 pub const ReadOptions = struct {
     verify_checksums: bool = false,
     fill_cache: bool = true,
-    /// Sequence-number placeholder for snapshot reads.
-    // TODO: typed Snapshot in M6
+    /// Snapshot sequence number for repeatable reads: when set, reads see only
+    /// entries at-or-below this sequence.  Carried as a raw sequence (not the
+    /// typed `db.Snapshot` handle) by design — callers pass `snap.sequence()`
+    /// from a `getSnapshot()` handle; the typed handle is what pins the sequence
+    /// against compaction (see db/snapshot.zig SnapshotList).
     snapshot: ?u64 = null,
     /// Prefix-bounded scan (M7.2).  When true AND a `prefix_extractor` is
     /// configured, a `DBIterator` positioned with `seek(target)` iterates only

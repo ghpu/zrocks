@@ -5,9 +5,13 @@
 /// algorithm (filter name "leveldb.BuiltinBloomFilter2"), the same one used by
 /// RocksDB's block-based filter blocks.
 ///
-/// TODO(m3.x): RocksDB also supports a "full filter" / partitioned-filter
-/// format with a different in-block layout; that is intentionally out of scope
-/// here and will be added when wiring up SST-table interop.
+/// SCOPE: this module is the READ-ONLY LevelDB/legacy-RocksDB compatibility
+/// path. zrocks's SST WRITE path emits the RocksDB FastLocalBloom *full filter*
+/// (see `full_filter.zig`, written into every SST under "fullfilter."++name by
+/// `table_builder.zig`); the block-based bloom WRITE path was deliberately
+/// dropped in the filter-rocksdb-only migration. `BloomFilterPolicy` lives on
+/// only to (a) name the policy and (b) let `table_reader.zig` parse legacy
+/// block-based filters found in externally-produced tables.
 const std = @import("std");
 const coding = @import("../util/coding.zig");
 

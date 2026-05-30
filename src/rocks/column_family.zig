@@ -43,7 +43,7 @@
 //! cf id (default 0 for untagged records).  Because the shared WAL is never
 //! truncated by a per-CF flush, replayed records that were already flushed to a
 //! CF's SSTs simply re-enter that CF's memtable; newest-wins reads stay correct.
-//! TODO(perf): WAL recycling/truncation once the OLDEST CF has flushed.
+//! FUTURE(perf): WAL recycling/truncation once the OLDEST CF has flushed.
 //!
 //! Standalone test note (Zig 0.16): `../...` imports only resolve inside the
 //! `src`-rooted module:

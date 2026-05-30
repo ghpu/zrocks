@@ -5,9 +5,10 @@
 /// data block region, followed by an array of fixed32 offsets, a fixed32
 /// pointing at the start of that array, and a final base-lg byte.
 ///
-/// TODO(m3.x): RocksDB's newer partitioned/full filter block formats differ;
-/// only the legacy block-based layout is implemented here for now. SST-table
-/// integration is out of scope for this milestone.
+/// SCOPE: READ-ONLY LevelDB compatibility shim. zrocks always WRITES the
+/// RocksDB FastLocalBloom full filter (`full_filter.zig`), never this
+/// block-based layout; `FilterBlockReader` exists so `table_reader.zig` can
+/// still parse legacy block-based filter blocks in externally-produced SSTs.
 const std = @import("std");
 const coding = @import("../util/coding.zig");
 const bloom = @import("bloom.zig");

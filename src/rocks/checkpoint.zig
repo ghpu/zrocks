@@ -99,8 +99,8 @@ pub fn createCheckpoint(
         defer gpa.free(dst_path);
         try copyFile(gpa, e, src_path, dst_path);
     }
-    // TODO: hard-link via Env for space efficiency when src and dest share a
-    // filesystem — avoids byte-copying large SSTs.
+    // FUTURE(perf): hard-link via Env for space efficiency when src and dest
+    // share a filesystem — avoids byte-copying large SSTs.
 }
 
 // ---------------------------------------------------------------------------

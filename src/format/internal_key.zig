@@ -1,12 +1,5 @@
 /// internal_key.zig — RocksDB-compatible InternalKey format and comparator.
 /// Byte-compatible with RocksDB's db/dbformat.h / db/dbformat.cc.
-///
-/// RED phase: declarations with @panic stubs + full tests.
-/// Import as named modules when testing standalone:
-///   zig test --dep coding --dep comparator \
-///       -Mtest=src/format/internal_key.zig \
-///       -Mcoding=src/util/coding.zig \
-///       -Mcomparator=src/util/comparator.zig
 const std = @import("std");
 const coding = @import("../util/coding.zig");
 const comparator = @import("../util/comparator.zig");

@@ -27,17 +27,20 @@
 //! freed here after writing.  Snapshot-protected versions, merge operands,
 //! deletions, and older (hidden) versions are never filtered.
 //!
-//! What is implemented vs left as TODO:
+//! What is implemented vs left as future refinement:
 //!   * Size-based output split — implemented (correctness-sufficient).
 //!   * Tombstone drop at the base level — implemented (isBaseLevelForKey).
 //!   * Merge operand collapse — implemented (collapseMergeRun, M7.1).
 //!   * Compaction filter on plain `.value` survivors — implemented (M7.4).
-//!   * Compaction filter on merge-derived values / FilterMergeOperand — TODO.
-//!   * Per-compaction CompactionFilterFactory — TODO (single filter for now).
-//!   * Grandparent-overlap split — TODO (refinement; size split suffices).
-//!   * Boundary-input expansion ("AddBoundaryInputs") — TODO (refinement).
-//!   * Obsolete .sst deletion from disk — TODO (files are dropped from the
-//!     Version but left on disk; a future SST file manager reclaims them).
+//!   * Obsolete .sst deletion from disk — implemented (reclaimObsoleteFiles;
+//!     synchronous, sound while single-threaded — see its SAFETY note).
+//!   * Compaction filter on merge-derived values / FilterMergeOperand —
+//!     FUTURE(feature): merge results are intentionally not filtered today.
+//!   * Per-compaction CompactionFilterFactory — FUTURE(feature) (single filter).
+//!   * Grandparent-overlap split — FUTURE(perf) (refinement; size split suffices).
+//!   * Boundary-input expansion ("AddBoundaryInputs") — FUTURE(perf) (refinement).
+//! None of the above affects byte-exact RocksDB output; they are scheduling /
+//! feature refinements over an already-RocksDB-readable on-disk format.
 
 const std = @import("std");
 
@@ -70,8 +73,8 @@ pub const Compaction = struct {
     /// Level the merged output files are written to.  Leveled compaction sets
     /// this to `level + 1`; universal compaction (M7.3) sets it to 0 so merged
     /// runs stay in L0.  When null, `doCompaction` treats it as `level + 1`.
-    /// TODO: real RocksDB universal may place a fully-merged run at the bottom
-    /// level; we keep it in L0 here (simpler, correctness-sufficient).
+    /// FUTURE(perf): real RocksDB universal may place a fully-merged run at the
+    /// bottom level; we keep it in L0 here (simpler, correctness-sufficient).
     output_level: ?usize = null,
     /// inputs[0] = files chosen from `level`; inputs[1] = the overlapping files
     /// at the level just below (`level + 1`) — empty for universal.  Each list
@@ -107,7 +110,7 @@ pub const Compaction = struct {
 /// Scores every level (L0 by file count, deeper by bytes); the winner's input
 /// files are chosen from that level — for L0 the first file then EXPAND to all
 /// overlapping L0 files; for deeper levels the first file (round-robin
-/// compact-pointers are a TODO).  The combined user-key range then selects the
+/// compact-pointers are a FUTURE(perf) refinement).  The combined user-key range then selects the
 /// overlapping files at `level+1` as inputs[1].
 pub fn pickCompaction(
     gpa: std.mem.Allocator,
@@ -132,7 +135,7 @@ pub fn pickCompaction(
         const first = v.files[0].items[0];
         c.inputs[0] = try v.overlappingInputs(gpa, 0, first.smallest, first.largest, user_cmp);
     } else {
-        // Pick the first file at this level (TODO: round-robin compact pointer).
+        // Pick the first file at this level (FUTURE(perf): round-robin compact pointer).
         const first = v.files[level].items[0];
         try c.inputs[0].append(gpa, .{
             .number = first.number,
@@ -231,7 +234,7 @@ fn reclaimObsoleteFiles(
 /// FIFO never merges — it removes whole files, oldest first, so the
 /// earliest-written data is evicted like a ring buffer.  No output files are
 /// produced.
-/// TODO: ttl — only the size-based policy is implemented.
+/// FUTURE(feature): ttl — only the size-based FIFO policy is implemented.
 pub fn runFifoEviction(
     gpa: std.mem.Allocator,
     e: env.Env,
@@ -349,8 +352,8 @@ pub fn isBaseLevelForKey(
 /// leaves L0 = [older survivors..., merged] in insertion order — the merged run
 /// (newest data) lands last, so `Version.get`'s newest-first L0 scan still
 /// resolves correctly.
-/// TODO: real RocksDB universal may place a fully-merged run at the bottom
-/// level and supports incremental/sub-compactions; we keep it L0-only here.
+/// FUTURE(perf): real RocksDB universal may place a fully-merged run at the
+/// bottom level and supports incremental/sub-compactions; we keep it L0-only here.
 pub fn pickUniversalCompaction(
     gpa: std.mem.Allocator,
     versions: *VersionSet,
@@ -745,7 +748,7 @@ pub fn buildCompaction(
         // rule below would corrupt them.  When the newest surviving entry for a
         // user key is a `.merge` and an operator is configured, collapse the
         // operand run here (it advances `mit` past everything it consumes).
-        // TODO(M7.4): the M7.4 compaction filter is intentionally NOT applied to
+        // FUTURE(feature): the M7.4 compaction filter is intentionally NOT applied to
         // a value produced by collapseMergeRun (a merge-derived `.value`); only
         // plain `.value` survivors below are filtered.  Filtering a merge result
         // (and a FilterMergeOperand hook for operands) is a future refinement.
@@ -985,8 +988,8 @@ const EmitCtx = struct {
     /// M7.5: range tombstones surviving this compaction.  Carried — whole, no
     /// truncation — into EVERY output SST opened here, and they widen each
     /// output's key range so reads/overlap over the tombstone span find the file.
-    /// TODO: tombstone truncation at output-file boundaries (we duplicate whole
-    /// tombstones across split outputs, which is correct but not minimal).
+    /// FUTURE(perf): tombstone truncation at output-file boundaries (we duplicate
+    /// whole tombstones across split outputs, which is correct but not minimal).
     surviving_tombstones: *const delete_range.RangeTombstoneList,
 
     /// Open a fresh output builder (if none is open), seeding it with the

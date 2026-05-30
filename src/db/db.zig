@@ -11,8 +11,9 @@
 //! Flush (M6.1): when the live MemTable exceeds `write_buffer_size`, `write`
 //! rotates it into an immutable MemTable + a fresh WAL and synchronously writes
 //! it to a new L0 SSTable (see flush.zig), recording the file + rotated log in
-//! the MANIFEST.  No leveled compaction yet (M6.2) — flush only ever produces
-//! L0 files; the flush is synchronous (TODO: background flush thread).
+//! the MANIFEST.  Flush always produces L0 files; leveled/universal/FIFO
+//! compaction (M6.2/M7.3) then reshapes them.  The flush is synchronous
+//! (FUTURE(perf): background flush thread).
 //!
 //! Reads consult the live MemTable FIRST (newest writes), then the immutable
 //! MemTable being flushed (if any), then the current Version's SSTs via a
@@ -663,7 +664,7 @@ pub const DB = struct {
     ///   * `.universal` — merge similarly-sized L0 runs (kept in L0) until none
     ///                    qualifies (the merged run lowers the L0 count/ratio).
     ///   * `.fifo`      — drop the oldest L0 files until under the byte budget.
-    /// TODO(perf): background compaction thread.
+    /// FUTURE(perf): background compaction thread.
     fn maybeScheduleCompaction(self: *DB) !void {
         // Pin compaction to the oldest live snapshot so it cannot discard a
         // version (or a tombstone) that a snapshot read could still need.  When no

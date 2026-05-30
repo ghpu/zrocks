@@ -14,7 +14,7 @@
 //! from a `VersionEdit`, the bytes are duped into the new Version so the two
 //! Versions never alias.  This is intentionally simple — files are tiny
 //! metadata records.
-//! TODO(perf): share FileMetaData via refcount across Versions.
+//! FUTURE(perf): share FileMetaData via refcount across Versions.
 
 const std = @import("std");
 const version_edit = @import("version_edit.zig");
@@ -1129,11 +1129,12 @@ pub const SharedManifest = struct {
         try self.setCurrentFile(number);
     }
 
-    /// Snapshot every registered CF: for each, a kColumnFamilyAdd record
-    /// (placeholder name = the CF id) followed by a full file/scalar snapshot
-    /// tagged with that CF id.  CF NAMES live in CF_LIST; the snapshot's add
-    /// record carries a synthetic name only so the descriptor parses as
-    /// RocksDB-shaped — recovery routes by id, not name.
+    /// Snapshot every registered CF: for each, emit one VersionEdit tagged with
+    /// the CF id (kColumnFamily) carrying the comparator name + the log/next-file/
+    /// last-sequence scalars and a kNewFile4 (tag 103) record per live SST with
+    /// its full seqno range — byte-identical to the per-CF VersionSet snapshot and
+    /// the RocksDB-only on-disk format.  CF NAMES live in CF_LIST; recovery routes
+    /// by id, not name.
     fn writeSnapshot(self: *SharedManifest, writer: *log_writer.Writer, wf: env.WritableFile) !void {
         var it = self.cfs.iterator();
         while (it.next()) |entry| {

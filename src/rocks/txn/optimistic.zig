@@ -11,8 +11,8 @@
 //! This suits low-contention workloads (no lock bookkeeping); the pessimistic
 //! flavour (pessimistic.zig) instead locks keys eagerly on first write.
 //!
-//! TODO(2pc): no WritePrepared/WriteUnprepared two-phase commit — single-phase
-//! atomic apply only.
+//! FUTURE(feature): no WritePrepared/WriteUnprepared two-phase commit —
+//! single-phase atomic apply only.
 
 const std = @import("std");
 
