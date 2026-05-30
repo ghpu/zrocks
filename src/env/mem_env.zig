@@ -119,6 +119,7 @@ pub const MemEnv = struct {
         .newSequentialFile = newSequentialFile,
         .newRandomAccessFile = newRandomAccessFile,
         .deleteFile = deleteFile,
+        .deleteTree = deleteTree,
         .renameFile = renameFile,
         .fileExists = fileExists,
         .getFileSize = getFileSize,
@@ -212,6 +213,45 @@ pub const MemEnv = struct {
         } else {
             return error.NotFound;
         }
+    }
+
+    /// Recursively delete the tree rooted at `path` (C3): remove every map entry
+    /// whose key is `path` itself OR lives under the `path ++ "/"` prefix, and
+    /// free each owned key + value (exactly like `deleteFile`).  The map is flat,
+    /// so this is a single prefix sweep.  Deleting an absent tree is a no-op (no
+    /// error), matching RealEnv's tolerant `Dir.deleteTree`.  We cannot mutate the
+    /// map while iterating it, so we first collect the matching keys (borrowing
+    /// the live key pointers under the lock) and then remove them.
+    fn deleteTree(ptr: *anyopaque, path: []const u8) Error!void {
+        const self: *MemEnv = @ptrCast(@alignCast(ptr));
+        self.mutex.lockUncancelable(lockIo());
+        defer self.mutex.unlock(lockIo());
+
+        const prefix = std.fmt.allocPrint(self.gpa, "{s}/", .{path}) catch return Error.OutOfMemory;
+        defer self.gpa.free(prefix);
+
+        // Collect matching keys first (borrowed pointers into the map's owned
+        // keys; valid until we start removing).  Using the gpa for this scratch
+        // list keeps the sweep leak-free even on an allocation failure mid-collect.
+        var victims: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer victims.deinit(self.gpa);
+        {
+            var it = self.files.iterator();
+            while (it.next()) |entry| {
+                const key = entry.key_ptr.*;
+                if (std.mem.eql(u8, key, path) or std.mem.startsWith(u8, key, prefix)) {
+                    try victims.append(self.gpa, key);
+                }
+            }
+        }
+
+        for (victims.items) |key| {
+            if (self.files.fetchRemove(key)) |kv| {
+                self.gpa.free(kv.key);
+                self.gpa.free(kv.value);
+            }
+        }
+        // Absent tree → nothing collected → no-op success.
     }
 
     fn renameFile(ptr: *anyopaque, from: []const u8, to: []const u8) Error!void {

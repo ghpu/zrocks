@@ -42,6 +42,13 @@ fn mapDeleteErr(e: Dir.DeleteFileError) Error {
     };
 }
 
+fn mapDeleteTreeErr(e: Dir.DeleteTreeError) Error {
+    return switch (e) {
+        error.AccessDenied, error.PermissionDenied => error.PermissionDenied,
+        else => error.IoError,
+    };
+}
+
 fn mapRenameErr(e: Dir.RenameError) Error {
     return switch (e) {
         error.FileNotFound => error.NotFound,
@@ -161,6 +168,7 @@ pub const RealEnv = struct {
         .newSequentialFile = newSequentialFile,
         .newRandomAccessFile = newRandomAccessFile,
         .deleteFile = deleteFile,
+        .deleteTree = deleteTree,
         .renameFile = renameFile,
         .fileExists = fileExists,
         .getFileSize = getFileSize,
@@ -234,6 +242,15 @@ pub const RealEnv = struct {
     fn deleteFile(ptr: *anyopaque, path: []const u8) Error!void {
         const self: *RealEnv = @ptrCast(@alignCast(ptr));
         self.root.deleteFile(self.io, path) catch |e| return mapDeleteErr(e);
+    }
+
+    /// Recursively delete `path` and everything under it (C3).  std 0.16's
+    /// `Dir.deleteTree` no-ops on an absent path (its initial open returns null),
+    /// so deleting a CF subdir that never materialized is a silent success — the
+    /// drop never hard-errors on a never-flushed CF.
+    fn deleteTree(ptr: *anyopaque, path: []const u8) Error!void {
+        const self: *RealEnv = @ptrCast(@alignCast(ptr));
+        self.root.deleteTree(self.io, path) catch |e| return mapDeleteTreeErr(e);
     }
 
     fn renameFile(ptr: *anyopaque, from: []const u8, to: []const u8) Error!void {

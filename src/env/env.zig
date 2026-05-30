@@ -121,6 +121,12 @@ pub const Env = struct {
         newSequentialFile: *const fn (ptr: *anyopaque, gpa: std.mem.Allocator, path: []const u8) Error!SequentialFile,
         newRandomAccessFile: *const fn (ptr: *anyopaque, gpa: std.mem.Allocator, path: []const u8) Error!RandomAccessFile,
         deleteFile: *const fn (ptr: *anyopaque, path: []const u8) Error!void,
+        // Recursively delete the directory tree at `path` (and `path` itself).
+        // Used by CF drop to remove a dropped column family's `<dbroot>/<name>/`
+        // subdir and all of its SST files (C3).  Deleting a path that does NOT
+        // exist succeeds (no-op), matching RocksDB's tolerant cleanup so a drop
+        // of a CF that never flushed any SST does not hard-error.
+        deleteTree: *const fn (ptr: *anyopaque, path: []const u8) Error!void,
         renameFile: *const fn (ptr: *anyopaque, from: []const u8, to: []const u8) Error!void,
         fileExists: *const fn (ptr: *anyopaque, path: []const u8) bool,
         getFileSize: *const fn (ptr: *anyopaque, path: []const u8) Error!u64,
@@ -172,6 +178,13 @@ pub const Env = struct {
     }
     pub fn deleteFile(self: Env, path: []const u8) Error!void {
         return self.vtable.deleteFile(self.ptr, path);
+    }
+    /// Recursively delete the directory tree rooted at `path` (including `path`
+    /// itself).  Deleting an absent path succeeds (no-op) — this is what lets CF
+    /// drop clean up `<dbroot>/<name>/` even for a CF that never flushed an SST
+    /// (C3).
+    pub fn deleteTree(self: Env, path: []const u8) Error!void {
+        return self.vtable.deleteTree(self.ptr, path);
     }
     /// Rename `from` to `to`.  Atomic where the platform allows (used for the
     /// CURRENT file pointer swap).
@@ -373,6 +386,59 @@ fn runListDirContract(env: Env, gpa: std.mem.Allocator) !void {
     } else |err| {
         try std.testing.expectEqual(error.NotFound, err);
     }
+}
+
+/// `deleteTree` contract (C3): create `d/a` and `d/sub/b`, delete the whole `d`
+/// tree, and confirm every entry is gone and `listDir("d")` no longer reports
+/// children.  Also confirms deleting an absent tree is a no-op (no error).
+fn runDeleteTreeContract(env: Env, gpa: std.mem.Allocator) !void {
+    try env.makeDir("d");
+    try env.makeDir("d/sub");
+    for ([_][]const u8{ "d/a", "d/sub/b" }) |p| {
+        var wf = try env.newWritableFile(gpa, p);
+        errdefer wf.close() catch {};
+        try wf.append("x");
+        try wf.close();
+    }
+    try std.testing.expect(env.fileExists("d/a"));
+    try std.testing.expect(env.fileExists("d/sub/b"));
+
+    try env.deleteTree("d");
+
+    // Both files (and the nested dir) are gone.
+    try std.testing.expect(!env.fileExists("d/a"));
+    try std.testing.expect(!env.fileExists("d/sub/b"));
+
+    // Listing the deleted tree surfaces NotFound (RealEnv) or an empty listing
+    // (MemEnv's flat map cannot distinguish "missing" from "empty") — both mean
+    // "nothing under d".
+    if (env.listDir(gpa, "d")) |empty| {
+        defer Env.freeListing(gpa, empty);
+        try std.testing.expectEqual(@as(usize, 0), empty.len);
+    } else |err| {
+        try std.testing.expectEqual(error.NotFound, err);
+    }
+
+    // Deleting an absent tree is a no-op (does NOT error).
+    try env.deleteTree("no_such_tree");
+}
+
+test "MemEnv deleteTree contract" {
+    const gpa = std.testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    try runDeleteTreeContract(me.env(), gpa);
+}
+
+test "RealEnv deleteTree contract" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var re = RealEnv.init(gpa, io, tmp.dir);
+    try runDeleteTreeContract(re.env(), gpa);
 }
 
 test "MemEnv contract" {
