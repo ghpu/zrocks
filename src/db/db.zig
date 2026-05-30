@@ -150,6 +150,17 @@ pub const DB = struct {
     /// NOT — the multi-CF `CfDB` owns ONE shared WAL across all families — so
     /// `wal_file`/`wal` are left undefined and `close`/`write` never touch them.
     owns_wal: bool = true,
+    /// DB-level advisory LOCK held by THIS instance (C2).  A top-level writable
+    /// `DB.open` acquires `<name>/LOCK` via `Env.lockFile` and stores the owned
+    /// lock-file path here; `close` releases it with `Env.unlockFile`.  `null`
+    /// when this instance does not own the lock: read-only opens (RocksDB
+    /// read-only takes no exclusive lock) and per-CF sub-LSMs opened via
+    /// `openCf`/`openCfShared` (which SHARE the one DB directory whose single
+    /// LOCK is held by the owning `DB`/`CfDB` — they must NOT self-conflict by
+    /// each taking their own lock).  Memory comes from raw `gpa.create`, so this
+    /// field's default is NOT applied — every `open`/`openCfShared` sets it
+    /// explicitly.
+    lock_path: ?[]u8 = null,
     /// Live point-in-time snapshots.  Their oldest sequence bounds what
     /// compaction may discard (M6.3 snapshot pinning).
     snapshots: SnapshotList,
@@ -213,10 +224,30 @@ pub const DB = struct {
         self.name = try gpa.dupe(u8, name);
         errdefer gpa.free(self.name);
 
+        // No DB-level lock held yet (raw gpa.create memory: field defaults are
+        // NOT applied, so set it explicitly, C2).
+        self.lock_path = null;
+
         // Directory (no-op success if it already exists on MemEnv).  In
         // read-only mode we must NOT mutate the directory at all — the foreign
         // DB's directory already exists — so skip the makeDir.
         if (!options.read_only) try e.makeDir(name);
+
+        // DB-level advisory LOCK (C2): a writable single-CF DB takes an exclusive
+        // lock on `<name>/LOCK` right after the directory exists, so a second
+        // concurrent writer fails fast.  Read-only opens take NO exclusive lock
+        // (RocksDB read-only convention) and must not block a writer.  The lock
+        // descriptor is retained by the Env until `close` calls `unlockFile`.
+        if (!options.read_only) {
+            const lp = try filename.lockFileName(gpa, name);
+            errdefer gpa.free(lp);
+            try e.lockFile(lp);
+            self.lock_path = lp;
+        }
+        errdefer if (self.lock_path) |lp| {
+            e.unlockFile(lp) catch {};
+            gpa.free(lp);
+        };
 
         self.mem = try MemTable.init(gpa, options.comparator);
         errdefer self.mem.deinit();
@@ -372,6 +403,10 @@ pub const DB = struct {
         self.last_sequence = 0;
         self.owns_wal = false;
         self.ikcmp = .{ .user = options.comparator };
+        // A per-CF sub-LSM SHARES the one DB-directory LOCK held by the owning
+        // DB/CfDB; it must NOT take its own (C2).  Raw gpa.create memory: set the
+        // field explicitly.
+        self.lock_path = null;
 
         self.name = try gpa.dupe(u8, name);
         errdefer gpa.free(self.name);
@@ -487,6 +522,14 @@ pub const DB = struct {
         // reference frees it (its data is durable in the WAL / SST either way).
         if (self.imm) |holder| holder.release(gpa);
         self.mem.deinit();
+        // Release the DB-level advisory lock ONLY if THIS instance acquired it
+        // (C2).  Read-only opens and per-CF sub-LSMs never took one (lock_path ==
+        // null), so they leave the owner's lock untouched.  `close` swallows
+        // errors.
+        if (self.lock_path) |lp| {
+            self.env.unlockFile(lp) catch {};
+            gpa.free(lp);
+        }
         gpa.free(self.name);
         gpa.destroy(self);
     }

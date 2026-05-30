@@ -58,7 +58,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     // RealEnv rooted at the current working directory; the DB makes `dbpath` a
     // subdirectory of it.
-    var re = RealEnv.init(io, std.Io.Dir.cwd());
+    var re = RealEnv.init(gpa, io, std.Io.Dir.cwd());
     const e = re.env();
 
     if (std.mem.eql(u8, command, "put")) {

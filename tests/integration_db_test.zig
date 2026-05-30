@@ -19,6 +19,7 @@ const zrocks = @import("zrocks");
 const DB = zrocks.db.DB;
 const Options = zrocks.options.Options;
 const RealEnv = zrocks.env.RealEnv;
+const CfDB = zrocks.column_family.CfDB;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -139,7 +140,7 @@ test "M6.3 integration: snapshot-respects-compaction (pinned value survives)" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var re = RealEnv.init(io, tmp.dir);
+    var re = RealEnv.init(gpa, io, tmp.dir);
     const e = re.env();
 
     // Tiny write buffer + low L0 trigger so flushes + compactions fire readily.
@@ -194,7 +195,7 @@ test "M6.3 integration: randomized ~1500-op durability gate on a real fs (reopen
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var re = RealEnv.init(io, tmp.dir);
+    var re = RealEnv.init(gpa, io, tmp.dir);
     const e = re.env();
 
     const key_space: usize = 150; // keys "key000".."key149"
@@ -245,5 +246,106 @@ test "M6.3 integration: randomized ~1500-op durability gate on a real fs (reopen
         const db = try DB.open(gpa, e, "fuzzdb", opts);
         defer db.close();
         try verifyAgainstRef(gpa, db, &ref, key_space);
+    }
+}
+
+// ===========================================================================
+// C2 — DB-level advisory LOCK file (RealEnv-backed, real cross-handle locking).
+// ===========================================================================
+
+test "C2 lock: second writable open on the same dir FAILS while first is open" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var re = RealEnv.init(gpa, io, tmp.dir);
+    defer re.deinit();
+    const e = re.env();
+
+    // First writable open acquires the LOCK.
+    const db1 = try DB.open(gpa, e, "lockdb", .{});
+
+    // A SECOND writable open on the SAME directory must FAIL (lock held).
+    try std.testing.expectError(error.IoError, DB.open(gpa, e, "lockdb", .{}));
+
+    // Close the first DB — the lock is released.
+    db1.close();
+
+    // A fresh writable open now SUCCEEDS (lock was released on close).
+    const db2 = try DB.open(gpa, e, "lockdb", .{});
+    db2.close();
+}
+
+test "C2 lock: read-only open does NOT take the exclusive lock (opens on existing DB)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var re = RealEnv.init(gpa, io, tmp.dir);
+    defer re.deinit();
+    const e = re.env();
+
+    // Create an on-disk DB with some data, then close it.
+    {
+        const db = try DB.open(gpa, e, "rodb", .{});
+        try db.put(.{}, "k", "v");
+        db.close();
+    }
+
+    // A read-only open succeeds (and must not take an exclusive lock).
+    const ro = try DB.open(gpa, e, "rodb", .{ .read_only = true });
+    defer ro.close();
+    const got = try ro.get(.{}, "k") orelse return error.TestExpectedFound;
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings("v", got);
+}
+
+test "C2 lock: CfDB single dbroot lock does NOT self-conflict across per-CF sub-LSMs" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var re = RealEnv.init(gpa, io, tmp.dir);
+    defer re.deinit();
+    const e = re.env();
+
+    {
+        const cdb = try CfDB.open(gpa, e, "cflock", .{});
+        defer cdb.close();
+
+        const users = try cdb.createColumnFamily("users", .{});
+        const orders = try cdb.createColumnFamily("orders", .{});
+        const default = cdb.defaultColumnFamily();
+
+        try cdb.put(.{}, users, "u1", "alice");
+        try cdb.put(.{}, orders, "o1", "order-one");
+        try cdb.put(.{}, default, "d1", "def-one");
+
+        const uv = try cdb.get(.{}, users, "u1") orelse return error.TestExpectedFound;
+        defer gpa.free(uv);
+        try std.testing.expectEqualStrings("alice", uv);
+    }
+
+    // While the CfDB is open, a SECOND CfDB.open on the same dbroot must FAIL.
+    {
+        const cdb = try CfDB.open(gpa, e, "cflock2", .{});
+        try std.testing.expectError(error.IoError, CfDB.open(gpa, e, "cflock2", .{}));
+        cdb.close();
+    }
+
+    // After close, re-open the multi-CF DB SUCCEEDS (lock released).
+    {
+        const cdb = try CfDB.open(gpa, e, "cflock", .{});
+        defer cdb.close();
+        const users = try cdb.columnFamily("users");
+        const uv = try cdb.get(.{}, users, "u1") orelse return error.TestExpectedFound;
+        defer gpa.free(uv);
+        try std.testing.expectEqualStrings("alice", uv);
     }
 }

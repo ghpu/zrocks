@@ -122,7 +122,7 @@ test "Wave B: open a REAL RocksDB v11.4.0 database read_only and read every live
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var re = RealEnv.init(io, tmp.dir);
+    var re = RealEnv.init(gpa, io, tmp.dir);
     const e = re.env();
 
     const dbname = "rocksdb_basic";

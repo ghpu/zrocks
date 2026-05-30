@@ -105,7 +105,7 @@ pub fn runBench(
     defer if (cache_ptr) |cp| cp.deinit();
 
     // --- env + open DB -------------------------------------------------------
-    var re = RealEnv.init(io, base_dir);
+    var re = RealEnv.init(gpa, io, base_dir);
     const e = re.env();
 
     const db = try DB.open(gpa, e, cfg.db_path, .{

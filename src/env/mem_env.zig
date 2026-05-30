@@ -289,7 +289,9 @@ pub const MemEnv = struct {
     }
 
     fn lockFile(ptr: *anyopaque, path: []const u8) Error!void {
-        // Stub (see RealEnv): no cross-process semantics in memory.
+        // MemEnv is single-process and in-memory: there is no cross-process LOCK
+        // file to guard (the real exclusive advisory lock lives in RealEnv, C2).
+        // Always succeed so MemEnv-backed DB tests open without contention.
         _ = ptr;
         _ = path;
     }

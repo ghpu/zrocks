@@ -30,6 +30,13 @@ pub fn tempFileName(gpa: std.mem.Allocator, dbname: []const u8, number: u64) ![]
     return std.fmt.allocPrint(gpa, "{s}/{d:0>6}.dbtmp", .{ dbname, number });
 }
 
+/// `<dbname>/LOCK` — the DB-level advisory lock file (C2).  An exclusive flock
+/// on this file's descriptor guards a writable DB directory against a second
+/// concurrent writer (LevelDB/RocksDB convention).
+pub fn lockFileName(gpa: std.mem.Allocator, dbname: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "{s}/LOCK", .{dbname});
+}
+
 /// `<dbroot>/CF_LIST` — the column-family registry (M7.0): a line-oriented
 /// `<id> <name>` mapping rewritten on each create/drop so a reopen knows which
 /// column families exist and at which subdirectory.
@@ -46,6 +53,13 @@ test "currentFileName" {
     const s = try currentFileName(gpa, "db");
     defer gpa.free(s);
     try std.testing.expectEqualStrings("db/CURRENT", s);
+}
+
+test "lockFileName" {
+    const gpa = std.testing.allocator;
+    const s = try lockFileName(gpa, "db");
+    defer gpa.free(s);
+    try std.testing.expectEqualStrings("db/LOCK", s);
 }
 
 test "manifestFileName is 6-digit zero-padded" {

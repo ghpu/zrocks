@@ -81,7 +81,7 @@ test "D1c gate: RealEnv path model — files under <name>/, CURRENT holds bare b
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var re = RealEnv.init(io, tmp.dir);
+    var re = RealEnv.init(gpa, io, tmp.dir);
     const e = re.env();
 
     const dbname = "pathmodeldb";
@@ -145,7 +145,7 @@ test "D1c gate: kNewFile4 MANIFEST self-consistency — VersionSet.recover prese
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var re = RealEnv.init(io, tmp.dir);
+    var re = RealEnv.init(gpa, io, tmp.dir);
     const e = re.env();
 
     const dbname = "v4manifestdb";
@@ -290,7 +290,7 @@ test "D1c gate: zrocks writes -> close -> reopen -> reads on RealEnv (survives f
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var re = RealEnv.init(io, tmp.dir);
+    var re = RealEnv.init(gpa, io, tmp.dir);
     const e = re.env();
 
     const dbname = "rttdb";
