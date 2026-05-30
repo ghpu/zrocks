@@ -24,8 +24,30 @@
 //! plain `.value` survivor of each user key that is NOT visible to a live
 //! snapshot is handed to the filter, which may keep, drop (`.remove`), or rewrite
 //! (`.change`) it.  A `.change` replacement is gpa-allocated by the filter and
-//! freed here after writing.  Snapshot-protected versions, merge operands,
-//! deletions, and older (hidden) versions are never filtered.
+//! freed here after writing.  Snapshot-protected versions and older (hidden)
+//! versions are never filtered.  The filter also reaches MERGE operands and the
+//! merge-DERIVED value (see below).
+//!
+//! FilterMergeOperand + merge-derived value (D): the effective filter's optional
+//! `filterMergeOperand` hook decides the fate of each COLLAPSIBLE merge operand
+//! (operands the oldest snapshot does not pin); removed operands are not fed to
+//! the merge operator.  Operand filtering is a pure (key, operand) predicate, so
+//! it runs at EVERY level (idempotent).  The merge-DERIVED `.value` produced by
+//! `collapseMergeRun` is passed through the regular value `filter`
+//! (keep/change/remove) ONLY at the BOTTOM level — a higher-level partial merge
+//! becomes the base of a later merge, so filtering it there would re-apply the
+//! filter every stage (e.g. a suffix `.change` -> "ab!c!" instead of "abc!"); at
+//! the bottom level the value is final and filtered exactly once (RocksDB
+//! semantics).  Both still honour snapshot-eligibility.  Snapshot-protected
+//! operands and verbatim-re-emitted bases/deletions stay untouched; if every
+//! operand of a run is removed the run collapses to just its base (or to nothing
+//! when there is no base, so the key disappears — matching RocksDB).
+//!
+//! Per-compaction filter factory (D): when `options.compaction_filter_factory` is
+//! set, each compaction asks it for a FRESH filter (passing the level + the
+//! full/manual flags) which is OWNED BY THE COMPACTION for its duration and
+//! released (`filter.deinit(gpa)`) at the end.  A factory takes precedence over
+//! the single `compaction_filter`.
 //!
 //! What is implemented vs left as future refinement:
 //!   * Size-based output split — implemented (correctness-sufficient).
@@ -35,8 +57,9 @@
 //!   * Obsolete .sst deletion from disk — implemented (reclaimObsoleteFiles;
 //!     synchronous, sound while single-threaded — see its SAFETY note).
 //!   * Compaction filter on merge-derived values / FilterMergeOperand —
-//!     FUTURE(feature): merge results are intentionally not filtered today.
-//!   * Per-compaction CompactionFilterFactory — FUTURE(feature) (single filter).
+//!     implemented (collapseMergeRun threads the effective filter, D).
+//!   * Per-compaction CompactionFilterFactory — implemented (effective filter
+//!     resolved once per compaction in buildCompaction, D).
 //!   * Grandparent-overlap split — FUTURE(perf) (refinement; size split suffices).
 //!   * Boundary-input expansion ("AddBoundaryInputs") — FUTURE(perf) (refinement).
 //! None of the above affects byte-exact RocksDB output; they are scheduling /
@@ -58,6 +81,7 @@ const bloom = @import("../format/bloom.zig");
 const filename = @import("../version/filename.zig");
 const coding = @import("../util/coding.zig");
 const merge_operator_mod = @import("../rocks/merge_operator.zig");
+const compaction_filter_mod = @import("../rocks/compaction_filter.zig");
 const delete_range = @import("../rocks/delete_range.zig");
 
 const FileMetaData = version_edit.FileMetaData;
@@ -697,6 +721,31 @@ pub fn buildCompaction(
         if (!droppable) try surviving.add(t.begin, t.end, t.seq);
     }
 
+    // --- Effective compaction filter for THIS compaction (M7.4 / factory) ---
+    // A `compaction_filter_factory` produces a FRESH filter per compaction (owned
+    // by this compaction; released below).  When no factory is set we fall back to
+    // the single, statically-stored `compaction_filter`.  `factory_created` marks
+    // the filter we must tear down with `deinit` at the end (defer).  This single
+    // effective filter is used at every filter site (plain value, merge operands,
+    // and the merge-derived value).
+    var factory_created: ?compaction_filter_mod.CompactionFilter = null;
+    if (options.compaction_filter_factory) |fac| {
+        // Context booleans: is_full_compaction mirrors RocksDB's "this compaction
+        // reaches the bottom level, so a removed key cannot resurface from an
+        // unread deeper level" — we approximate it with `bottom_level`.
+        // is_manual_compaction is false: the leveled/universal scheduler has no
+        // manual-CompactRange path here (all compactions are background/auto).
+        factory_created = try fac.createCompactionFilter(.{
+            .level = compaction.level,
+            .is_full_compaction = bottom_level,
+            .is_manual_compaction = false,
+        }, gpa);
+    }
+    // Release the factory-created filter when the build finishes (or errors).
+    defer if (factory_created) |cf| cf.deinit(gpa);
+    const eff_filter: ?compaction_filter_mod.CompactionFilter =
+        factory_created orelse options.compaction_filter;
+
     // A reusable emitter closure-equivalent: append (ikey, value) into the
     // current output, opening a builder if needed and rolling over at the target
     // file size.  `ikey`/`value` may be transient — they are copied as needed.
@@ -753,10 +802,11 @@ pub fn buildCompaction(
         // rule below would corrupt them.  When the newest surviving entry for a
         // user key is a `.merge` and an operator is configured, collapse the
         // operand run here (it advances `mit` past everything it consumes).
-        // FUTURE(feature): the M7.4 compaction filter is intentionally NOT applied to
-        // a value produced by collapseMergeRun (a merge-derived `.value`); only
-        // plain `.value` survivors below are filtered.  Filtering a merge result
-        // (and a FilterMergeOperand hook for operands) is a future refinement.
+        // The effective compaction filter is threaded into collapseMergeRun: it
+        // applies `filterMergeOperand` to each collapsible operand (dropping the
+        // ones the filter removes) and the regular value `filter` to the
+        // merge-DERIVED value, under the same snapshot-eligibility rule as a plain
+        // value (only entries the oldest snapshot does not pin are filtered).
         if (parsed.type == .merge and
             options.merge_operator != null and
             last_sequence_for_key == internal_key.kMaxSequenceNumber) // first-for-key (newest)
@@ -767,6 +817,10 @@ pub fn buildCompaction(
                 user_cmp,
                 options.merge_operator.?,
                 smallest_snapshot,
+                has_live_snapshot,
+                eff_filter,
+                bottom_level,
+                compaction.level,
                 user_key,
                 &emit_ctx,
             );
@@ -824,7 +878,7 @@ pub fn buildCompaction(
             last_sequence_for_key == internal_key.kMaxSequenceNumber and // newest for this key
             snapshot_eligible)
         {
-            if (options.compaction_filter) |cf| {
+            if (eff_filter) |cf| {
                 switch (try cf.filter(compaction.level, user_key, value, gpa)) {
                     .keep => {},
                     .remove => drop = true,
@@ -1125,18 +1179,46 @@ fn encodeInternalKey(gpa: std.mem.Allocator, user_key: []const u8, seq: u64, t: 
 ///         resolve to a final value (that could discard a base).  Shrink the run
 ///         to ONE operand via `partialMerge` if supported, else keep the operands
 ///         VERBATIM so a deeper compaction (which reads the base) finishes it.
+///
+/// Compaction filter (FilterMergeOperand + merge-derived value):
+///   * `eff_filter`/`level`: the effective compaction filter for this compaction.
+///   * Each COLLAPSIBLE operand (`sequence <= smallest_snapshot`) is passed to
+///     `filterMergeOperand`; operands it removes are dropped and never fed to the
+///     operator.  Operands ABOVE the snapshot (kept verbatim) are snapshot-
+///     protected and are NEVER filtered.  Operand filtering only runs when the
+///     collapsible run is NOT pinned by a live snapshot (see `filter_eligible`),
+///     so a value the oldest snapshot must read verbatim is never altered.
+///   * The merge-DERIVED `.value` (a fullMerge result) is then passed to the
+///     value `filter` under the same eligibility: `.keep` emits it, `.change`
+///     rewrites it (the gpa-allocated replacement is freed here after emit, per
+///     the ownership contract), `.remove` emits NOTHING (the merged key disappears
+///     — matching RocksDB, which can produce no value).  Verbatim re-emitted
+///     bases/deletions (snapshot-protected paths) are not filtered.
+///   * If EVERY collapsible operand is removed, the run collapses to just its
+///     underlying base/deletion (re-emitted verbatim) — and to nothing at all when
+///     there is no base/deletion, so the key effectively disappears.
 fn collapseMergeRun(
     gpa: std.mem.Allocator,
     mit: iterator.Iterator,
     user_cmp: comparator.Comparator,
     merge_op: merge_operator_mod.MergeOperator,
     smallest_snapshot: u64,
+    has_live_snapshot: bool,
+    eff_filter: ?compaction_filter_mod.CompactionFilter,
+    bottom_level: bool,
+    level: usize,
     user_key_in: []const u8,
     emit_ctx: *EmitCtx,
 ) !void {
     // Stable copy of the user key (iterator slices are transient).
     const user_key = try gpa.dupe(u8, user_key_in);
     defer gpa.free(user_key);
+
+    // Collapsible operands and the merge-derived value are at-or-below the oldest
+    // snapshot, so they are filterable only when NO live snapshot pins them (the
+    // same rule the plain-value site uses): with a live snapshot the oldest reader
+    // must observe the run verbatim.
+    const filter_eligible = !has_live_snapshot;
 
     // Operands above the snapshot: kept verbatim (newest-first), each tagged with
     // its sequence so we re-emit it as a `.merge` at the same sequence.
@@ -1173,10 +1255,24 @@ fn collapseMergeRun(
                 if (parsed.sequence > smallest_snapshot) {
                     try kept.append(gpa, .{ .seq = parsed.sequence, .op = try gpa.dupe(u8, mit.value()) });
                 } else {
-                    try collapsible.append(gpa, try gpa.dupe(u8, mit.value()));
+                    // FilterMergeOperand: skip a collapsible operand the filter
+                    // removes (do not feed it to the operator).  The newest
+                    // collapsible sequence is still tracked from the FIRST
+                    // collapsible operand SEEN so the collapsed entry keeps a
+                    // correct stamp even if that operand is later dropped.
                     if (!have_collapsible_seq) {
                         newest_collapsible_seq = parsed.sequence;
                         have_collapsible_seq = true;
+                    }
+                    const keep_operand = if (filter_eligible)
+                        if (eff_filter) |cf|
+                            try cf.filterMergeOperand(level, user_key, mit.value())
+                        else
+                            true
+                    else
+                        true;
+                    if (keep_operand) {
+                        try collapsible.append(gpa, try gpa.dupe(u8, mit.value()));
                     }
                 }
                 mit.next();
@@ -1232,6 +1328,17 @@ fn collapseMergeRun(
 
     const collapse_seq = if (have_collapsible_seq) newest_collapsible_seq else 0;
 
+    // Filter eligibility for the merge-DERIVED value.  Beyond the snapshot rule
+    // (filter_eligible), the derived value may be filtered ONLY at the BOTTOM
+    // level.  An LSM compacts in stages, so a partial merge result emitted at a
+    // higher level becomes the BASE of a later merge: filtering it there would
+    // re-apply the filter on every subsequent stage (e.g. a suffix-appending
+    // .change yields "ab!c!" instead of "abc!").  At the bottom level the value
+    // is final and will not be re-merged, so the filter applies exactly once —
+    // matching RocksDB, which only filters a fully-resolved value.
+    const value_filter: ?compaction_filter_mod.CompactionFilter =
+        if (filter_eligible and bottom_level) eff_filter else null;
+
     if (have_base) {
         // fullMerge with the base → a single value.
         const merged = (try merge_op.fullMerge(user_key, base.?, view, gpa)) orelse {
@@ -1243,9 +1350,7 @@ fn collapseMergeRun(
             return;
         };
         defer gpa.free(merged);
-        const ik = try encodeInternalKey(gpa, user_key, collapse_seq, .value);
-        defer gpa.free(ik);
-        try emit_ctx.emit(ik, merged);
+        try emitDerivedValue(gpa, value_filter, level, user_key, collapse_seq, merged, emit_ctx);
         return;
     }
 
@@ -1256,9 +1361,7 @@ fn collapseMergeRun(
             return;
         };
         defer gpa.free(merged);
-        const ik = try encodeInternalKey(gpa, user_key, collapse_seq, .value);
-        defer gpa.free(ik);
-        try emit_ctx.emit(ik, merged);
+        try emitDerivedValue(gpa, value_filter, level, user_key, collapse_seq, merged, emit_ctx);
         return;
     }
 
@@ -1277,6 +1380,39 @@ fn collapseMergeRun(
     } else {
         try emitOperandsVerbatim(gpa, user_key, collapsible.items, collapse_seq, emit_ctx);
     }
+}
+
+/// Emit a merge-DERIVED `.value` (the result of a fullMerge) for `user_key` at
+/// `seq`, passing it through `value_filter` first when one is given.  The filter
+/// may `.keep` it (emit as-is), `.change` it (emit the gpa-allocated replacement,
+/// freed here after writing — ownership contract), or `.remove` it (emit nothing,
+/// so the merged key disappears, matching RocksDB).  When `value_filter` is null
+/// the value is emitted unchanged.
+fn emitDerivedValue(
+    gpa: std.mem.Allocator,
+    value_filter: ?compaction_filter_mod.CompactionFilter,
+    level: usize,
+    user_key: []const u8,
+    seq: u64,
+    merged: []const u8,
+    emit_ctx: *EmitCtx,
+) !void {
+    var out: []const u8 = merged;
+    var owned_change: ?[]const u8 = null;
+    defer if (owned_change) |c| gpa.free(c);
+    if (value_filter) |cf| {
+        switch (try cf.filter(level, user_key, merged, gpa)) {
+            .keep => {},
+            .remove => return, // the merged key disappears
+            .change => |repl| {
+                owned_change = repl;
+                out = repl;
+            },
+        }
+    }
+    const ik = try encodeInternalKey(gpa, user_key, seq, .value);
+    defer gpa.free(ik);
+    try emit_ctx.emit(ik, out);
 }
 
 /// Re-emit `operands` (OLDEST-first as stored after the reverse) verbatim as
@@ -1868,8 +2004,6 @@ test "M7.1: randomized merge gate vs counter reference (flush + compaction + reo
 
 // --- THE COMPACTION-FILTER GATE (M7.4) -------------------------------------
 
-const compaction_filter_mod = @import("../rocks/compaction_filter.zig");
-
 test "M7.4: compaction filter removes keys whose value has the configured prefix" {
     const gpa = testing.allocator;
     var me = env.MemEnv.init(gpa);
@@ -2002,6 +2136,293 @@ test "M7.4: compaction filter must not touch snapshot-protected entries" {
     if (try db.get(.{}, "k")) |leftover| {
         defer gpa.free(leftover);
         return error.TestExpectedRemoved;
+    }
+}
+
+// --- FilterMergeOperand + merge-derived-value filter + factory (D) ---------
+
+/// A merge operator over single-byte string operands: concatenates the operands
+/// (oldest-first) onto the base, e.g. base "a" + operands {"b","c"} -> "abc".
+/// Used by the FilterMergeOperand tests so the *set* of operands that survived
+/// filtering is directly visible in the merged value.
+const StringConcatOperator = struct {
+    fn operator(self: *const StringConcatOperator) merge_operator_mod.MergeOperator {
+        return .{ .ctx = self, .vtable = &string_concat_vtable };
+    }
+};
+fn stringConcatFull(
+    _: *const anyopaque,
+    _: []const u8,
+    existing: ?[]const u8,
+    operands: []const []const u8,
+    gpa: std.mem.Allocator,
+) anyerror!?[]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    if (existing) |e| try buf.appendSlice(gpa, e);
+    for (operands) |op| try buf.appendSlice(gpa, op);
+    return try buf.toOwnedSlice(gpa);
+}
+fn stringConcatPartial(
+    _: *const anyopaque,
+    _: []const u8,
+    operands: []const []const u8,
+    gpa: std.mem.Allocator,
+) anyerror!?[]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    for (operands) |op| try buf.appendSlice(gpa, op);
+    return try buf.toOwnedSlice(gpa);
+}
+fn stringConcatName(_: *const anyopaque) []const u8 {
+    return "StringConcatOperator";
+}
+const string_concat_vtable = merge_operator_mod.MergeOperator.VTable{
+    .fullMerge = stringConcatFull,
+    .partialMerge = stringConcatPartial,
+    .name = stringConcatName,
+};
+
+test "D(A): FilterMergeOperand drops specific operands from the merged value" {
+    const gpa = testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    var op = StringConcatOperator{};
+    // Drop every operand equal to "x"; keep all other operands and all values.
+    var f = compaction_filter_mod.RemoveOperandByValueFilter{ .drop = "x" };
+    const db = try DB.open(gpa, e, "filter-operand", .{
+        .merge_operator = op.operator(),
+        .compaction_filter = f.filter(),
+        .write_buffer_size = 1, // flush per write -> operands land in separate SSTs
+        .level0_file_num_compaction_trigger = 2,
+    });
+    defer db.close();
+
+    // Base "a", then operands b, x, c, x, d.  The "x" operands must be dropped,
+    // so the collapsed value is "abcd".
+    try db.put(.{}, "k", "a");
+    try db.merge(.{}, "k", "b");
+    try db.merge(.{}, "k", "x");
+    try db.merge(.{}, "k", "c");
+    try db.merge(.{}, "k", "x");
+    try db.merge(.{}, "k", "d");
+    // Trailing writes force flushes + a compaction that sweeps "k" to L1.
+    for ([_][]const u8{ "p", "q", "r", "s", "t", "u" }) |kk| try db.put(.{}, kk, "z");
+
+    try testing.expect(levelFiles(db, 1) >= 1);
+
+    const got = try db.get(.{}, "k") orelse return error.TestExpectedFound;
+    defer gpa.free(got);
+    try testing.expectEqualStrings("abcd", got);
+}
+
+test "D(A): all merge operands removed leaves the base value alone" {
+    const gpa = testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    var op = StringConcatOperator{};
+    var f = compaction_filter_mod.RemoveOperandByValueFilter{ .drop = "x" };
+    const db = try DB.open(gpa, e, "filter-operand-all", .{
+        .merge_operator = op.operator(),
+        .compaction_filter = f.filter(),
+        .write_buffer_size = 1,
+        .level0_file_num_compaction_trigger = 2,
+    });
+    defer db.close();
+
+    // Base "base", then only droppable operands -> merged value collapses back to
+    // just the base ("base"), because every operand is filtered out.
+    try db.put(.{}, "k", "base");
+    try db.merge(.{}, "k", "x");
+    try db.merge(.{}, "k", "x");
+    for ([_][]const u8{ "p", "q", "r", "s", "t", "u" }) |kk| try db.put(.{}, kk, "z");
+
+    try testing.expect(levelFiles(db, 1) >= 1);
+
+    const got = try db.get(.{}, "k") orelse return error.TestExpectedFound;
+    defer gpa.free(got);
+    try testing.expectEqualStrings("base", got);
+}
+
+test "D(A): merge-derived value is NOT filtered above the bottom level (no double-application)" {
+    const gpa = testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    var op = StringConcatOperator{};
+    // AppendSuffixFilter appends "!" via a `.change`.  The DERIVED-value filter is
+    // BOTTOM-LEVEL-ONLY: an LSM compacts in stages, so a partial merge result
+    // emitted at a higher level becomes the BASE of a later merge.  Filtering it
+    // there would re-apply the suffix every stage ("ab!c!"); gating on the bottom
+    // level means a non-bottom compaction passes the merged value through cleanly.
+    var f = compaction_filter_mod.AppendSuffixFilter{ .suffix = "!" };
+    const db = try DB.open(gpa, e, "filter-derived-change", .{
+        .merge_operator = op.operator(),
+        .compaction_filter = f.filter(),
+        .write_buffer_size = 1,
+        .level0_file_num_compaction_trigger = 2,
+    });
+    defer db.close();
+
+    try db.put(.{}, "k", "a");
+    try db.merge(.{}, "k", "b");
+    try db.merge(.{}, "k", "c");
+    for ([_][]const u8{ "p", "q", "r", "s", "t", "u" }) |kk| try db.put(.{}, kk, "z");
+
+    try testing.expect(levelFiles(db, 1) >= 1);
+
+    // The staged L0->L1 compactions merge to "abc" and, because L1 is not the
+    // bottom level, the suffix filter does NOT fire — and crucially is NOT
+    // double-applied across stages (regression guard against "ab!c!").
+    const got = try db.get(.{}, "k") orelse return error.TestExpectedFound;
+    defer gpa.free(got);
+    try testing.expectEqualStrings("abc", got);
+}
+
+/// A value filter that REMOVES any surviving value equal to a configured match
+/// (a .remove decision), used to verify removal of a merge-derived value.
+const RemoveExactValueFilter = struct {
+    match: []const u8,
+    fn filter(self: *const RemoveExactValueFilter) compaction_filter_mod.CompactionFilter {
+        return .{ .ctx = self, .vtable = &remove_exact_value_vtable };
+    }
+};
+fn removeExactValue(
+    ctx: *const anyopaque,
+    _: usize,
+    _: []const u8,
+    value: []const u8,
+    _: std.mem.Allocator,
+) anyerror!compaction_filter_mod.Decision {
+    const self: *const RemoveExactValueFilter = @ptrCast(@alignCast(ctx));
+    if (std.mem.eql(u8, value, self.match)) return .remove;
+    return .keep;
+}
+fn removeExactValueName(_: *const anyopaque) []const u8 {
+    return "RemoveExactValueFilter";
+}
+const remove_exact_value_vtable = compaction_filter_mod.CompactionFilter.VTable{
+    .filter = removeExactValue,
+    .name = removeExactValueName,
+};
+
+test "D(A): merge-derived value is NOT removed above the bottom level" {
+    const gpa = testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    var op = StringConcatOperator{};
+    // A `.remove` of the derived "abc" must NOT fire at a non-bottom compaction
+    // (same bottom-level-only rule as the `.change` case): the merged key must
+    // survive so a deeper level cannot resurface an older value the filter would
+    // not have removed there.
+    var f = RemoveExactValueFilter{ .match = "abc" };
+    const db = try DB.open(gpa, e, "filter-derived-remove", .{
+        .merge_operator = op.operator(),
+        .compaction_filter = f.filter(),
+        .write_buffer_size = 1,
+        .level0_file_num_compaction_trigger = 2,
+    });
+    defer db.close();
+
+    try db.put(.{}, "k", "a");
+    try db.merge(.{}, "k", "b");
+    try db.merge(.{}, "k", "c");
+    for ([_][]const u8{ "p", "q", "r", "s", "t", "u" }) |kk| try db.put(.{}, kk, "z");
+
+    try testing.expect(levelFiles(db, 1) >= 1);
+
+    // L1 is not the bottom level, so the merged "abc" is NOT removed -> it persists.
+    const got = try db.get(.{}, "k") orelse return error.TestExpectedFound;
+    defer gpa.free(got);
+    try testing.expectEqualStrings("abc", got);
+    // A padding key survives untouched.
+    const z = try db.get(.{}, "p") orelse return error.TestExpectedFound;
+    defer gpa.free(z);
+    try testing.expectEqualStrings("z", z);
+}
+
+test "D(A): a snapshot-pinned merge operand is NOT filtered" {
+    const gpa = testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    var op = StringConcatOperator{};
+    var f = compaction_filter_mod.RemoveOperandByValueFilter{ .drop = "x" };
+    const db = try DB.open(gpa, e, "filter-operand-snap", .{
+        .merge_operator = op.operator(),
+        .compaction_filter = f.filter(),
+        .write_buffer_size = 64,
+        .level0_file_num_compaction_trigger = 2,
+        .max_bytes_for_level_base = 256,
+        .target_file_size_base = 256,
+    });
+    defer db.close();
+
+    // Base + a droppable "x" operand, PINNED by a snapshot: a compaction while the
+    // snapshot is held must keep the operand verbatim (snapshot-protected), so the
+    // snapshot read still sees "abx" (a + b + x).
+    try db.put(.{}, "k", "a");
+    try db.merge(.{}, "k", "b");
+    try db.merge(.{}, "k", "x");
+    const snap = try db.getSnapshot();
+
+    try db.put(.{}, "a", "av");
+    try db.put(.{}, "b", "bv");
+    try db.put(.{}, "c", "cv");
+
+    {
+        const got = try db.get(.{ .snapshot = snap.sequence }, "k") orelse
+            return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings("abx", got);
+    }
+    db.releaseSnapshot(snap);
+}
+
+test "D(B): CompactionFilterFactory produces a per-compaction filter (no leak)" {
+    const gpa = testing.allocator;
+    var me = env.MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    // The factory hands each compaction a fresh PrefixDropFilter that removes keys
+    // whose USER key starts with "tmp_" and frees its gpa-allocated state at the
+    // end of the compaction (testing.allocator flags a leak otherwise).
+    var fac = compaction_filter_mod.PrefixDropFilterFactory{ .prefix = "tmp_" };
+    const db = try DB.open(gpa, e, "factory", .{
+        .compaction_filter_factory = fac.factory(),
+        .write_buffer_size = 1,
+        .level0_file_num_compaction_trigger = 2,
+    });
+    defer db.close();
+
+    try db.put(.{}, "tmp_a", "1");
+    try db.put(.{}, "keep_b", "2");
+    try db.put(.{}, "tmp_c", "3");
+    try db.put(.{}, "keep_d", "4");
+    try db.put(.{}, "keep_e", "5");
+
+    try testing.expect(levelFiles(db, 1) >= 1);
+
+    // The "tmp_"-prefixed keys are removed by the per-compaction filter.
+    try testing.expect((try db.get(.{}, "tmp_a")) == null);
+    try testing.expect((try db.get(.{}, "tmp_c")) == null);
+    for ([_]struct { k: []const u8, v: []const u8 }{
+        .{ .k = "keep_b", .v = "2" },
+        .{ .k = "keep_d", .v = "4" },
+        .{ .k = "keep_e", .v = "5" },
+    }) |kv| {
+        const got = try db.get(.{}, kv.k) orelse return error.TestExpectedFound;
+        defer gpa.free(got);
+        try testing.expectEqualStrings(kv.v, got);
     }
 }
 

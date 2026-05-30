@@ -12,6 +12,7 @@ pub const MergeOperator = merge_operator.MergeOperator;
 // Re-export so callers can write `options_mod.CompactionFilter` / `.Decision` (M7.4).
 pub const CompactionFilter = compaction_filter.CompactionFilter;
 pub const Decision = compaction_filter.Decision;
+pub const CompactionFilterFactory = compaction_filter.CompactionFilterFactory;
 // `CompactionStyle` is declared below; nothing to re-export from another module.
 /// Re-export Cache so callers can write `options_mod.Cache`.
 pub const Cache = cache_mod.Cache;
@@ -131,6 +132,14 @@ pub const Options = struct {
     /// snapshot, merge operands, deletions, and older (hidden) versions are NOT
     /// filtered.  Default null leaves compaction behaviour unchanged.
     compaction_filter: ?compaction_filter.CompactionFilter = null,
+
+    /// Optional per-compaction compaction-filter factory (mirrors RocksDB's
+    /// `CompactionFilterFactory`).  When set, each compaction asks the factory for
+    /// a FRESH `CompactionFilter` (passing a `Context` with the level and the
+    /// full/manual flags) and uses it for that compaction only, releasing it
+    /// (`filter.deinit(gpa)`) when the compaction finishes.  A factory takes
+    /// precedence over `compaction_filter`; when both are null, no filtering runs.
+    compaction_filter_factory: ?compaction_filter.CompactionFilterFactory = null,
 
     /// Which compaction algorithm the DB runs (M7.3).  Default `.level` keeps the
     /// classic leveled behaviour; `.universal` and `.fifo` switch to alternative

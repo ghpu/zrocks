@@ -14,7 +14,16 @@
 //! Mirrors RocksDB's `CompactionFilter::FilterV2` (the value variant):
 //!   - `filter(level, key, value, gpa)`: `key` is the USER key, `value` the
 //!     current value; returns a `Decision`.
+//!   - `filterMergeOperand(level, key, operand)`: OPTIONAL hook (mirrors
+//!     RocksDB `CompactionFilter::FilterMergeOperand`).  Returns `true` to KEEP
+//!     the operand, `false` to REMOVE it from the merge run.  When the vtable
+//!     hook is null, every operand is kept (so filters written before this hook
+//!     existed keep working unchanged).
 //!   - `name()`: a stable identifier.
+//!   - `destroy(ctx, gpa)`: OPTIONAL teardown hook.  A plain (statically-stored)
+//!     filter leaves this null.  A filter produced by a `CompactionFilterFactory`
+//!     (whose `ctx` points at gpa-allocated per-compaction state) sets it so the
+//!     compaction can release that state when the compaction finishes.
 //!
 //! Change-buffer OWNERSHIP CONTRACT
 //! --------------------------------
@@ -74,8 +83,26 @@ pub const CompactionFilter = struct {
             gpa: std.mem.Allocator,
         ) anyerror!Decision,
 
+        /// OPTIONAL: decide the fate of a single MERGE operand during compaction.
+        /// `key` is the USER key, `operand` the operand bytes (transient).
+        /// Returns `true` to KEEP the operand, `false` to REMOVE it.  When null,
+        /// the compaction keeps every operand (back-compat for filters that only
+        /// set `filter`).  Mirrors RocksDB `CompactionFilter::FilterMergeOperand`.
+        filterMergeOperand: ?*const fn (
+            ctx: *const anyopaque,
+            level: usize,
+            key: []const u8,
+            operand: []const u8,
+        ) anyerror!bool = null,
+
         /// Stable identifier of this filter.
         name: *const fn (ctx: *const anyopaque) []const u8,
+
+        /// OPTIONAL: release any gpa-allocated state behind `ctx`.  Set by a
+        /// `CompactionFilterFactory` for the per-compaction filter it produces;
+        /// the compaction calls it (with the same `gpa`) when it finishes.  A
+        /// statically-stored filter leaves this null.
+        destroy: ?*const fn (ctx: *const anyopaque, gpa: std.mem.Allocator) void = null,
     };
 
     // Thin method wrappers --------------------------------------------------
@@ -90,7 +117,78 @@ pub const CompactionFilter = struct {
         return self.vtable.filter(self.ctx, level, key, value, gpa);
     }
 
+    /// Decide whether a merge `operand` is kept (`true`) or removed (`false`).
+    /// Returns `true` when the vtable has no `filterMergeOperand` hook, so a
+    /// filter that does not implement it keeps every operand.
+    pub fn filterMergeOperand(
+        self: CompactionFilter,
+        level: usize,
+        key: []const u8,
+        operand: []const u8,
+    ) anyerror!bool {
+        const hook = self.vtable.filterMergeOperand orelse return true;
+        return hook(self.ctx, level, key, operand);
+    }
+
     pub fn name(self: CompactionFilter) []const u8 {
+        return self.vtable.name(self.ctx);
+    }
+
+    /// Release per-compaction state behind `ctx` (no-op when `destroy` is null).
+    pub fn deinit(self: CompactionFilter, gpa: std.mem.Allocator) void {
+        if (self.vtable.destroy) |d| d(self.ctx, gpa);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// CompactionFilterFactory — produces a fresh CompactionFilter per compaction
+// (capability pattern).  Mirrors RocksDB's `CompactionFilterFactory`.
+// ---------------------------------------------------------------------------
+
+pub const CompactionFilterFactory = struct {
+    ctx: *const anyopaque,
+    vtable: *const VTable,
+
+    /// Per-compaction context handed to the factory, mirroring RocksDB's
+    /// `CompactionFilter::Context`.
+    pub const Context = struct {
+        /// The level being compacted (the compaction's input level).
+        level: usize,
+        /// True when the compaction includes every file of the key range so a
+        /// removed key cannot be resurrected from an unread level.
+        is_full_compaction: bool,
+        /// True when the compaction was triggered manually (RocksDB
+        /// `CompactRange`).  False for background/auto compactions.
+        is_manual_compaction: bool,
+    };
+
+    pub const VTable = struct {
+        /// Produce a fresh `CompactionFilter` for one compaction, or null to run
+        /// that compaction WITHOUT filtering.  Any per-compaction state the
+        /// returned filter needs must be `gpa`-allocated, and the returned filter
+        /// must set its vtable `destroy` so the compaction can free it.  The
+        /// produced filter is OWNED BY THE COMPACTION for the compaction's
+        /// duration: the compaction calls `filter.deinit(gpa)` (which dispatches
+        /// to `destroy`) when it finishes.
+        createCompactionFilter: *const fn (
+            ctx: *const anyopaque,
+            context: Context,
+            gpa: std.mem.Allocator,
+        ) anyerror!?CompactionFilter,
+
+        /// Stable identifier of this factory.
+        name: *const fn (ctx: *const anyopaque) []const u8,
+    };
+
+    pub fn createCompactionFilter(
+        self: CompactionFilterFactory,
+        context: Context,
+        gpa: std.mem.Allocator,
+    ) anyerror!?CompactionFilter {
+        return self.vtable.createCompactionFilter(self.ctx, context, gpa);
+    }
+
+    pub fn name(self: CompactionFilterFactory) []const u8 {
         return self.vtable.name(self.ctx);
     }
 };
@@ -173,6 +271,129 @@ const append_suffix_vtable = CompactionFilter.VTable{
 };
 
 // ---------------------------------------------------------------------------
+// RemoveOperandByValueFilter — example: a filter that keeps all plain values but
+// REMOVES any merge operand equal to a configured `drop` operand.  Demonstrates
+// the optional `filterMergeOperand` hook.
+// ---------------------------------------------------------------------------
+
+/// Keeps every plain `.value` (its `filter` always returns `.keep`), but drops
+/// any merge operand whose bytes equal `drop`.  The `drop` slice must stay alive
+/// for the lifetime of any `CompactionFilter` this hands out.
+pub const RemoveOperandByValueFilter = struct {
+    drop: []const u8,
+
+    pub fn filter(self: *const RemoveOperandByValueFilter) CompactionFilter {
+        return .{ .ctx = self, .vtable = &remove_operand_by_value_vtable };
+    }
+};
+
+fn removeOperandByValueFilter(
+    _: *const anyopaque,
+    _: usize,
+    _: []const u8,
+    _: []const u8,
+    _: std.mem.Allocator,
+) anyerror!Decision {
+    return .keep;
+}
+
+fn removeOperandByValueMergeOperand(
+    ctx: *const anyopaque,
+    _: usize,
+    _: []const u8,
+    operand: []const u8,
+) anyerror!bool {
+    const self: *const RemoveOperandByValueFilter = @ptrCast(@alignCast(ctx));
+    // KEEP when the operand differs from `drop`; REMOVE when it matches.
+    return !std.mem.eql(u8, operand, self.drop);
+}
+
+fn removeOperandByValueName(_: *const anyopaque) []const u8 {
+    return "RemoveOperandByValueFilter";
+}
+
+const remove_operand_by_value_vtable = CompactionFilter.VTable{
+    .filter = removeOperandByValueFilter,
+    .filterMergeOperand = removeOperandByValueMergeOperand,
+    .name = removeOperandByValueName,
+};
+
+// ---------------------------------------------------------------------------
+// PrefixDropFilterFactory — example factory: produces a per-compaction filter
+// that removes any key whose USER key starts with a configured prefix.  The
+// produced filter carries gpa-allocated state (so a leak is observable if the
+// compaction forgets to release it), torn down via the vtable `destroy` hook.
+// ---------------------------------------------------------------------------
+
+/// gpa-allocated per-compaction state behind a filter produced by
+/// `PrefixDropFilterFactory`.  Owns a private copy of the prefix.
+const PrefixDropFilterState = struct {
+    prefix: []u8,
+    level: usize,
+};
+
+/// A factory that, for each compaction, allocates a fresh `PrefixDropFilterState`
+/// (copying the configured `prefix`) and returns a `CompactionFilter` whose `ctx`
+/// is that state and whose `destroy` frees it.  The `prefix` slice must stay
+/// alive for the lifetime of any factory this hands out.
+pub const PrefixDropFilterFactory = struct {
+    prefix: []const u8,
+
+    pub fn factory(self: *const PrefixDropFilterFactory) CompactionFilterFactory {
+        return .{ .ctx = self, .vtable = &prefix_drop_factory_vtable };
+    }
+};
+
+fn prefixDropCreate(
+    ctx: *const anyopaque,
+    context: CompactionFilterFactory.Context,
+    gpa: std.mem.Allocator,
+) anyerror!?CompactionFilter {
+    const self: *const PrefixDropFilterFactory = @ptrCast(@alignCast(ctx));
+    const state = try gpa.create(PrefixDropFilterState);
+    errdefer gpa.destroy(state);
+    state.* = .{ .prefix = try gpa.dupe(u8, self.prefix), .level = context.level };
+    return CompactionFilter{ .ctx = state, .vtable = &prefix_drop_filter_vtable };
+}
+
+fn prefixDropFactoryName(_: *const anyopaque) []const u8 {
+    return "PrefixDropFilterFactory";
+}
+
+const prefix_drop_factory_vtable = CompactionFilterFactory.VTable{
+    .createCompactionFilter = prefixDropCreate,
+    .name = prefixDropFactoryName,
+};
+
+fn prefixDropFilter(
+    ctx: *const anyopaque,
+    _: usize,
+    key: []const u8,
+    _: []const u8,
+    _: std.mem.Allocator,
+) anyerror!Decision {
+    const state: *const PrefixDropFilterState = @ptrCast(@alignCast(ctx));
+    if (std.mem.startsWith(u8, key, state.prefix)) return .remove;
+    return .keep;
+}
+
+fn prefixDropFilterName(_: *const anyopaque) []const u8 {
+    return "PrefixDropFilter";
+}
+
+fn prefixDropDestroy(ctx: *const anyopaque, gpa: std.mem.Allocator) void {
+    const state: *PrefixDropFilterState = @constCast(@ptrCast(@alignCast(ctx)));
+    gpa.free(state.prefix);
+    gpa.destroy(state);
+}
+
+const prefix_drop_filter_vtable = CompactionFilter.VTable{
+    .filter = prefixDropFilter,
+    .name = prefixDropFilterName,
+    .destroy = prefixDropDestroy,
+};
+
+// ---------------------------------------------------------------------------
 // Tests — the example filters' decisions (unit level)
 // ---------------------------------------------------------------------------
 
@@ -222,4 +443,44 @@ test "AppendSuffixFilter: change carries gpa-allocated rewritten value" {
 test "AppendSuffixFilter: name is stable" {
     var f = AppendSuffixFilter{ .suffix = "!" };
     try testing.expectEqualStrings("AppendSuffixFilter", f.filter().name());
+}
+
+test "filterMergeOperand wrapper defaults to KEEP when the hook is null" {
+    // RemoveByValuePrefixFilter sets no operand hook → every operand is kept.
+    var f = RemoveByValuePrefixFilter{ .prefix = "DEL" };
+    const cf = f.filter();
+    try testing.expect(try cf.filterMergeOperand(0, "k", "anything") == true);
+}
+
+test "RemoveOperandByValueFilter: drops the matching operand, keeps others/values" {
+    const gpa = testing.allocator;
+    var f = RemoveOperandByValueFilter{ .drop = "skip" };
+    const cf = f.filter();
+
+    // Plain values are always kept (the value filter returns .keep).
+    try testing.expect((try cf.filter(0, "k", "skip", gpa)) == .keep);
+
+    // The matching operand is removed; a different operand is kept.
+    try testing.expect((try cf.filterMergeOperand(0, "k", "skip")) == false);
+    try testing.expect((try cf.filterMergeOperand(0, "k", "take")) == true);
+    try testing.expectEqualStrings("RemoveOperandByValueFilter", cf.name());
+}
+
+test "PrefixDropFilterFactory: produces a per-compaction filter that is freed" {
+    const gpa = testing.allocator;
+    var fac = PrefixDropFilterFactory{ .prefix = "tmp_" };
+    const factory = fac.factory();
+    try testing.expectEqualStrings("PrefixDropFilterFactory", factory.name());
+
+    const cf = (try factory.createCompactionFilter(
+        .{ .level = 3, .is_full_compaction = true, .is_manual_compaction = false },
+        gpa,
+    )) orelse return error.TestExpectedFilter;
+    // The produced filter must release its state (testing.allocator catches a
+    // leak if `deinit`/`destroy` is wrong).
+    defer cf.deinit(gpa);
+
+    try testing.expect((try cf.filter(3, "tmp_x", "v", gpa)) == .remove);
+    try testing.expect((try cf.filter(3, "keep", "v", gpa)) == .keep);
+    try testing.expectEqualStrings("PrefixDropFilter", cf.name());
 }
