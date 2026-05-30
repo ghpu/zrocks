@@ -19,3 +19,7 @@ zig build test     # run all tests
 ```
 
 Requires Zig 0.16.0.
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE) — the same license used by upstream [RocksDB](https://github.com/facebook/rocksdb).
