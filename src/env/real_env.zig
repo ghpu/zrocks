@@ -107,14 +107,48 @@ fn mapStatErr(e: File.StatError) Error {
 // RealEnv
 // ---------------------------------------------------------------------------
 
+/// One held advisory lock: the open `LOCK` File whose descriptor PINS the
+/// POSIX flock, plus the gpa-owned `path` it is keyed by.  POSIX advisory locks
+/// are released only when the holding fd closes, so the Env must RETAIN this
+/// File from `lockFile(path)` until the matching `unlockFile(path)` (C2).  The
+/// nodes form a tiny intrusive singly-linked list off `RealEnv.locks`; an empty
+/// list owns NO heap memory (the list head is a plain `?*LockNode`), so an Env
+/// that never took a lock — or unlocked everything — leaks nothing.
+const LockNode = struct {
+    path: []u8,
+    file: File,
+    next: ?*LockNode,
+};
+
 pub const RealEnv = struct {
     io: Io,
     root: Dir,
+    /// Allocator owning the `LockNode`s (and their duped paths).  Capability
+    /// passed in by the caller; used ONLY for the advisory-lock bookkeeping.
+    gpa: std.mem.Allocator,
+    /// Head of the held-lock list (C2).  `null` when no DB-level lock is held.
+    locks: ?*LockNode,
 
     /// `io` and `root` are capabilities owned by the caller.  RealEnv does not
-    /// close `root` or tear down the `Io`.
-    pub fn init(io: Io, root: Dir) RealEnv {
-        return .{ .io = io, .root = root };
+    /// close `root` or tear down the `Io`.  `gpa` owns the held-lock bookkeeping
+    /// only (see `LockNode`); call `deinit` to release any still-held locks.
+    pub fn init(gpa: std.mem.Allocator, io: Io, root: Dir) RealEnv {
+        return .{ .io = io, .root = root, .gpa = gpa, .locks = null };
+    }
+
+    /// Release any locks still held (defensive — normal teardown unlocks via
+    /// `DB.close` → `unlockFile`).  Safe to call when no lock is held (no-op).
+    pub fn deinit(self: *RealEnv) void {
+        var node = self.locks;
+        while (node) |n| {
+            const next = n.next;
+            n.file.unlock(self.io);
+            n.file.close(self.io);
+            self.gpa.free(n.path);
+            self.gpa.destroy(n);
+            node = next;
+        }
+        self.locks = null;
     }
 
     pub fn env(self: *RealEnv) Env {
@@ -253,18 +287,81 @@ pub const RealEnv = struct {
         return names.toOwnedSlice(gpa);
     }
 
-    // Advisory file locking.  std 0.16 exposes File.lock / Dir open `lock`
-    // option, but the DB-level single-process lock (LOCK file) is a M5/M6
-    // concern with its own lifecycle.  Stub as no-op success for now.
-    // TODO M5/M6: real advisory lock via Dir.openFile(.{ .lock = .exclusive }).
+    // DB-level advisory locking (C2 — implemented).  `lockFile(path)` opens (or
+    // creates, without truncating) the `LOCK` file and takes a NON-BLOCKING
+    // exclusive `flock` on its descriptor via `File.tryLock(.exclusive)`.  POSIX
+    // advisory locks live with the OPEN FILE DESCRIPTION, so the Env must RETAIN
+    // the open File until `unlockFile`; we stash it in a `LockNode` keyed by
+    // `path` (the Env can be shared across DBs, so locks are tracked per-path).
+    // A second concurrent acquire on the same directory sees the held lock and
+    // returns `error.IoError` immediately (no blocking) — that is what makes a
+    // second writable `DB.open` fail fast instead of hanging.  `unlockFile`
+    // releases + closes the held descriptor and frees the node.
     fn lockFile(ptr: *anyopaque, path: []const u8) Error!void {
-        _ = ptr;
-        _ = path;
+        const self: *RealEnv = @ptrCast(@alignCast(ptr));
+
+        // Already locked by this Env (defensive — DB never double-locks): treat
+        // a re-lock of a path we already hold as a conflict.
+        {
+            var it = self.locks;
+            while (it) |n| : (it = n.next) {
+                if (std.mem.eql(u8, n.path, path)) return error.IoError;
+            }
+        }
+
+        // Open-or-create the LOCK file WITHOUT truncating (an empty marker file).
+        // We do NOT acquire the lock atomically at open time: we want a
+        // non-blocking exclusive acquire whose failure is distinguishable from
+        // open errors, so we open first, then `tryLock`.
+        const file = self.root.createFile(self.io, path, .{
+            .read = true,
+            .truncate = false,
+        }) catch |e| return mapOpenErr(e);
+
+        const got = file.tryLock(self.io, .exclusive) catch {
+            file.close(self.io);
+            return error.IoError;
+        };
+        if (!got) {
+            // Another descriptor (this or another process) holds the lock.
+            file.close(self.io);
+            return error.IoError;
+        }
+
+        const node = self.gpa.create(LockNode) catch |e| {
+            file.unlock(self.io);
+            file.close(self.io);
+            return e;
+        };
+        node.path = self.gpa.dupe(u8, path) catch |e| {
+            self.gpa.destroy(node);
+            file.unlock(self.io);
+            file.close(self.io);
+            return e;
+        };
+        node.file = file;
+        node.next = self.locks;
+        self.locks = node;
     }
 
     fn unlockFile(ptr: *anyopaque, path: []const u8) Error!void {
-        _ = ptr;
-        _ = path;
+        const self: *RealEnv = @ptrCast(@alignCast(ptr));
+        var prev: ?*LockNode = null;
+        var it = self.locks;
+        while (it) |n| : ({
+            prev = n;
+            it = n.next;
+        }) {
+            if (std.mem.eql(u8, n.path, path)) {
+                if (prev) |p| p.next = n.next else self.locks = n.next;
+                n.file.unlock(self.io);
+                n.file.close(self.io);
+                self.gpa.free(n.path);
+                self.gpa.destroy(n);
+                return;
+            }
+        }
+        // Unlocking a path we never locked is a no-op (idempotent close path).
     }
 };
 

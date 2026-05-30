@@ -145,7 +145,7 @@ test "Wave A: open an external-LevelDB fixture read_only and read its live keys 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var re = RealEnv.init(io, tmp.dir);
+    var re = RealEnv.init(gpa, io, tmp.dir);
     const e = re.env();
 
     const dbname = "ldbfixture";

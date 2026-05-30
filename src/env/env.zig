@@ -132,8 +132,16 @@ pub const Env = struct {
         // recovery replays every log whose number is >= the recovered
         // log_number, not just the one named in the MANIFEST).
         listDir: *const fn (ptr: *anyopaque, gpa: std.mem.Allocator, path: []const u8) Error![][]u8,
-        // Advisory file locking.  See note in RealEnv/MemEnv: stubbed for now
-        // (TODO M5/M6 — DB-level single-process lock).  No-op success.
+        // DB-level advisory file locking (C2 — implemented).  `lockFile(path)`
+        // takes a NON-BLOCKING exclusive lock on `path` (the `<dbdir>/LOCK`
+        // file); a conflicting lock already held returns `error.IoError`
+        // immediately so a second writable open fails fast instead of hanging.
+        // The implementation RETAINS the open lock descriptor (POSIX advisory
+        // locks live with the open file description) until `unlockFile(path)`
+        // releases + closes it.  RealEnv tracks held locks per-path (the Env may
+        // be shared across DBs); MemEnv is single-process and always succeeds.
+        // Acquired by writable `DB.open` / `CfDB.open` (once per DB directory);
+        // read-only opens and per-CF sub-LSMs take no lock.
         lockFile: *const fn (ptr: *anyopaque, path: []const u8) Error!void,
         unlockFile: *const fn (ptr: *anyopaque, path: []const u8) Error!void,
         // The async/concurrency capability backing this Env (D2a-1).  Threaded
@@ -388,7 +396,7 @@ test "RealEnv appendable round-trip" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var re = RealEnv.init(io, tmp.dir);
+    var re = RealEnv.init(gpa, io, tmp.dir);
     try runAppendableContract(re.env(), gpa);
 }
 
@@ -399,7 +407,7 @@ test "RealEnv contract" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var re = RealEnv.init(io, tmp.dir);
+    var re = RealEnv.init(gpa, io, tmp.dir);
     try runEnvContract(re.env(), gpa);
 }
 
@@ -417,6 +425,6 @@ test "RealEnv listDir contract" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var re = RealEnv.init(io, tmp.dir);
+    var re = RealEnv.init(gpa, io, tmp.dir);
     try runListDirContract(re.env(), gpa);
 }

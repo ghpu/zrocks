@@ -107,6 +107,13 @@ pub const CfDB = struct {
     dbroot: []u8, // owned
     options: Options,
 
+    /// DB-level advisory LOCK held by this multi-CF database (C2).  CfDB owns the
+    /// single `<dbroot>` directory shared by every per-CF sub-LSM, so it takes
+    /// exactly ONE exclusive lock on `<dbroot>/LOCK`; the per-CF `openCfShared`
+    /// calls SHARE this directory and must NOT take their own lock.  Owned path
+    /// (freed in `close`); `null` only transiently before acquisition.
+    lock_path: []u8,
+
     /// Live CFs by name.  The map owns the `*ColumnFamily` values; the keys are
     /// the CF's owned `name` slice (so the map borrows, the CF frees).
     cfs: std.StringHashMapUnmanaged(*ColumnFamily),
@@ -160,6 +167,17 @@ pub const CfDB = struct {
         errdefer gpa.free(self.dbroot);
 
         try e.makeDir(dbroot);
+
+        // DB-level advisory LOCK (C2): take ONE exclusive lock on `<dbroot>/LOCK`
+        // for the whole multi-CF database, right after the directory exists.  The
+        // per-CF sub-LSMs opened below (via openCfShared) SHARE this directory and
+        // do NOT take their own lock, so the single dbroot lock never
+        // self-conflicts across families.  A second concurrent CfDB.open on the
+        // same dbroot fails fast.
+        self.lock_path = try filename.lockFileName(gpa, dbroot);
+        errdefer gpa.free(self.lock_path);
+        try e.lockFile(self.lock_path);
+        errdefer e.unlockFile(self.lock_path) catch {};
 
         // The single shared MANIFEST.  Created before any CF so addCf can
         // register each CF's VersionSet into it.
@@ -241,6 +259,10 @@ pub const CfDB = struct {
         self.deinitCfs();
         self.manifest.deinit();
         gpa.destroy(self.manifest);
+        // Release the single DB-level advisory lock (C2).  `close` swallows
+        // errors.
+        self.env.unlockFile(self.lock_path) catch {};
+        gpa.free(self.lock_path);
         gpa.free(self.dbroot);
         gpa.destroy(self);
     }

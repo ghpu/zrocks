@@ -124,7 +124,7 @@ test "rocksdb-write: fully-flushed .rocksdb DB round-trips through a fresh zrock
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var re = RealEnv.init(io, tmp.dir);
+    var re = RealEnv.init(gpa, io, tmp.dir);
     const e = re.env();
 
     const dbname = "rdbwrite";
