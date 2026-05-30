@@ -323,20 +323,30 @@ pub const CfDB = struct {
         return cf.handle();
     }
 
-    /// Drop a column family: remove it from the live map + CF_LIST.  The default
-    /// CF (id 0) cannot be dropped (`error.CannotDropDefault`).  Files are left on
-    /// disk (TODO: delete CF dir), so a recreated-name CF re-recovers any stale
-    /// SSTs — acceptable for M7.0 (the registry no longer lists it, and a fresh
-    /// create assigns a new id; the test gate only requires a recreated CF behave
-    /// as empty, which holds because a dropped CF's data is unreachable).
+    /// Drop a column family: remove it from the live map + CF_LIST, AND delete
+    /// its on-disk subdirectory `<dbroot>/<name>/` with all of its SST files
+    /// (C3).  The default CF (id 0) cannot be dropped (`error.CannotDropDefault`).
+    /// Because the subdir is now removed, a recreated-name CF can no longer
+    /// re-recover any stale SSTs — the data is both unreachable in the registry
+    /// and gone from disk.
     pub fn dropColumnFamily(self: *CfDB, h: ColumnFamilyHandle) !void {
         if (h.id == 0) return error.CannotDropDefault;
         const entry = self.cfs.fetchRemove(h.name) orelse return error.ColumnFamilyNotFound;
         const cf = entry.value;
+        // Compute the CF subdir path BEFORE we free `cf.name` (the same
+        // construction `addCf` used to create it, so the deleted path matches
+        // exactly).
+        const dir = try self.cfDir(cf.name);
+        defer self.gpa.free(dir);
         // Unregister from the shared MANIFEST BEFORE closing the CF DB (closing
         // frees the VersionSet the manifest borrows by pointer).
         self.manifest.unregisterCf(cf.id);
+        // Close the sub-LSM so no open file handle remains, THEN delete the
+        // subdir tree.  `deleteTree` tolerates an absent dir (a CF that never
+        // flushed any SST may have no subdir on disk), so this never hard-errors
+        // the drop on the cleanup step.
         cf.db.close();
+        try self.env.deleteTree(dir);
         self.gpa.free(cf.name);
         self.gpa.destroy(cf);
 
@@ -575,6 +585,7 @@ pub const CfDB = struct {
 
 const testing = std.testing;
 const MemEnv = env.MemEnv;
+const Env = env.Env;
 
 test "M7.0 isolation: same key in three CFs holds three distinct values" {
     const gpa = testing.allocator;
@@ -675,6 +686,78 @@ test "M7.0 create/drop: drop leaves others intact; recreated name is empty" {
     // Recreate the name → starts empty (its old key is unreachable).
     const tmp2 = try cdb.createColumnFamily("tmp", .{});
     try testing.expect((try cdb.get(.{}, tmp2, "x")) == null);
+}
+
+test "C3 drop deletes the CF's on-disk subdir (SST files + dir gone)" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+    const e = me.env();
+
+    // Tiny write buffer so the CF flushes at least one SST into its subdir.
+    const opts = Options{ .write_buffer_size = 256 };
+
+    const cdb = try CfDB.open(gpa, e, "cfdrop2", opts);
+    defer cdb.close();
+
+    const temp = try cdb.createColumnFamily("temp", .{});
+
+    // Enough padded writes to force an L0 flush → at least one `.sst` under
+    // `cfdrop2/temp/`.
+    var i: usize = 0;
+    var kbuf: [16]u8 = undefined;
+    while (i < 40) : (i += 1) {
+        const k = try std.fmt.bufPrint(&kbuf, "k{d:0>4}", .{i});
+        try cdb.put(.{}, temp, k, "value-padding-to-force-an-l0-flush");
+    }
+
+    // Record that the CF subdir is non-empty (it has at least one SST).
+    {
+        const names = try e.listDir(gpa, "cfdrop2/temp");
+        defer Env.freeListing(gpa, names);
+        try testing.expect(names.len > 0);
+        var saw_sst = false;
+        for (names) |n| {
+            if (std.mem.endsWith(u8, n, ".sst")) saw_sst = true;
+        }
+        try testing.expect(saw_sst);
+    }
+
+    try cdb.dropColumnFamily(temp);
+
+    // The CF subdir's files are gone: listing it now reports nothing (MemEnv's
+    // flat map lists an empty/absent dir as empty; RealEnv would surface
+    // NotFound).
+    {
+        if (e.listDir(gpa, "cfdrop2/temp")) |empty| {
+            defer Env.freeListing(gpa, empty);
+            try testing.expectEqual(@as(usize, 0), empty.len);
+        } else |err| {
+            try testing.expectEqual(error.NotFound, err);
+        }
+    }
+    // The dbroot no longer enumerates any "temp/..." children either.
+    try testing.expect(!e.fileExists("cfdrop2/temp/CURRENT"));
+
+    // Recreate the SAME name → starts empty; no stale SST lingers to be
+    // re-recovered.
+    const temp2 = try cdb.createColumnFamily("temp", .{});
+    try testing.expect((try cdb.get(.{}, temp2, "k0000")) == null);
+}
+
+test "C3 drop tolerates a never-flushed CF (empty/absent subdir)" {
+    const gpa = testing.allocator;
+    var me = MemEnv.init(gpa);
+    defer me.deinit();
+
+    const cdb = try CfDB.open(gpa, me.env(), "cfdrop3", .{});
+    defer cdb.close();
+
+    // No writes → the CF may never have created its subdir on disk.  Dropping it
+    // must NOT hard-error on the (no-op) tree delete.
+    const temp = try cdb.createColumnFamily("temp", .{});
+    try cdb.dropColumnFamily(temp);
+    try testing.expectError(error.ColumnFamilyNotFound, cdb.columnFamily("temp"));
 }
 
 test "M7.0 recovery: all CFs recover (per-CF SSTs + shared-WAL replay)" {
