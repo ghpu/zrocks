@@ -201,7 +201,11 @@ pub fn pickL0CompactionForced(
 /// this must then become a refcount/pending-deletion queue.  See roadmap D2c.
 ///
 /// The DB's `table_cache` must be passed (NOT the per-compaction private cache),
-/// so the entry a reader would re-`findTable` is the one that gets torn down.
+/// so the entry a reader would re-`acquire` is the one that gets torn down.
+/// NOTE: `evict` now has ERASE semantics — it removes the entry from the map and
+/// drops the in-cache ref, but a still-pinned entry (held by a live reader's
+/// handle) survives until that reader releases it (POSIX-unlink: the open fd
+/// keeps working).  So this remains sound even with a concurrent reader.
 /// Deletion errors (e.g. NotFound when the file was never opened/written) are
 /// swallowed — the file is gone from the Version regardless.
 fn reclaimObsoleteFiles(
@@ -608,8 +612,9 @@ pub fn buildCompaction(
             errdefer it.deinit();
             try children.append(gpa, it);
 
-            const table = try tc.findTable(f.number, f.file_size);
-            var rtl = try table.rangeTombstones(gpa);
+            const h = try tc.acquire(f.number, f.file_size);
+            defer tc.release(h);
+            var rtl = try h.table().rangeTombstones(gpa);
             defer rtl.deinit();
             for (rtl.tombstones.items) |t| try input_tombstones.add(t.begin, t.end, t.seq);
         }

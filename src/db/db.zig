@@ -1471,8 +1471,9 @@ pub const DB = struct {
                 if (prune_key) |pk| {
                     if (!fileMayCoverKey(f, pk, user_cmp)) continue;
                 }
-                const table = try self.table_cache.findTable(f.number, f.file_size);
-                var rtl = try table.rangeTombstones(gpa);
+                const h = try self.table_cache.acquire(f.number, f.file_size);
+                defer self.table_cache.release(h);
+                var rtl = try h.table().rangeTombstones(gpa);
                 defer rtl.deinit();
                 for (rtl.tombstones.items) |t| {
                     if (t.seq <= snapshot) try agg.add(t.begin, t.end, t.seq);
