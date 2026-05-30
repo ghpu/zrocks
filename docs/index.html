@@ -1,0 +1,528 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zrocks — Project Report (RocksDB → Zig)</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #161922; --ink: #e6e8ee; --muted: #8b93a7;
+    --accent: #7fb6ff; --ok: #58c463; --warn: #f0b347; --bad: #ff6b6b;
+    --line: #242938; --code: #1c2030; --violet: #b69bff;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  header {
+    padding: 32px 48px 20px; border-bottom: 1px solid var(--line);
+    background: linear-gradient(180deg, #1a1f2e 0%, var(--bg) 100%);
+  }
+  header h1 { margin: 0 0 4px; font-size: 26px; font-weight: 600; }
+  header .sub { color: var(--muted); font-size: 13px; }
+  nav.toc {
+    position: sticky; top: 0; z-index: 10;
+    background: rgba(15,17,21,0.92); backdrop-filter: blur(6px);
+    border-bottom: 1px solid var(--line); padding: 10px 48px;
+    font-size: 12.5px; display: flex; flex-wrap: wrap; gap: 6px 18px; align-items: center;
+  }
+  nav.toc a { color: var(--muted); text-decoration: none; white-space: nowrap; }
+  nav.toc a:hover { color: var(--accent); }
+  nav.toc .grp { color: var(--ink); font-weight: 600; }
+  nav.toc .sep { color: var(--line); }
+  main { padding: 24px 48px 64px; max-width: 1240px; }
+  .part-divider {
+    margin: 52px 0 0; padding: 22px 0 0; border-top: 2px solid var(--violet);
+  }
+  .part-divider .tag {
+    display: inline-block; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--violet); border: 1px solid rgba(182,155,255,0.4); border-radius: 999px;
+    padding: 2px 10px; margin-bottom: 8px;
+  }
+  h2 {
+    margin: 36px 0 14px; font-size: 18px; font-weight: 600;
+    padding-bottom: 6px; border-bottom: 1px solid var(--line); scroll-margin-top: 56px;
+  }
+  h2.big { font-size: 22px; border-bottom: none; margin-bottom: 4px; }
+  h3 { margin: 22px 0 10px; font-size: 15px; font-weight: 600; color: var(--accent); }
+  p { margin: 10px 0; }
+  .kpis {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 12px; margin: 16px 0 8px;
+  }
+  .kpi {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+    padding: 14px 16px;
+  }
+  .kpi .v { font-size: 22px; font-weight: 600; color: var(--ink); }
+  .kpi .k { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin-top: 2px; }
+  .kpi .s { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; margin: 10px 0 18px; }
+  th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+  tbody tr:hover { background: rgba(127,182,255,0.04); }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  code, pre { font-family: ui-monospace, "SF Mono", Consolas, monospace; font-size: 12.5px; }
+  code { background: var(--code); padding: 1px 5px; border-radius: 3px; color: #cfe1ff; }
+  pre { background: var(--code); padding: 12px 14px; border-radius: 6px; overflow-x: auto;
+        border: 1px solid var(--line); color: #cfe1ff; }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+  .muted { color: var(--muted); }
+  .pill {
+    display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px;
+    background: rgba(88,196,99,0.15); color: var(--ok); border: 1px solid rgba(88,196,99,0.35);
+  }
+  .pill.warn { background: rgba(240,179,71,0.12); color: var(--warn); border-color: rgba(240,179,71,0.35); }
+  .pill.bad  { background: rgba(255,107,107,0.12); color: var(--bad);  border-color: rgba(255,107,107,0.35); }
+  .bar { background: var(--code); border-radius: 3px; overflow: hidden; height: 9px; min-width: 60px; }
+  .bar > span { display: block; height: 100%; background: var(--accent); }
+  .bar.bad > span { background: var(--bad); }
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+  @media (max-width: 880px) { .two-col { grid-template-columns: 1fr; } }
+  .legend { font-size: 12px; color: var(--muted); margin: 2px 0 10px; }
+  .footnote { color: var(--muted); font-size: 12px; margin-top: 24px; border-top: 1px solid var(--line); padding-top: 12px; }
+  .tl { list-style: none; padding: 0; margin: 12px 0; }
+  .tl li { padding: 8px 0 8px 18px; border-left: 2px solid var(--line); position: relative; margin-left: 6px; }
+  .tl li::before { content: ""; position: absolute; left: -7px; top: 13px; width: 10px; height: 10px;
+        border-radius: 50%; background: var(--accent); border: 2px solid var(--bg); }
+  .tl li.mig::before { background: var(--violet); }
+  .tl .when { color: var(--muted); font-size: 12px; }
+  .note { background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--accent);
+        border-radius: 6px; padding: 10px 14px; margin: 12px 0; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>zrocks &mdash; Project Report</h1>
+  <div class="sub">
+    Porting RocksDB to a pure&nbsp;Zig&nbsp;0.16 LSM engine &middot; Branch <code>main</code> &middot;
+    Window <strong>2026-05-28 &rarr; 2026-05-30</strong> CEST &middot; 278 commits &middot;
+    <span class="pill">36 milestones + 8 migration branches &middot; 529 tests green &middot; real librocksdb v11.4.0 opens the output</span>
+  </div>
+  <div class="sub" style="margin-top:6px">
+    Two reports folded into one page: <a href="#part1" style="color:var(--accent)">Part I — the whole project</a>,
+    then <a href="#part2" style="color:var(--violet)">Part II — a deep-dive on the final RocksDB-only migration</a>.
+  </div>
+</header>
+
+<nav class="toc">
+  <span class="grp">I · Project</span>
+  <a href="#goal">Goal</a>
+  <a href="#timeline">Timeline</a>
+  <a href="#tokens">Tokens</a>
+  <a href="#tools">Tools</a>
+  <a href="#failures">Failures</a>
+  <a href="#process">Process</a>
+  <span class="sep">|</span>
+  <span class="grp" style="color:var(--violet)">II · Migration</span>
+  <a href="#mig-headline">Headline</a>
+  <a href="#mig-phases">Phases</a>
+  <a href="#mig-milestones">Milestones</a>
+  <a href="#mig-failure">Failure</a>
+  <a href="#mig-evidence">Evidence</a>
+</nav>
+
+<main>
+
+<!-- ============================ PART I ============================ -->
+<div id="part1"></div>
+
+<h2 class="goal" id="goal">The goal &amp; what was built</h2>
+<p>
+The whole project <em>is</em> the migration: re-implement RocksDB as a pure-Zig 0.16 LSM key-value engine,
+built bottom-up under strict TDD, and finish by making <strong>byte-exact RocksDB the only on-disk format</strong>
+zrocks emits — proven by having a real <code>librocksdb&nbsp;v11.4.0</code> binary open zrocks's flush,
+compaction, range-delete and WAL output through a <code>verify_open</code> oracle.
+</p>
+<p>
+The result is a working, durable, crash-recoverable, leveled-compacting LSM store with a CLI:
+foundation (slice/status/coding/comparator/arena/CRC32C/options) → Env over <code>std.Io</code> →
+WAL · skiplist · memtable · WriteBatch → block-based SST (builder/reader, bloom, footer) → LRU cache →
+iterators → VersionEdit/VersionSet/MANIFEST → recovery → flush + leveled/universal/FIFO compaction →
+snapshots → column families, merge operator, prefix seek, compaction filter, range delete, transactions,
+checkpoints → then the format migration to byte-exact RocksDB.
+</p>
+
+<div class="kpis">
+  <div class="kpi"><div class="v">278</div><div class="k">Commits</div><div class="s">151 / 126 / 1 per day</div></div>
+  <div class="kpi"><div class="v">36 + 8</div><div class="k">Milestones + migration branches</div><div class="s">Phases 0–7, then RocksDB-only</div></div>
+  <div class="kpi"><div class="v">529</div><div class="k">Tests green</div><div class="s">oracle OPEN_OK count=34</div></div>
+  <div class="kpi"><div class="v">59</div><div class="k">Zig files</div><div class="s">≈31,970 lines</div></div>
+  <div class="kpi"><div class="v">1.22 B</div><div class="k">Total tokens processed</div><div class="s">incl. cache reads</div></div>
+  <div class="kpi"><div class="v">4.48 M</div><div class="k">Output tokens generated</div><div class="s">+0.20M input, 43.4M cache-create</div></div>
+  <div class="kpi"><div class="v">121</div><div class="k">Subagent runs</div><div class="s">43 direct + 78 workflow</div></div>
+  <div class="kpi"><div class="v">4</div><div class="k">Orchestrated workflows</div><div class="s">6,383 total tool calls</div></div>
+</div>
+
+<h2 id="timeline">Timeline</h2>
+<p class="legend">Times are CEST. Blue = core engine build (Phases 0–7); violet = RocksDB-only format migration.</p>
+<ul class="tl">
+  <li><span class="when">05-28 08:15</span> &nbsp;<strong>Phase 0 — Foundation</strong>: build/harness, Slice/Status, coding (varint+fixed), comparator, arena, options, CRC32C (M0.0–M0.6).</li>
+  <li><span class="when">05-28 08:32</span> &nbsp;<strong>Phase 1 — Environment</strong>: Env over <code>std.Io</code> + MemEnv (M1.0).</li>
+  <li><span class="when">05-28 08:43</span> &nbsp;<strong>Phase 2 — Write durability core</strong>: InternalKey, WriteBatch, WAL, skiplist, memtable (M2.0–M2.4).</li>
+  <li><span class="when">05-28 09:06</span> &nbsp;<strong>Phase 3 — Block-based SST</strong>: block builder/reader, bloom + filter block, footer, TableBuilder/Reader, LRU cache (M3.0–M3.5).</li>
+  <li><span class="when">05-28 09:41</span> &nbsp;<strong>Phase 4 — Iterators &amp; in-memory DB</strong>: merging/two-level iterators, Put/Get/Delete/Write/iter (M4.0–M4.1).</li>
+  <li><span class="when">05-28 18:09</span> &nbsp;<strong>Phase 5 — Persistence</strong>: VersionEdit, VersionSet/MANIFEST, recovery + durable open (M5.0–M5.2).</li>
+  <li><span class="when">05-28 18:50</span> &nbsp;<strong>Phase 6 — Compaction → embedded KV store</strong>: SST read path, flush, leveled compaction, snapshots + CLI. <span class="pill">GATE: LevelDB-equivalent core</span> (M6.0–M6.3).</li>
+  <li><span class="when">05-28 22:09</span> &nbsp;<strong>Phase 7 — RocksDB extensions</strong>: column families, merge operator, prefix bloom/seek, universal+FIFO, compaction filter, DeleteRange, transactions, checkpoints (M7.0–M7.7). READ-interop with real RocksDB v11.4.0 + Chromium LevelDB.</li>
+  <li class="mig"><span class="when">05-29 16:26</span> &nbsp;<strong>Migration — interop tooling</strong>: real RocksDB v11.4.0 fixture + built-from-source oracle; <code>verify_open</code> widened to point-Get + Seek/range-scan + absent-key.</li>
+  <li class="mig"><span class="when">05-29 20:04 → 23:52</span> &nbsp;<strong>RocksDB-only migration</strong> (8 branches): properties-always → SST-default-flip → manifest-rocksdb-exact (<code>kNewFile4</code> tag 103 + seqnos) → filter-rocksdb-only (FastLocalBloom) → range-del-rocksdb → partitioned-index-drop → remove-native-and-tests. Native/clean formats deleted.</li>
+  <li class="mig"><span class="when">05-30 10:46</span> &nbsp;<strong>Done</strong> — "End of Opus 4.8 run." Directive fulfilled: byte-exact RocksDB is the only format. <span class="muted">Part II below dissects this final phase.</span></li>
+</ul>
+
+<h2 id="tokens">Token usage</h2>
+<p class="legend">
+Across all 125 transcripts (1 main session + 3 helper sessions + 121 subagent/workflow runs).
+Cache reads dominate because every agent turn re-reads its cached context cheaply; the real generation cost
+is the <strong>output</strong> column. "Total" sums input+output+cache-create+cache-read.
+</p>
+<table>
+  <thead><tr><th>Model</th><th class="num">Output</th><th class="num">Input</th><th class="num">Cache create</th><th class="num">Cache read</th><th class="num">Total</th><th>Role</th></tr></thead>
+  <tbody>
+    <tr><td><code>claude-opus-4-7</code></td><td class="num">4,115,123</td><td class="num">145,341</td><td class="num">37,685,149</td><td class="num">1,070,637,462</td><td class="num">1,112,583,075</td><td>Primary driver — orchestration + all coding subagents</td></tr>
+    <tr><td><code>claude-sonnet-4-6</code></td><td class="num">351,668</td><td class="num">47,628</td><td class="num">5,661,202</td><td class="num">102,440,903</td><td class="num">108,501,401</td><td>Lighter-weight subagent work</td></tr>
+    <tr><td><code>claude-opus-4-8</code></td><td class="num">10,208</td><td class="num">7,876</td><td class="num">69,667</td><td class="num">308,802</td><td class="num">396,553</td><td>Reporting sessions (this report)</td></tr>
+    <tr style="font-weight:600"><td>All</td><td class="num">4,476,999</td><td class="num">200,845</td><td class="num">43,416,018</td><td class="num">1,173,387,167</td><td class="num">1,221,481,029</td><td></td></tr>
+  </tbody>
+</table>
+
+<h3>By day</h3>
+<table>
+  <thead><tr><th>Day</th><th class="num">Output tokens</th><th></th><th class="num">Cache read</th><th class="num">Tool calls</th><th class="num">Agents spawned</th></tr></thead>
+  <tbody>
+    <tr><td>2026-05-28</td><td class="num">2,748,676</td><td><div class="bar"><span style="width:100%"></span></div></td><td class="num">550,233,848</td><td class="num">2,589</td><td class="num">39</td></tr>
+    <tr><td>2026-05-29</td><td class="num">1,675,993</td><td><div class="bar"><span style="width:61%"></span></div></td><td class="num">618,047,526</td><td class="num">3,735</td><td class="num">4</td></tr>
+    <tr><td>2026-05-30</td><td class="num">69,896</td><td><div class="bar"><span style="width:3%"></span></div></td><td class="num">5,490,851</td><td class="num">63</td><td class="num">0</td></tr>
+  </tbody>
+</table>
+<p class="legend">Day 1 (28th) built the entire Phases 0–7 core; day 2 (29th) drove the most tool-heavy work — read-interop tooling plus the RocksDB-only migration.</p>
+
+<h2 id="tools">Tool usage</h2>
+<div class="two-col">
+<div>
+<table>
+  <thead><tr><th>Tool</th><th class="num">Calls</th><th></th></tr></thead>
+  <tbody>
+    <tr><td><code>Bash</code></td><td class="num">3,321</td><td><div class="bar"><span style="width:100%"></span></div></td></tr>
+    <tr><td><code>Read</code></td><td class="num">1,570</td><td><div class="bar"><span style="width:47%"></span></div></td></tr>
+    <tr><td><code>Edit</code></td><td class="num">1,040</td><td><div class="bar"><span style="width:31%"></span></div></td></tr>
+    <tr><td><code>Write</code></td><td class="num">128</td><td><div class="bar"><span style="width:4%"></span></div></td></tr>
+    <tr><td><code>StructuredOutput</code></td><td class="num">115</td><td><div class="bar"><span style="width:3.5%"></span></div></td></tr>
+    <tr><td><code>TaskUpdate</code></td><td class="num">84</td><td><div class="bar"><span style="width:2.5%"></span></div></td></tr>
+    <tr><td><code>Agent</code></td><td class="num">43</td><td><div class="bar"><span style="width:1.3%"></span></div></td></tr>
+    <tr><td><code>TaskCreate</code></td><td class="num">42</td><td><div class="bar"><span style="width:1.3%"></span></div></td></tr>
+    <tr><td><code>ToolSearch</code> · <code>Monitor</code> · <code>Workflow</code> · <code>EnterWorktree</code> · …</td><td class="num">≤14 ea</td><td><div class="bar"><span style="width:0.4%"></span></div></td></tr>
+  </tbody>
+</table>
+</div>
+<div>
+  <div class="note">
+    <strong>6,383</strong> tool calls in total.<br>
+    <strong>531</strong> ran in the main orchestration session;
+    <strong>5,852</strong> (92%) ran inside subagents — the coding happened in delegated agents, as the workflow intended.
+  </div>
+  <p class="legend">
+    The <code>Bash</code>/<code>Read</code>/<code>Edit</code> shape is the TDD loop: run <code>zig build test</code>, read the
+    failure, edit, repeat. <code>StructuredOutput</code> calls are workflow agents returning validated JSON
+    (design verdicts, migration findings). 43 <code>Agent</code> spawns + 4 <code>Workflow</code> runs drove
+    121 subagent transcripts.
+  </p>
+</div>
+</div>
+
+<h2 id="failures">Tool failure analysis</h2>
+<p class="legend">128 errored tool results out of 6,383 — an overall <span class="ok">2.0% failure rate</span>. Breakdown by tool and by cause below.</p>
+
+<div class="two-col">
+<div>
+<h3>By tool</h3>
+<table>
+  <thead><tr><th>Tool</th><th class="num">Errors</th><th class="num">Calls</th><th class="num">Rate</th><th></th></tr></thead>
+  <tbody>
+    <tr><td><code>StructuredOutput</code></td><td class="num">40</td><td class="num">115</td><td class="num bad">34.8%</td><td><div class="bar bad"><span style="width:100%"></span></div></td></tr>
+    <tr><td><code>EnterWorktree</code></td><td class="num">4</td><td class="num">4</td><td class="num bad">100%</td><td><div class="bar bad"><span style="width:11%"></span></div></td></tr>
+    <tr><td><code>Monitor</code></td><td class="num">1</td><td class="num">10</td><td class="num warn">10.0%</td><td><div class="bar bad"><span style="width:3%"></span></div></td></tr>
+    <tr><td><code>Bash</code></td><td class="num">65</td><td class="num">3,321</td><td class="num ok">2.0%</td><td><div class="bar bad"><span style="width:6%"></span></div></td></tr>
+    <tr><td><code>Edit</code></td><td class="num">15</td><td class="num">1,040</td><td class="num ok">1.4%</td><td><div class="bar bad"><span style="width:4%"></span></div></td></tr>
+    <tr><td><code>Write</code></td><td class="num">1</td><td class="num">128</td><td class="num ok">0.8%</td><td><div class="bar bad"><span style="width:2%"></span></div></td></tr>
+    <tr><td><code>Read</code></td><td class="num">2</td><td class="num">1,570</td><td class="num ok">0.1%</td><td><div class="bar bad"><span style="width:1%"></span></div></td></tr>
+  </tbody>
+</table>
+</div>
+<div>
+<h3>By root cause</h3>
+<table>
+  <thead><tr><th>Category</th><th class="num">Count</th></tr></thead>
+  <tbody>
+    <tr><td>Schema-mismatch / transient / misc <span class="muted">(mostly StructuredOutput retries + "model temporarily unavailable")</span></td><td class="num">76</td></tr>
+    <tr><td>Bash: command / Zig compile error <span class="muted">(the expected red side of TDD)</span></td><td class="num">31</td></tr>
+    <tr><td>File not found / EISDIR</td><td class="num">13</td></tr>
+    <tr><td>Edit: stale read or non-unique match</td><td class="num">6</td></tr>
+    <tr><td>Permission / denied</td><td class="num">2</td></tr>
+  </tbody>
+</table>
+</div>
+</div>
+
+<h3>What the failures actually were</h3>
+<ul>
+  <li><strong>StructuredOutput (40, the biggest bucket)</strong> — workflow agents whose first JSON didn't satisfy the
+  required schema, e.g. <code>must have required property 'verdict_note'</code> / <code>'already_rocksdb_exact'</code>.
+  These are <em>self-correcting retries</em>: the harness rejects the output and the agent re-emits a valid object.
+  No work was lost; they inflate the count without being real failures.</li>
+  <li><strong>EnterWorktree (4, 100%)</strong> — a subagent tried to call <code>EnterWorktree</code> while already running
+  with a <code>cwd</code>/worktree override: <em>"cannot be called from a subagent with a cwd override."</em> A harness
+  guardrail, not a code bug; the orchestrator owns worktree creation.</li>
+  <li><strong>Bash (65, ~2%)</strong> — dominated by <strong>expected</strong> failures: <code>zig build test</code> exiting
+  non-zero on the red step of red→green TDD, plus a handful of <code>cat</code> on a not-yet-existing
+  <code>MEMORY.md</code> and two transient "<code>claude-opus-4-7 is temporarily unavailable</code>" auto-permission stalls.</li>
+  <li><strong>Edit (15, ~1.4%)</strong> — "<code>File has been modified since read… Read it again</code>" and
+  "<code>Found 2 matches… set replace_all</code>." Standard edit-contract hiccups, immediately retried.</li>
+  <li><strong>Read / Write (3)</strong> — one <code>EISDIR</code> (read a directory as a file), one missing file, one
+  write-before-read. All recovered on the next call.</li>
+</ul>
+<div class="note">
+  <strong>Reading the rate:</strong> of 128 errors, the large majority are <em>designed-in</em> — TDD red builds,
+  schema-validation retries, and a harness guardrail. Subtracting those, genuine unexpected tool failures
+  (stale edits, wrong path, EISDIR, transient model unavailability) number roughly <strong>~25</strong>, i.e.
+  well under 0.5% of all tool calls. The agent recovered from every one without losing milestone progress.
+  <span class="muted">Part II reports the migration phase's own failure ledger: 0 subagent retries.</span>
+</div>
+
+<h2 id="process">Process: TDD cadence &amp; orchestration</h2>
+<div class="two-col">
+<div>
+<h3>Commit shape</h3>
+<table>
+  <thead><tr><th>Prefix</th><th class="num">Commits</th></tr></thead>
+  <tbody>
+    <tr><td><code>feat</code></td><td class="num">75</td></tr>
+    <tr><td><code>Merge</code> <span class="muted">(per-milestone <code>--no-ff</code>)</span></td><td class="num">75</td></tr>
+    <tr><td><code>test</code></td><td class="num">54</td></tr>
+    <tr><td><code>chore</code></td><td class="num">37</td></tr>
+    <tr><td><code>refactor</code></td><td class="num">31</td></tr>
+    <tr><td><code>fix</code> / <code>docs</code></td><td class="num">5</td></tr>
+  </tbody>
+</table>
+<p class="legend">61 commits say "red", 51 say "green" — the literal failing-test-first / make-it-pass rhythm of every milestone.</p>
+</div>
+<div>
+<h3>Agent orchestration</h3>
+<p>
+A single main session acted as orchestrator; nearly all code was written by delegated subagents, one per
+milestone, mostly in isolated git worktrees. Four deterministic <strong>workflows</strong> structured the bigger
+fan-outs:
+</p>
+<ul>
+  <li><code>execute-roadmap</code> — drove the Phase 0–7 milestone build</li>
+  <li><code>next-directions</code> — post-core roadmap exploration</li>
+  <li><code>rocksdb-only-migration-design</code> — design + adversarial verification of the migration</li>
+  <li><code>rocksdb-only-execute</code> — milestone-by-milestone, each gated by <code>verify_open</code></li>
+</ul>
+<p class="legend">43 direct <code>Agent</code> spawns + 78 workflow-launched agents = 121 subagent transcripts.</p>
+</div>
+</div>
+
+<!-- ============================ PART II ============================ -->
+<div class="part-divider" id="part2">
+  <span class="tag">Part II · Deep-dive</span>
+  <h2 class="big" style="scroll-margin-top:56px">The final RocksDB-only format migration</h2>
+  <div class="sub muted" style="font-size:13px">
+    Window <strong>2026-05-29 18:38 &rarr; 23:52</strong> CEST (5h&nbsp;14m wall clock) &middot;
+    2 sequential workflows, 28 subagents &middot;
+    <span class="pill">9 / 9 milestones merged &middot; oracle OPEN_OK count=34 &middot; 529 tests green</span>
+  </div>
+  <p>
+  This is the last phase of the timeline above, examined on its own. Goal: make byte-exact RocksDB the
+  <em>only</em> on-disk format zrocks emits, delete every native/&ldquo;clean&rdquo; write path, and prove it by having a
+  real <code>librocksdb&nbsp;v11.4.0</code> binary open the output via a widened <code>verify_open</code> oracle that
+  exercises point-Get, Seek+range-scan, and absent-key checks.
+  </p>
+</div>
+
+<h2 id="mig-headline">Headline numbers</h2>
+<div class="kpis">
+  <div class="kpi"><div class="v">2,653,408</div><div class="k">total tokens</div></div>
+  <div class="kpi"><div class="v">5h 19m</div><div class="k">workflow CPU time</div></div>
+  <div class="kpi"><div class="v">28</div><div class="k">subagents</div></div>
+  <div class="kpi"><div class="v">1,681</div><div class="k">tool calls (subagents)</div></div>
+  <div class="kpi"><div class="v">9 / 9</div><div class="k">milestones merged</div></div>
+  <div class="kpi"><div class="v">17 files</div><div class="k">+1,320 / &minus;1,810 LoC</div></div>
+  <div class="kpi"><div class="v">21</div><div class="k">commits to main</div></div>
+  <div class="kpi"><div class="v">0</div><div class="k">subagent retries</div></div>
+</div>
+<p class="legend">
+Token total = design workflow (1,581,977) + execute workflow (1,071,431). Wall clock (5h 14m) &lt; workflow CPU time (5h 19m) because the design phase had agents running in parallel.
+</p>
+
+<h2 id="mig-phases">Two-phase structure</h2>
+<table>
+  <thead>
+    <tr>
+      <th>Phase</th><th>Workflow</th><th>Started</th><th class="num">Duration</th>
+      <th class="num">Agents</th><th class="num">Tokens</th><th class="num">Tool calls</th><th>Status</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>1. Design + verify</td><td><code>zrocks-rocksdb-only-migration-design</code></td><td>17:22 UTC</td>
+      <td class="num">41.5 min</td><td class="num">19</td><td class="num">1,581,977</td><td class="num">613</td>
+      <td><span class="pill">completed</span></td>
+    </tr>
+    <tr>
+      <td>2. Execute</td><td><code>zrocks-rocksdb-only-execute</code></td><td>18:05 UTC</td>
+      <td class="num">278.2 min</td><td class="num">9</td><td class="num">1,071,431</td><td class="num">1,068</td>
+      <td><span class="pill">completed</span></td>
+    </tr>
+  </tbody>
+</table>
+<p class="legend">
+Phase 1 fanned out 9 design agents (one per format component) and 9 adversarial verifiers in parallel, then a single synthesizer produced the sequenced plan (28 min, 183&nbsp;k tokens by itself).
+Phase 2 ran the 9 plan milestones <strong>sequentially</strong> on the shared repo (each had to commit before the next started, because they all touch <code>src/format/</code> and <code>src/db/</code>).
+</p>
+
+<h2 id="mig-milestones">Per-milestone breakdown (execution phase)</h2>
+<table>
+  <thead>
+    <tr>
+      <th class="num">#</th><th>Milestone</th><th>Commit</th><th>Model</th><th class="num">Duration</th>
+      <th class="num">Tokens</th><th class="num">Tool calls</th><th class="num">Tests after</th><th>Oracle</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td class="num">1</td><td><strong>oracle-widen</strong><div class="muted">widen <code>verify_open</code> to Get+Seek+absent-key</div></td><td><code>d3c39a6</code></td><td>sonnet&#8209;4&#8209;6</td><td class="num">26:40</td><td class="num">48,652</td><td class="num">49</td><td class="num">530</td><td><span class="pill">OPEN_OK&nbsp;11</span></td></tr>
+    <tr><td class="num">2</td><td><strong>properties-always</strong><div class="muted">emit full 29-field RocksDB v11 table-properties</div></td><td><code>94ae493</code></td><td>opus&#8209;4&#8209;7</td><td class="num">15:01</td><td class="num">83,325</td><td class="num">45</td><td class="num">530</td><td><span class="pill">OPEN_OK&nbsp;11</span></td></tr>
+    <tr><td class="num">3</td><td><strong>sst-default-flip</strong><div class="muted">delete <code>sst_output</code> enum + native single-level index + native finish path</div></td><td><code>33d7b6f</code></td><td>opus&#8209;4&#8209;7</td><td class="num">41:39</td><td class="num">204,807</td><td class="num">137</td><td class="num">524</td><td><span class="pill">OPEN_OK&nbsp;11</span></td></tr>
+    <tr><td class="num">4</td><td><strong>manifest-rocksdb-exact</strong><div class="muted">compaction emits <code>kNewFile4</code> (tag 103) with min/max seqnos &mdash; <span class="warn">fixed latent bug</span></div></td><td><code>26a9639</code></td><td>opus&#8209;4&#8209;7</td><td class="num">15:19</td><td class="num">111,705</td><td class="num">55</td><td class="num">525</td><td><span class="pill warn">OPEN_OK&nbsp;8</span></td></tr>
+    <tr><td class="num">5</td><td><strong>filter-rocksdb-only</strong><div class="muted">FastLocalBloom full filter in every SST; drop block-based-bloom write path</div></td><td><code>22a3afe</code></td><td>opus&#8209;4&#8209;7</td><td class="num">22:19</td><td class="num">113,679</td><td class="num">101</td><td class="num">525</td><td><span class="pill">OPEN_OK&nbsp;11</span></td></tr>
+    <tr><td class="num">6</td><td><strong>range-del-rocksdb</strong><div class="muted">emit/read range tombstones in <code>rocksdb.range_del</code> meta-block format</div></td><td><code>4c6e3fb</code></td><td>opus&#8209;4&#8209;7</td><td class="num">28:35</td><td class="num">111,886</td><td class="num">62</td><td class="num">528</td><td><span class="pill warn">OPEN_OK&nbsp;5</span></td></tr>
+    <tr><td class="num">7</td><td><strong>wal-writebatch-cf</strong><div class="muted">replace <code>kColumnFamilyTag=0x10</code> with RocksDB CF value-type bytes (0x4/0x5/0x6/0xE)</div></td><td><code>b13f6a2</code></td><td>opus&#8209;4&#8209;7</td><td class="num">37:12</td><td class="num">160,351</td><td class="num">414</td><td class="num">532</td><td><span class="pill">OPEN_OK&nbsp;11</span></td></tr>
+    <tr><td class="num">8</td><td><strong>partitioned-index-drop</strong><div class="muted">delete <code>partitioned_index.zig</code> (373&nbsp;LoC); drop <code>Options.IndexType</code></div></td><td><code>55f0668</code></td><td>sonnet&#8209;4&#8209;6</td><td class="num">38:18</td><td class="num">119,790</td><td class="num">107</td><td class="num">528</td><td><span class="pill">OPEN_OK&nbsp;11</span></td></tr>
+    <tr><td class="num">9</td><td><strong>remove-native-and-tests</strong><div class="muted">final sweep: <code>SharedManifest.writeSnapshot</code> emits <code>kNewFile4</code></div></td><td><code>aba5a2b</code></td><td>opus&#8209;4&#8209;7</td><td class="num">53:05</td><td class="num">117,236</td><td class="num">98</td><td class="num">529</td><td><span class="pill">OPEN_OK&nbsp;34</span></td></tr>
+  </tbody>
+</table>
+<p class="legend">
+Oracle column = result of <code>/home/ghpu/rocksdb-interop/verify_open &lt;db&gt;</code> on the milestone&rsquo;s gate fixture (a full flush+compaction+range-del+WAL DB).
+Intermediate dips to 5 / 8 are <em>expected</em> &mdash; each step proves its own component opens in isolation while later steps still emit native formats for the others.
+The final 34 means the final fixture is richer (more keys + multi-level + tombstones) <em>and</em> reads end-to-end.
+</p>
+
+<div class="two-col">
+  <div>
+    <h2 style="font-size:18px">Tool usage (migration)</h2>
+    <p class="legend">Across all 28 migration subagents.</p>
+    <table>
+      <thead><tr><th>Tool</th><th class="num">Calls</th><th>Share</th></tr></thead>
+      <tbody>
+        <tr><td><code>Bash</code> <span class="muted">(zig build, git, grep, oracle)</span></td><td class="num">1,083</td><td><div class="bar"><span style="width:64.4%"></span></div></td></tr>
+        <tr><td><code>Read</code></td><td class="num">401</td><td><div class="bar"><span style="width:23.9%"></span></div></td></tr>
+        <tr><td><code>Edit</code></td><td class="num">104</td><td><div class="bar"><span style="width:6.2%"></span></div></td></tr>
+        <tr><td><code>StructuredOutput</code> <span class="muted">(schema-bound return)</span></td><td class="num">69</td><td><div class="bar"><span style="width:4.1%"></span></div></td></tr>
+        <tr><td><code>Write</code></td><td class="num">10</td><td><div class="bar"><span style="width:0.6%"></span></div></td></tr>
+        <tr><td><code>Monitor</code></td><td class="num">9</td><td><div class="bar"><span style="width:0.5%"></span></div></td></tr>
+        <tr><td><code>ToolSearch</code></td><td class="num">3</td><td><div class="bar"><span style="width:0.2%"></span></div></td></tr>
+        <tr><td><code>TaskStop</code></td><td class="num">2</td><td><div class="bar"><span style="width:0.1%"></span></div></td></tr>
+      </tbody>
+    </table>
+    <p class="legend">
+    Read/Edit/Bash dominance is the signature of strict TDD on a Zig codebase: read the file, write a red test, build, edit, build, run the oracle. Almost no <code>Write</code> (large new files) &mdash; the migration is mostly <em>deletion</em>.
+    </p>
+  </div>
+
+  <div>
+    <h2 style="font-size:18px">Model mix (migration)</h2>
+    <table>
+      <thead><tr><th>Model</th><th class="num">Agents</th><th class="num">Tokens</th></tr></thead>
+      <tbody>
+        <tr><td>claude-opus-4-7</td><td class="num">17</td><td class="num">1,910,733</td></tr>
+        <tr><td>claude-sonnet-4-6</td><td class="num">11</td><td class="num">878,675</td></tr>
+      </tbody>
+    </table>
+    <p class="legend">
+    Sonnet 4.6 handled the 9 design agents (broad-but-shallow assessment) and 2 execute steps with narrow, well-specified scope (<code>oracle-widen</code>, <code>partitioned-index-drop</code>). Opus 4.7 handled all adversarial verifiers, the synthesizer, and 7 of 9 execute milestones &mdash; everywhere the work touched contended core files (<code>db.zig</code>, <code>compaction.zig</code>, <code>table_builder.zig</code>).
+    </p>
+
+    <h2 style="font-size:18px">Resulting diff</h2>
+    <pre>17 files changed
++1,320 insertions
+-1,810 deletions
+net &minus;490 LoC
+21 commits to main</pre>
+    <p class="legend">Net negative LoC despite adding RocksDB format features &mdash; because nine entire native/&ldquo;clean&rdquo; write paths were deleted in the process.</p>
+  </div>
+</div>
+
+<h2 id="mig-failure">Failure analysis (migration)</h2>
+<p>
+The migration completed with <strong>0 retries and 0 quarantined milestones</strong>. Every one of the 28 subagents finished on its first attempt; every one of the 9 execute milestones merged to <code>main</code>. The execute workflow&rsquo;s pre-commit gate (full <code>zig build test</code> + the real-RocksDB <code>verify_open</code> oracle) was the safety net that made retries unnecessary &mdash; an agent that broke the gate would have been quarantined and its dependents skipped, but none did.
+</p>
+<table>
+  <thead><tr><th>Event</th><th>Where</th><th>Outcome</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Latent bug discovered mid-flight</td>
+      <td>Milestone&nbsp;4 (<code>manifest-rocksdb-exact</code>)</td>
+      <td>
+        <span class="ok">Fixed in-band.</span> Before the migration, <code>compaction.zig:commitCompaction</code> emitted compaction outputs via <code>addFile</code> (legacy <code>kNewFile=7</code>, no seqnos). This wasn&rsquo;t caught earlier because no test exercised compaction <em>after</em> a multi-level fill. The milestone&rsquo;s red test surfaced it; the same milestone&rsquo;s green commit (<code>4d0f04b</code>) fixed it by switching to <code>addFile4</code> with real min/max seqnos.
+      </td>
+    </tr>
+    <tr>
+      <td>Oracle count regression at milestone 6</td>
+      <td><code>range-del-rocksdb</code> (<code>OPEN_OK&nbsp;5</code>)</td>
+      <td>
+        <span class="warn">Expected.</span> The narrower fixture used by intermediate gates only carries 5 live non-tombstoned keys; the gate&rsquo;s contract is &ldquo;real RocksDB opens it,&rdquo; not a fixed count. The next milestone&rsquo;s richer fixture lifted it back to 11, and the final milestone&rsquo;s end-to-end DB hit 34.
+      </td>
+    </tr>
+    <tr>
+      <td>2x <code>TaskStop</code> in subagent traces</td>
+      <td>Execute phase (long-running background <code>zig build</code> jobs)</td>
+      <td>
+        <span class="ok">Cooperative.</span> Both were agent-initiated stops of own background <code>zig build test</code> jobs after a faster path produced the answer &mdash; no test was abandoned.
+      </td>
+    </tr>
+    <tr>
+      <td>Subagent retries</td>
+      <td>&mdash;</td>
+      <td><span class="pill">0 / 28</span> &mdash; every agent reported <code>attempt=1, state=done</code>.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>What the migration deleted</h2>
+<ul>
+  <li><code>Options.sst_output</code> enum + field (forced single output format)</li>
+  <li>Native single-level SST index path (write side)</li>
+  <li>Two-level partitioned SST index (<code>src/format/partitioned_index.zig</code>, 373 LoC + 3 tests + <code>Options.IndexType</code>)</li>
+  <li>Block-based-bloom <em>write</em> path (read path retained for LevelDB interop)</li>
+  <li>Bespoke range-tombstone serialization (replaced by <code>rocksdb.range_del</code>)</li>
+  <li><code>kColumnFamilyTag=0x10</code> WAL prefix (replaced by RocksDB CF value-type bytes)</li>
+  <li>Per-CF MANIFEST snapshot path emitting legacy <code>kNewFile=7</code></li>
+</ul>
+
+<h2 id="mig-evidence">Evidence on disk (post-migration)</h2>
+<pre>$ zrocks /tmp/demo put keyN value-from-zrocks-N   <span class="muted"># via the zrocks CLI</span>
+$ ls /tmp/demo
+000002.log  CURRENT  MANIFEST-000003
+
+$ /home/ghpu/rocksdb-interop/verify_open /tmp/demo   <span class="muted"># the REAL librocksdb binary</span>
+OPEN_OK count=10
+key0=value-from-zrocks-0
+&hellip;
+key9=value-from-zrocks-9</pre>
+<p class="legend">Plus the CI self-consistency gate <code>tests/rocksdb_write_interop_test.zig</code>, which on every <code>zig build test</code> asserts on the raw bytes that footer is <code>format_version=5 / crc32c</code>, metaindex carries <code>rocksdb.properties</code>, and MANIFEST uses <code>kNewFile4</code> with no stray <code>kColumnFamilyAdd</code>.</p>
+
+<div class="footnote">
+  Generated 2026-05-30 by Claude Opus 4.8 (1M context). <strong>Part I</strong> sources: 278 git commits on
+  <code>main</code>; 125 session transcripts (≈44&nbsp;MB) under the project's Claude history; <code>DEVSTATE.md</code>.
+  Token figures are exact sums of per-message <code>usage</code>; failure analysis counts <code>tool_result</code>
+  blocks with <code>is_error</code>. <strong>Part II</strong> sources: the design + execute workflow journals
+  (<code>wf_19b0a837-1b4</code>, <code>wf_d94d13f7-c95</code>), 28 subagent traces, and git log
+  <code>bf8bc96..aba5a2b</code>. All times CEST unless suffixed UTC.
+</div>
+
+</main>
+</body>
+</html>
